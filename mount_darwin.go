@@ -431,6 +431,7 @@ func mountTransport(
 	cfg *MountConfig,
 	ready chan<- error) (connectionTransport, error) {
 	if cfg.Options["backend"] == "fskit" {
+		fusekernel.IsPlatformFuseT = false
 		return mountFSKitTransport(dir, cfg, ready)
 	}
 
