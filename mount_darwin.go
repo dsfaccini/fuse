@@ -425,3 +425,18 @@ func mount(
 	}
 	return
 }
+
+func mountTransport(
+	dir string,
+	cfg *MountConfig,
+	ready chan<- error) (connectionTransport, error) {
+	if cfg.Options["backend"] == "fskit" {
+		return mountFSKitTransport(dir, cfg, ready)
+	}
+
+	dev, err := mount(dir, cfg, ready)
+	if err != nil {
+		return nil, err
+	}
+	return newFileTransport(dev), nil
+}

@@ -58,7 +58,7 @@ func Mount(
 		config.DebugLogger.Println("Beginning the mounting kickoff process")
 	}
 	ready := make(chan error, 1)
-	dev, err := mount(dir, config, ready)
+	transport, err := mountTransport(dir, config, ready)
 	if err != nil {
 		return nil, fmt.Errorf("mount: %v", err)
 	}
@@ -75,14 +75,19 @@ func Mount(
 	if config.DebugLogger != nil {
 		config.DebugLogger.Println("Creating a connection object")
 	}
-	// Create a Connection object wrapping the device.
+	// Create a Connection object wrapping the transport.
 	connection, err := newConnection(
 		cfgCopy,
 		config.DebugLogger,
 		config.ErrorLogger,
 		config.WireLogger,
-		dev)
+		transport)
 	if err != nil {
+		if config.Options["backend"] == "fskit" {
+			if mountErr := <-ready; mountErr != nil {
+				return nil, fmt.Errorf("mount (background): %w", mountErr)
+			}
+		}
 		return nil, fmt.Errorf("newConnection: %v", err)
 	}
 	if config.DebugLogger != nil {

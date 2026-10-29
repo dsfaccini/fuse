@@ -165,6 +165,21 @@ func mount(dir string, cfg *MountConfig, ready chan<- error) (*os.File, error) {
 	return dev, err
 }
 
+func mountTransport(
+	dir string,
+	cfg *MountConfig,
+	ready chan<- error) (connectionTransport, error) {
+	if cfg.Options["backend"] == "fskit" {
+		return nil, fmt.Errorf("backend fskit is only available on darwin with cgo")
+	}
+
+	dev, err := mount(dir, cfg, ready)
+	if err != nil {
+		return nil, err
+	}
+	return newFileTransport(dev), nil
+}
+
 func parseFuseFd(dir string) (int, error) {
 	if !strings.HasPrefix(dir, "/dev/fd/") {
 		return -1, fmt.Errorf("not a /dev/fd path")
