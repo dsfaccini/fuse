@@ -61,10 +61,10 @@ func TestFSKitTransportCloseState(t *testing.T) {
 			transport.stateChanged = sync.NewCond(&transport.mu)
 
 			transport.mu.Lock()
-			got := transport.shouldCloseNativeChannelLocked()
+			got := transport.claimNativeCloseLocked()
 			transport.mu.Unlock()
 			if got != test.wantClose {
-				t.Errorf("shouldCloseNativeChannelLocked() = %v, want %v", got, test.wantClose)
+				t.Errorf("claimNativeCloseLocked() = %v, want %v", got, test.wantClose)
 			}
 		})
 	}

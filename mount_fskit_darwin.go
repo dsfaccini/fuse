@@ -93,6 +93,7 @@ type fskitTransport struct {
 	receivedNativeMessage bool
 	mountFinished         bool
 	mountSucceeded        bool
+	nativeCloseStarted    bool
 	operations            sync.WaitGroup
 	mountDone             sync.WaitGroup
 	closeMu               sync.Mutex
@@ -206,6 +207,17 @@ func (t *fskitTransport) shouldCloseNativeChannelLocked() bool {
 		return t.mountSucceeded
 	}
 	return t.receivedNativeMessage
+}
+
+func (t *fskitTransport) claimNativeCloseLocked() bool {
+	if t.nativeCloseStarted {
+		return true
+	}
+	if !t.shouldCloseNativeChannelLocked() {
+		return false
+	}
+	t.nativeCloseStarted = true
+	return true
 }
 
 func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
@@ -391,7 +403,10 @@ func (t *fskitTransport) Close() error {
 			t.stateChanged.Wait()
 		}
 	}
-	closeChannel := t.shouldCloseNativeChannelLocked()
+	// Claim the close while holding the same lock used to report MFMount's
+	// result. If mount completion wins the lock with a failure, no close is
+	// claimed; if receipt wins, the close is an early abort of the pending mount.
+	closeChannel := t.claimNativeCloseLocked()
 	t.mu.Unlock()
 
 	var err error
