@@ -16,7 +16,8 @@
 package fuse
 
 import (
-	"sync"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -38,70 +39,98 @@ func TestFSKitOSVersion(t *testing.T) {
 	}
 }
 
-func TestFSKitTransportCloseState(t *testing.T) {
+func TestFSKitTransportCloseWaitsForMountPublication(t *testing.T) {
 	for _, test := range []struct {
 		name      string
-		received  bool
-		finished  bool
 		succeeded bool
-		wantClose bool
 	}{
-		{name: "awaiting first message", wantClose: false},
-		{name: "first message proves open", received: true, wantClose: true},
-		{name: "mount succeeded", finished: true, succeeded: true, wantClose: true},
-		{name: "mount failed after first message", received: true, finished: true, wantClose: false},
-		{name: "mount failed before first message", finished: true, wantClose: false},
+		{name: "native mount failed"},
+		{name: "native mount succeeded", succeeded: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			var closes, releases atomic.Int32
+			closeErr := errors.New("native close error")
 			transport := &fskitTransport{
-				receivedNativeMessage: test.received,
-				mountFinished:         test.finished,
-				mountSucceeded:        test.succeeded,
+				closeNative: func() error {
+					closes.Add(1)
+					return closeErr
+				},
+				releaseNative: func() { releases.Add(1) },
 			}
-			transport.stateChanged = sync.NewCond(&transport.mu)
-
+			// The native call has returned, but its result is not published yet.
+			transport.mountDone.Add(1)
+			results := make(chan error, 2)
+			for range 2 {
+				go func() { results <- transport.Close() }()
+			}
+			select {
+			case err := <-results:
+				t.Fatalf("Close returned before mount publication: %v", err)
+			case <-time.After(10 * time.Millisecond):
+			}
 			transport.mu.Lock()
-			got := transport.claimNativeCloseLocked()
+			closed := transport.closed
 			transport.mu.Unlock()
-			if got != test.wantClose {
-				t.Errorf("claimNativeCloseLocked() = %v, want %v", got, test.wantClose)
+			if closed || closes.Load() != 0 || releases.Load() != 0 {
+				t.Error("Close blocked pending INIT traffic or touched the native channel before mount publication")
+			}
+			transport.setMountResult(test.succeeded)
+			transport.mountDone.Done()
+			var wantErr error
+			var wantCloses int32
+			if test.succeeded {
+				wantErr, wantCloses = closeErr, 1
+			}
+			for range 2 {
+				select {
+				case err := <-results:
+					if !errors.Is(err, wantErr) {
+						t.Errorf("Close error = %v, want %v", err, wantErr)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("Close did not finish after mount publication")
+				}
+			}
+			if closes.Load() != wantCloses || releases.Load() != 1 {
+				t.Fatalf("close calls=%d release calls=%d, want %d and 1", closes.Load(), releases.Load(), wantCloses)
 			}
 		})
 	}
 }
 
-func TestFSKitTransportStateChangesWakeWaiters(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		update    func(*fskitTransport)
-		wantClose bool
-	}{
-		{name: "first native message", update: func(transport *fskitTransport) { transport.noteNativeMessage() }, wantClose: true},
-		{name: "mount failure", update: func(transport *fskitTransport) { transport.setMountResult(false) }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			transport := &fskitTransport{}
-			transport.stateChanged = sync.NewCond(&transport.mu)
-			result := make(chan bool, 1)
-			go func() {
-				transport.mu.Lock()
-				for !transport.receivedNativeMessage && !transport.mountFinished {
-					transport.stateChanged.Wait()
-				}
-				closeChannel := transport.shouldCloseNativeChannelLocked()
-				transport.mu.Unlock()
-				result <- closeChannel
-			}()
-
-			test.update(transport)
-			select {
-			case got := <-result:
-				if got != test.wantClose {
-					t.Errorf("close decision = %v, want %v", got, test.wantClose)
-				}
-			case <-time.After(time.Second):
-				t.Fatal("state change did not wake Close waiter")
-			}
-		})
+func TestFSKitTransportCloseDrainsOperationsBeforeRelease(t *testing.T) {
+	closed := make(chan struct{})
+	released := make(chan struct{})
+	transport := &fskitTransport{
+		mountSucceeded: true,
+		closeNative:    func() error { close(closed); return nil },
+		releaseNative:  func() { close(released) },
+	}
+	transport.operations.Add(1)
+	result := make(chan error, 1)
+	go func() { result <- transport.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not close the successful mount's channel")
+	}
+	select {
+	case <-released:
+		t.Error("native channel released while an operation was active")
+	default:
+	}
+	transport.operations.Done()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after its operation drained")
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("Close did not release the native channel")
 	}
 }
