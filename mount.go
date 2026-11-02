@@ -60,7 +60,7 @@ func Mount(
 	ready := make(chan error, 1)
 	transport, err := mountTransport(dir, config, ready)
 	if err != nil {
-		return nil, fmt.Errorf("mount: %v", err)
+		return nil, fmt.Errorf("mount: %w", err)
 	}
 	if config.DebugLogger != nil {
 		config.DebugLogger.Println("Completed the mounting kickoff process")
@@ -107,7 +107,7 @@ func Mount(
 
 	// Wait for the mount process to complete.
 	if err := <-ready; err != nil {
-		return nil, fmt.Errorf("mount (background): %v", err)
+		return nil, fmt.Errorf("mount (background): %w", err)
 	}
 
 	return mfs, nil

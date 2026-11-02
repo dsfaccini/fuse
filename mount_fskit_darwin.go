@@ -11,66 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//go:build darwin && cgo && fskit
 
 package fuse
-
-/*
-#cgo darwin LDFLAGS: -framework MFMount
-#include <errno.h>
-#include <stdlib.h>
-#include <MFMount/MFMount.h>
-
-static MFChannelRef fskit_channel_create(void) {
-    return MFChannelCreate();
-}
-static MFMountResult fskit_mount(
-    MFChannelRef channel,
-    const char *mountPoint,
-    const char *options,
-    bool quiet,
-    int *error
-) {
-    MFMountResult result = MFMount(channel, mountPoint, options, quiet);
-    *error = errno;
-    return result;
-}
-static MFMessageRef fskit_channel_copy_next_message(MFChannelRef channel, int *error) {
-    MFMessageRef message = MFChannelCopyNextMessage(channel);
-    *error = errno;
-    return message;
-}
-static ssize_t fskit_message_get_body_size(MFMessageRef message, int *error) {
-    ssize_t size = MFMessageGetBodySize(message);
-    *error = errno;
-    return size;
-}
-static ssize_t fskit_message_get_body_buffers(
-    MFMessageRef message,
-    const struct iovec **buffers,
-    int *error
-) {
-    ssize_t count = MFMessageGetBodyBuffers(message, buffers);
-    *error = errno;
-    return count;
-}
-static ssize_t fskit_channel_send_message(
-    MFChannelRef channel,
-    const struct iovec *buffers,
-    size_t count,
-    int *error
-) {
-    ssize_t sent = MFChannelSendMessage(channel, buffers, count);
-    *error = errno;
-    return sent;
-}
-static bool fskit_channel_close(MFChannelRef channel, int *error) {
-    bool closed = MFChannelClose(channel);
-    *error = errno;
-    return closed;
-}
-*/
-import "C"
 
 import (
 	"fmt"
@@ -82,11 +24,62 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
+// fskitFrameworkPath is the install name of macFUSE's MFMount framework, which
+// is loaded at mount time so that builds need neither cgo nor macFUSE.
+var fskitFrameworkPath = "/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/Versions/A/MFMount"
+
+var fskitOSProductVersion = func() (string, error) {
+	return syscall.Sysctl("kern.osproductversion")
+}
+
+// fskitAPI holds the addresses of the MFMount functions the FSKit transport
+// calls. The channel functions arrived in macFUSE 5.3.
+type fskitAPI struct {
+	channelCreate          uintptr
+	mount                  uintptr
+	channelCopyNextMessage uintptr
+	messageGetBodySize     uintptr
+	messageGetBodyBuffers  uintptr
+	channelSendMessage     uintptr
+	channelClose           uintptr
+	release                uintptr
+}
+
+func loadFSKitAPI(path string) (*fskitAPI, error) {
+	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrFSKitUnavailable, err)
+	}
+	api := &fskitAPI{}
+	for _, symbol := range []struct {
+		name string
+		addr *uintptr
+	}{
+		{"MFChannelCreate", &api.channelCreate},
+		{"MFMount", &api.mount},
+		{"MFChannelCopyNextMessage", &api.channelCopyNextMessage},
+		{"MFMessageGetBodySize", &api.messageGetBodySize},
+		{"MFMessageGetBodyBuffers", &api.messageGetBodyBuffers},
+		{"MFChannelSendMessage", &api.channelSendMessage},
+		{"MFChannelClose", &api.channelClose},
+		{"MFRelease", &api.release},
+	} {
+		if *symbol.addr, err = purego.Dlsym(lib, symbol.name); err != nil {
+			purego.Dlclose(lib)
+			return nil, fmt.Errorf("%w: %v", ErrFSKitUnavailable, err)
+		}
+	}
+	return api, nil
+}
+
 type fskitTransport struct {
+	api            *fskitAPI
 	mu             sync.Mutex
-	channel        C.MFChannelRef
+	channel        uintptr
 	closed         bool
 	mountSucceeded bool
 	operations     sync.WaitGroup
@@ -105,51 +98,53 @@ func mountFSKitTransport(
 		return nil, err
 	}
 
-	channel := C.fskit_channel_create()
-	if channel == nil {
+	options := cfg.toMap()
+	delete(options, "backend")
+	mountOptions, err := syscall.BytePtrFromString(mapToOptionsString(options))
+	if err != nil {
+		return nil, fmt.Errorf("FSKit mount options: %w", err)
+	}
+	mountPoint, err := syscall.BytePtrFromString(dir)
+	if err != nil {
+		return nil, fmt.Errorf("FSKit mount point: %w", err)
+	}
+
+	api, err := loadFSKitAPI(fskitFrameworkPath)
+	if err != nil {
+		return nil, err
+	}
+	channel, _, _ := purego.SyscallN(api.channelCreate)
+	if channel == 0 {
 		return nil, fmt.Errorf("MFChannelCreate failed")
 	}
 	t := &fskitTransport{
+		api:     api,
 		channel: channel,
 		closeNative: func() error {
-			var callErr C.int
-			if !C.fskit_channel_close(channel, &callErr) {
-				return fmt.Errorf("MFChannelClose: %w", syscall.Errno(callErr))
+			closed, _, errno := purego.SyscallN(api.channelClose, channel)
+			if byte(closed) == 0 {
+				return fmt.Errorf("MFChannelClose: %w", syscall.Errno(errno))
 			}
 			return nil
 		},
-		releaseNative: func() { C.MFRelease(C.MFTypeRef(channel)) },
+		releaseNative: func() { purego.SyscallN(api.release, channel) },
 	}
 
-	options := cfg.toMap()
-	delete(options, "backend")
-	mountOptions := C.CString(mapToOptionsString(options))
-	mountPoint := C.CString(dir)
 	t.mountDone.Add(1)
 	go func() {
 		defer t.mountDone.Done()
-		defer C.free(unsafe.Pointer(mountOptions))
-		defer C.free(unsafe.Pointer(mountPoint))
 
-		var mountCallErr C.int
-		result := C.fskit_mount(t.channel, mountPoint, mountOptions, true, &mountCallErr)
+		// Report failures through the result code instead of macFUSE dialogs.
+		const quiet = 1
+		result, _, _ := purego.SyscallN(
+			api.mount,
+			channel,
+			uintptr(unsafe.Pointer(mountPoint)),
+			uintptr(unsafe.Pointer(mountOptions)),
+			quiet)
 		var mountErr error
-		switch result {
-		case C.MFMountResultSuccess:
-		case C.MFMountResultUnsupporteOSVersion:
-			mountErr = fmt.Errorf("MFMount does not support this macOS version")
-		case C.MFMountResultHelperToolsInstallationFailed:
-			mountErr = fmt.Errorf("MFMount could not install its helper tools")
-		case C.MFMountResultFileSystemExtensionNotFound:
-			mountErr = fmt.Errorf("MFMount file system extension was not found")
-		case C.MFMountResultFileSystemExtensionRequiresApproval:
-			mountErr = fmt.Errorf("MFMount file system extension requires user approval")
-		case C.MFMountResultCreatingMountPointFailed:
-			mountErr = fmt.Errorf("MFMount could not create the mount point")
-		case C.MFMountResultUnexpectedFailure:
-			mountErr = fmt.Errorf("MFMount failed: %w", syscall.Errno(mountCallErr))
-		default:
-			mountErr = fmt.Errorf("MFMount failed with result %d", int32(result))
+		if code := int32(result); code != 0 {
+			mountErr = FSKitMountError{Result: code}
 		}
 		t.setMountResult(mountErr == nil)
 		ready <- mountErr
@@ -159,29 +154,31 @@ func mountFSKitTransport(
 }
 
 func validateFSKitMount(dir string, cfg *MountConfig) error {
-	// Check availability before allocating a native channel.
-	version, err := syscall.Sysctl("kern.osproductversion")
-	if err != nil {
-		return fmt.Errorf("reading macOS version for FSKit: %w", err)
-	}
-	if err := validateFSKitOSVersion(version); err != nil {
-		return err
-	}
-
 	if dir == "" {
 		return fmt.Errorf("FSKit mount point must not be empty")
 	}
 	if cfg == nil {
 		return fmt.Errorf("FSKit mount config must not be nil")
 	}
-	validation := Connection{cfg: *cfg}
-	if err := validation.sanitizeMaxPagesAndWrite(); err != nil {
+
+	// Check availability before allocating a native channel.
+	version, err := fskitOSProductVersion()
+	if err != nil {
+		return fmt.Errorf("reading macOS version for FSKit: %w", err)
+	}
+	_, local := cfg.Options["local"]
+	if err := validateFSKitOSVersion(version, local); err != nil {
 		return err
 	}
-	return nil
+
+	validation := Connection{cfg: *cfg}
+	return validation.sanitizeMaxPagesAndWrite()
 }
 
-func validateFSKitOSVersion(version string) error {
+// validateFSKitOSVersion checks version against the macFUSE FSKit module that
+// serves the mount: macOS 26 for the default module, macOS 15.4 for the module
+// that serves volumes mounted with the local option.
+func validateFSKitOSVersion(version string, local bool) error {
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 {
 		return fmt.Errorf("invalid macOS product version %q", version)
@@ -191,8 +188,12 @@ func validateFSKitOSVersion(version string) error {
 	if majorErr != nil || minorErr != nil {
 		return fmt.Errorf("invalid macOS product version %q", version)
 	}
-	if major < 15 || major == 15 && minor < 4 {
-		return fmt.Errorf("FSKit backend requires macOS 15.4 or later; found %s", version)
+	minMajor, minMinor := 26, 0
+	if local {
+		minMajor, minMinor = 15, 4
+	}
+	if major < minMajor || major == minMajor && minor < minMinor {
+		return FSKitMountError{Result: FSKitMountResultUnsupportedOSVersion}
 	}
 	return nil
 }
@@ -215,9 +216,8 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 	defer t.operations.Done()
 
 	for {
-		var callErr C.int
-		message := C.fskit_channel_copy_next_message(channel, &callErr)
-		if message == nil {
+		message, _, callErr := purego.SyscallN(t.api.channelCopyNextMessage, channel)
+		if message == 0 {
 			errno := syscall.Errno(callErr)
 			if errno == syscall.EINTR {
 				continue
@@ -232,28 +232,32 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 		closed := t.closed
 		t.mu.Unlock()
 		if closed {
-			C.MFRelease(C.MFTypeRef(message))
+			purego.SyscallN(t.api.release, message)
 			return 0, io.EOF
 		}
 
-		n, err := copyFskitMessage(message, p)
-		C.MFRelease(C.MFTypeRef(message))
+		n, err := t.api.copyMessage(message, p)
+		purego.SyscallN(t.api.release, message)
 		return n, err
 	}
 }
 
-func copyFskitMessage(message C.MFMessageRef, dst []byte) (int, error) {
-	var callErr C.int
-	bodySize := C.fskit_message_get_body_size(message, &callErr)
+func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
+	result, _, callErr := purego.SyscallN(api.messageGetBodySize, message)
+	bodySize := int(result)
 	if bodySize < 0 {
 		return 0, fmt.Errorf("MFMessageGetBodySize: %w", syscall.Errno(callErr))
 	}
-	if uint64(bodySize) > uint64(len(dst)) {
-		return 0, fmt.Errorf("FUSE message has %d bytes; transport buffer holds %d", int64(bodySize), len(dst))
+	if bodySize > len(dst) {
+		return 0, fmt.Errorf("FUSE message has %d bytes; transport buffer holds %d", bodySize, len(dst))
 	}
 
-	var bodyBuffers *C.struct_iovec
-	count := C.fskit_message_get_body_buffers(message, &bodyBuffers, &callErr)
+	var bodyBuffers *syscall.Iovec
+	result, _, callErr = purego.SyscallN(
+		api.messageGetBodyBuffers,
+		message,
+		uintptr(unsafe.Pointer(&bodyBuffers)))
+	count := int(result)
 	if count < 0 {
 		return 0, fmt.Errorf("MFMessageGetBodyBuffers: %w", syscall.Errno(callErr))
 	}
@@ -261,18 +265,17 @@ func copyFskitMessage(message C.MFMessageRef, dst []byte) (int, error) {
 		return 0, fmt.Errorf("MFMessageGetBodyBuffers returned no body buffers")
 	}
 
-	buffers := unsafe.Slice(bodyBuffers, int(count))
 	var offset int
-	for _, body := range buffers {
-		if uint64(body.iov_len) > uint64(len(dst)-offset) {
-			return 0, fmt.Errorf("FUSE message buffers exceed reported body size %d", int64(bodySize))
+	for _, body := range unsafe.Slice(bodyBuffers, count) {
+		if body.Len > uint64(len(dst)-offset) {
+			return 0, fmt.Errorf("FUSE message buffers exceed reported body size %d", bodySize)
 		}
-		length := int(body.iov_len)
-		copy(dst[offset:offset+length], unsafe.Slice((*byte)(body.iov_base), length))
+		length := int(body.Len)
+		copy(dst[offset:offset+length], unsafe.Slice(body.Base, length))
 		offset += length
 	}
-	if offset != int(bodySize) {
-		return 0, fmt.Errorf("FUSE message buffers contain %d bytes; header reports %d", offset, int64(bodySize))
+	if offset != bodySize {
+		return 0, fmt.Errorf("FUSE message buffers contain %d bytes; header reports %d", offset, bodySize)
 	}
 	return offset, nil
 }
@@ -287,28 +290,15 @@ func (t *fskitTransport) WritevMessage(parts [][]byte) error {
 	}
 
 	var total int
-	for _, part := range parts {
-		total += len(part)
-	}
-
-	vectorBytes := C.size_t(len(parts)) * C.size_t(C.sizeof_struct_iovec)
-	vectorMemory := C.malloc(vectorBytes)
-	if vectorMemory == nil {
-		return fmt.Errorf("allocating FUSE reply iovecs")
-	}
-	defer C.free(vectorMemory)
-
-	vectors := unsafe.Slice((*C.struct_iovec)(vectorMemory), len(parts))
+	vectors := make([]syscall.Iovec, len(parts))
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
 	for i, part := range parts {
-		vectors[i].iov_base = nil
-		vectors[i].iov_len = 0
+		total += len(part)
 		if len(part) != 0 {
-			base := unsafe.SliceData(part)
-			pinner.Pin(base)
-			vectors[i].iov_base = unsafe.Pointer(base)
-			vectors[i].iov_len = C.size_t(len(part))
+			pinner.Pin(&part[0])
+			vectors[i].Base = &part[0]
+			vectors[i].SetLen(len(part))
 		}
 	}
 
@@ -322,14 +312,17 @@ func (t *fskitTransport) WritevMessage(parts [][]byte) error {
 	t.mu.Unlock()
 	defer t.operations.Done()
 
-	var callErr C.int
-	n := C.fskit_channel_send_message(channel, (*C.struct_iovec)(vectorMemory), C.size_t(len(parts)), &callErr)
-	runtime.KeepAlive(parts)
-	if n < 0 {
+	result, _, callErr := purego.SyscallN(
+		t.api.channelSendMessage,
+		channel,
+		uintptr(unsafe.Pointer(&vectors[0])),
+		uintptr(len(vectors)))
+	sent := int(result)
+	if sent < 0 {
 		return fmt.Errorf("MFChannelSendMessage: %w", syscall.Errno(callErr))
 	}
-	if int(n) != total {
-		return fmt.Errorf("MFChannelSendMessage sent %d bytes; expected %d", int(n), total)
+	if sent != total {
+		return fmt.Errorf("MFChannelSendMessage sent %d bytes; expected %d", sent, total)
 	}
 	return nil
 }

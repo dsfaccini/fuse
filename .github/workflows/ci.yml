@@ -44,6 +44,10 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse-dev
     - name: Build
       run: go build ./...
+    # composites and unsafeptr report existing findings in connection.go,
+    # conversions.go and internal/buffer.
+    - name: Vet darwin code
+      run: GOOS=darwin go vet -composites=false -unsafeptr=false ./...
     # Disabled running `go test` because running tests hung at random,
     # preventing us from running the tests in CI reliably.
     # (cf. https://github.com/jacobsa/fuse/issues/97)

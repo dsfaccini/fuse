@@ -170,7 +170,7 @@ func mountTransport(
 	cfg *MountConfig,
 	ready chan<- error) (connectionTransport, error) {
 	if cfg.Options["backend"] == "fskit" {
-		return nil, fmt.Errorf("backend fskit is only available on darwin with cgo")
+		return nil, fmt.Errorf("backend fskit is only available on darwin")
 	}
 
 	dev, err := mount(dir, cfg, ready)

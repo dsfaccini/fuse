@@ -11,31 +11,88 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//go:build darwin && cgo && fskit
 
 package fuse
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestFSKitOSVersion(t *testing.T) {
+	unsupported := FSKitMountError{Result: FSKitMountResultUnsupportedOSVersion}
 	for _, test := range []struct {
 		version string
-		wantErr bool
+		local   bool
+		want    error
 	}{
-		{version: "15.3", wantErr: true},
-		{version: "15.4", wantErr: false},
-		{version: "26.0", wantErr: false},
-		{version: "not-a-version", wantErr: true},
+		{version: "15.3", local: true, want: unsupported},
+		{version: "15.4", local: true},
+		{version: "15.7", want: unsupported},
+		{version: "26.0"},
+		{version: "26.0", local: true},
+		{version: "27.2"},
 	} {
-		err := validateFSKitOSVersion(test.version)
-		if (err != nil) != test.wantErr {
-			t.Errorf("validateFSKitOSVersion(%q) error = %v, wantErr %v", test.version, err, test.wantErr)
+		err := validateFSKitOSVersion(test.version, test.local)
+		if !errors.Is(err, test.want) {
+			t.Errorf("validateFSKitOSVersion(%q, local=%v) error = %v, want %v", test.version, test.local, err, test.want)
 		}
+	}
+
+	err := validateFSKitOSVersion("not-a-version", false)
+	if err == nil || errors.As(err, new(FSKitMountError)) {
+		t.Errorf("validateFSKitOSVersion(%q) error = %v, want a parse error", "not-a-version", err)
+	}
+}
+
+// setFSKitTestSystem points FSKit mounts at frameworkPath and reports
+// osVersion as the running macOS version until the test ends.
+func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
+	t.Helper()
+	oldPath, oldVersion := fskitFrameworkPath, fskitOSProductVersion
+	fskitFrameworkPath = frameworkPath
+	fskitOSProductVersion = func() (string, error) { return osVersion, nil }
+	t.Cleanup(func() { fskitFrameworkPath, fskitOSProductVersion = oldPath, oldVersion })
+}
+
+func TestLoadFSKitAPIReportsMissingFramework(t *testing.T) {
+	_, err := loadFSKitAPI(filepath.Join(t.TempDir(), "MFMount"))
+	if !errors.Is(err, ErrFSKitUnavailable) {
+		t.Fatalf("loadFSKitAPI error = %v, want ErrFSKitUnavailable", err)
+	}
+}
+
+func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
+	if _, err := os.Stat(fskitFrameworkPath); err != nil {
+		t.Skipf("macFUSE MFMount framework not installed: %v", err)
+	}
+	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {
+		t.Fatalf("loadFSKitAPI(%q): %v", fskitFrameworkPath, err)
+	}
+}
+
+func TestMountReturnsTypedFSKitErrors(t *testing.T) {
+	// Every case uses a missing framework, so none can reach MFMount.
+	missingFramework := filepath.Join(t.TempDir(), "MFMount")
+	if _, err := loadFSKitAPI(missingFramework); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Fatalf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", missingFramework, err)
+	}
+	config := &MountConfig{Options: map[string]string{"backend": "fskit"}}
+
+	setFSKitTestSystem(t, missingFramework, "15.7")
+	_, err := Mount(t.TempDir(), nil, config)
+	var mountErr FSKitMountError
+	if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
+		t.Errorf("Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", err, FSKitMountResultUnsupportedOSVersion)
+	}
+
+	setFSKitTestSystem(t, missingFramework, "26.0")
+	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("Mount without MFMount error = %v, want ErrFSKitUnavailable", err)
 	}
 }
 
