@@ -19,8 +19,11 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/ebitengine/purego"
 )
 
 func TestFSKitOSVersion(t *testing.T) {
@@ -72,6 +75,27 @@ func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
 	}
 	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {
 		t.Fatalf("loadFSKitAPI(%q): %v", fskitFrameworkPath, err)
+	}
+}
+
+func TestCallErrnoDropsGarbageUpperBits(t *testing.T) {
+	// MFChannelCopyNextMessage reported this raw value for ENODEV when the
+	// channel closed; without truncation the transport panicked on shutdown.
+	if got := callErrno(0x6f18b00000000013); got != syscall.ENODEV {
+		t.Fatalf("callErrno = %v, want ENODEV", got)
+	}
+
+	libc, err := purego.Dlopen("/usr/lib/libSystem.B.dylib", purego.RTLD_NOW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeFn, err := purego.Dlsym(libc, "close")
+	if err != nil {
+		t.Fatal(err)
+	}
+	badFD := ^uintptr(0) // -1
+	if _, _, raw := purego.SyscallN(closeFn, badFD); callErrno(raw) != syscall.EBADF {
+		t.Fatalf("close(-1) errno = %v, want EBADF", callErrno(raw))
 	}
 }
 

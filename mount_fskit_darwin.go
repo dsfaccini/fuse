@@ -36,6 +36,13 @@ var fskitOSProductVersion = func() (string, error) {
 	return syscall.Sysctl("kern.osproductversion")
 }
 
+// callErrno converts the errno that purego.SyscallN reports. On darwin purego
+// loads the 32-bit errno with a 64-bit read, so the upper half is garbage and
+// must be dropped before comparing against syscall constants.
+func callErrno(raw uintptr) syscall.Errno {
+	return syscall.Errno(uint32(raw))
+}
+
 // fskitAPI holds the addresses of the MFMount functions the FSKit transport
 // calls. The channel functions arrived in macFUSE 5.3.
 type fskitAPI struct {
@@ -123,7 +130,7 @@ func mountFSKitTransport(
 		closeNative: func() error {
 			closed, _, errno := purego.SyscallN(api.channelClose, channel)
 			if byte(closed) == 0 {
-				return fmt.Errorf("MFChannelClose: %w", syscall.Errno(errno))
+				return fmt.Errorf("MFChannelClose: %w", callErrno(errno))
 			}
 			return nil
 		},
@@ -218,7 +225,7 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 	for {
 		message, _, callErr := purego.SyscallN(t.api.channelCopyNextMessage, channel)
 		if message == 0 {
-			errno := syscall.Errno(callErr)
+			errno := callErrno(callErr)
 			if errno == syscall.EINTR {
 				continue
 			}
@@ -246,7 +253,7 @@ func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
 	result, _, callErr := purego.SyscallN(api.messageGetBodySize, message)
 	bodySize := int(result)
 	if bodySize < 0 {
-		return 0, fmt.Errorf("MFMessageGetBodySize: %w", syscall.Errno(callErr))
+		return 0, fmt.Errorf("MFMessageGetBodySize: %w", callErrno(callErr))
 	}
 	if bodySize > len(dst) {
 		return 0, fmt.Errorf("FUSE message has %d bytes; transport buffer holds %d", bodySize, len(dst))
@@ -259,7 +266,7 @@ func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
 		uintptr(unsafe.Pointer(&bodyBuffers)))
 	count := int(result)
 	if count < 0 {
-		return 0, fmt.Errorf("MFMessageGetBodyBuffers: %w", syscall.Errno(callErr))
+		return 0, fmt.Errorf("MFMessageGetBodyBuffers: %w", callErrno(callErr))
 	}
 	if count == 0 || bodyBuffers == nil {
 		return 0, fmt.Errorf("MFMessageGetBodyBuffers returned no body buffers")
@@ -319,7 +326,7 @@ func (t *fskitTransport) WritevMessage(parts [][]byte) error {
 		uintptr(len(vectors)))
 	sent := int(result)
 	if sent < 0 {
-		return fmt.Errorf("MFChannelSendMessage: %w", syscall.Errno(callErr))
+		return fmt.Errorf("MFChannelSendMessage: %w", callErrno(callErr))
 	}
 	if sent != total {
 		return fmt.Errorf("MFChannelSendMessage sent %d bytes; expected %d", sent, total)
