@@ -1,4 +1,4 @@
-module github.com/jacobsa/fuse
+module github.com/dsfaccini/fuse
 
 go 1.23.0
 

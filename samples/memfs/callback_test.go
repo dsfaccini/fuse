@@ -5,8 +5,8 @@ import (
 	"path"
 	"testing"
 
-	"github.com/jacobsa/fuse/samples"
-	"github.com/jacobsa/fuse/samples/memfs"
+	"github.com/dsfaccini/fuse/samples"
+	"github.com/dsfaccini/fuse/samples/memfs"
 	. "github.com/jacobsa/ogletest"
 )
 

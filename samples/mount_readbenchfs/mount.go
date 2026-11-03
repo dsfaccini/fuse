@@ -9,8 +9,8 @@ import (
 	_ "net/http/pprof"
 	"os"
 
-	"github.com/jacobsa/fuse"
-	"github.com/jacobsa/fuse/samples/readbenchfs"
+	"github.com/dsfaccini/fuse"
+	"github.com/dsfaccini/fuse/samples/readbenchfs"
 )
 
 var fMountPoint = flag.String("mount_point", "", "Path to mount point.")

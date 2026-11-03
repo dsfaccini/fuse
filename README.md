@@ -1,10 +1,10 @@
-[![ci](https://github.com/jacobsa/fuse/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jacobsa/fuse/actions/workflows/ci.yml)
-[![GoDoc](https://godoc.org/github.com/jacobsa/ogletest?status.svg)](https://godoc.org/github.com/jacobsa/fuse)
+[![ci](https://github.com/dsfaccini/fuse/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/dsfaccini/fuse/actions/workflows/ci.yml)
+[![GoDoc](https://godoc.org/github.com/dsfaccini/fuse?status.svg)](https://godoc.org/github.com/dsfaccini/fuse)
 
 This package allows for writing and mounting user-space file systems from Go.
 Install it as follows:
 
-    go get -u github.com/jacobsa/fuse
+    go get -u github.com/dsfaccini/fuse
 
 Afterward, see the documentation for the following three packages:
 
@@ -24,8 +24,8 @@ and tests.
 This package owes its inspiration and most of its kernel-related code to
 [bazil.org/fuse][bazil].
 
-[fuse]: http://godoc.org/github.com/jacobsa/fuse
-[fuseops]: http://godoc.org/github.com/jacobsa/fuse/fuseops
-[fuseutil]: http://godoc.org/github.com/jacobsa/fuse/fuseutil
-[samples]: http://godoc.org/github.com/jacobsa/fuse/samples
+[fuse]: http://godoc.org/github.com/dsfaccini/fuse
+[fuseops]: http://godoc.org/github.com/dsfaccini/fuse/fuseops
+[fuseutil]: http://godoc.org/github.com/dsfaccini/fuse/fuseutil
+[samples]: http://godoc.org/github.com/dsfaccini/fuse/samples
 [bazil]: http://godoc.org/bazil.org/fuse

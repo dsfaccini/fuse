@@ -18,7 +18,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/jacobsa/fuse/internal/fusekernel"
+	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
 ////////////////////////////////////////////////////////////////////////

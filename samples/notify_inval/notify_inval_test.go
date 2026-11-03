@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jacobsa/fuse/fusetesting"
-	"github.com/jacobsa/fuse/samples"
-	"github.com/jacobsa/fuse/samples/notify_inval"
+	"github.com/dsfaccini/fuse/fusetesting"
+	"github.com/dsfaccini/fuse/samples"
+	"github.com/dsfaccini/fuse/samples/notify_inval"
 
 	. "github.com/jacobsa/ogletest"
 )
