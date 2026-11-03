@@ -53,8 +53,9 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   or `errors.Is` on an op error.
 - Unwrapping a nil `*os.PathError` panics, and `Errno` recovers from that
   panic.
-- One helper also keeps the kernel reply, the error log and the wire log on
-  the same errno.
+- The kernel reply, the error log and the wire log all judge the errno that
+  `Errno` finds. When `Errno` finds none, the kernel gets EIO and the wire-log
+  `Status` stays 0.
 
 ## FSKit changes need a test that does not mount
 

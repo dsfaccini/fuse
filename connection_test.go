@@ -250,8 +250,64 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 	}
 }
 
-func TestFormatWireLogEntryWithNilPathError(t *testing.T) {
-	if _, err := formatWireLogEntry(&fuseops.LookUpInodeOp{}, nilPathErr, NewWireLogRecord()); err != nil {
-		t.Errorf("formatWireLogEntry: %v", err)
+func TestFormatWireLogEntryStatus(t *testing.T) {
+	tests := []struct {
+		name  string
+		opErr error
+		want  int
+	}{
+		{"wrapped errno", fmt.Errorf("lookup: %w", syscall.ENOENT), int(syscall.ENOENT)},
+		{"no errno", errors.New("lookup failed"), 0},
+		{"nil path error", nilPathErr, 0},
+		{"wrapped nil path error", fmt.Errorf("lookup: %w", nilPathErr), 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wlog := NewWireLogRecord()
+			if _, err := formatWireLogEntry(&fuseops.LookUpInodeOp{}, tt.opErr, wlog); err != nil {
+				t.Fatalf("formatWireLogEntry: %v", err)
+			}
+			if wlog.Status != tt.want {
+				t.Errorf("Status = %d, want %d", wlog.Status, tt.want)
+			}
+		})
+	}
+}
+
+// fmt recovers from a panic in Error when it formats the error value itself.
+func TestReplyDebugLogsErrorWhoseErrorPanics(t *testing.T) {
+	tests := []struct {
+		name        string
+		opErr       error
+		errorLogger bool
+	}{
+		{"nil path error", nilPathErr, false},
+		{"suppressed errno joined with nil path error", errors.Join(syscall.ENOSYS, nilPathErr), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var debugged bytes.Buffer
+			c := &Connection{
+				cfg:              MountConfig{OpContext: context.Background()},
+				debugLogger:      log.New(&debugged, "", 0),
+				transport:        &testTransport{messages: [][]byte{makeTestInMessage(7)}},
+				cancelFuncs:      make(map[uint64]func()),
+				inMessageBufSize: buffer.GetPageSize(),
+			}
+			if tt.errorLogger {
+				c.errorLogger = log.New(io.Discard, "", 0)
+			}
+			ctx, _, err := c.ReadOp()
+			if err != nil {
+				t.Fatalf("ReadOp: %v", err)
+			}
+
+			if err := c.Reply(ctx, tt.opErr); err != nil {
+				t.Errorf("Reply: %v", err)
+			}
+			if !strings.Contains(debugged.String(), "-> Error:") {
+				t.Errorf("debug log = %q, want the error reply", debugged.String())
+			}
+		})
 	}
 }
