@@ -504,21 +504,25 @@ func (c *Connection) shouldLogError(
 		return false
 	}
 
+	// Judge the errno that kernelResponse sends, not any errno in the chain.
+	var errno syscall.Errno
+	errors.As(err, &errno)
+
 	switch op.(type) {
 	case *fuseops.LookUpInodeOp:
 		// It is totally normal for the kernel to ask to look up an inode by name
 		// and find the name doesn't exist. For example, this happens when linking
 		// a new file.
-		if errors.Is(err, syscall.ENOENT) {
+		if errno == syscall.ENOENT {
 			return false
 		}
 	case *fuseops.GetXattrOp, *fuseops.ListXattrOp:
-		if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.ENODATA) || errors.Is(err, syscall.ERANGE) {
+		if errno == syscall.ENOSYS || errno == syscall.ENODATA || errno == syscall.ERANGE {
 			return false
 		}
 	case *unknownOp:
 		// Don't bother the user with methods we intentionally don't support.
-		if errors.Is(err, syscall.ENOSYS) {
+		if errno == syscall.ENOSYS {
 			return false
 		}
 	}

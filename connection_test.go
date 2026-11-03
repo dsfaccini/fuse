@@ -68,6 +68,8 @@ func TestShouldLogErrorMatchesWrappedErrno(t *testing.T) {
 		{"getxattr ENOSYS", &fuseops.GetXattrOp{}, wrap(syscall.ENOSYS), false},
 		{"unknown op ENOSYS", &unknownOp{}, wrap(syscall.ENOSYS), false},
 		{"lookup EIO", &fuseops.LookUpInodeOp{}, wrap(syscall.EIO), true},
+		{"lookup EIO before ENOENT", &fuseops.LookUpInodeOp{}, fmt.Errorf("lookup: %w (cleanup: %w)", syscall.EIO, syscall.ENOENT), true},
+		{"lookup joined EACCES and ENOENT", &fuseops.LookUpInodeOp{}, errors.Join(syscall.EACCES, syscall.ENOENT), true},
 	}
 	c := &Connection{errorLogger: log.New(io.Discard, "", 0)}
 	for _, tt := range tests {
