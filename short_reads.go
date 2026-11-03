@@ -24,24 +24,32 @@ import (
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
-// trackReportedSizes records the size in every inode's attributes that op's
-// reply carries, extends a recorded size past the end of a write, and drops
-// the sizes of forgotten inodes. It returns the error to reply with: EIO for a
-// ReadFileOp reply that ends before the read or the recorded size does,
-// otherwise opErr.
+// reportedInode is what the connection keeps for an inode the kernel holds:
+// the size last reported for it, and its lookup count, which each entry reply
+// raises by one and each forget lowers by its N.
+type reportedInode struct {
+	size    uint64
+	lookups uint64
+}
+
+// trackReportedSizes records the size in every inode's attributes that the
+// reply to state.op carries, extends a recorded size past the end of a write,
+// and counts the lookups entry replies give the kernel, dropping an inode once
+// forgets bring its count to zero. It returns the error to reply with: EIO for
+// a ReadFileOp reply that checkReadLength rejects, otherwise opErr.
 //
 // LOCKS_EXCLUDED(c.mu)
-func (c *Connection) trackReportedSizes(op interface{}, opErr error) error {
+func (c *Connection) trackReportedSizes(state opState, opErr error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	switch o := op.(type) {
+	switch o := state.op.(type) {
 	case *fuseops.ForgetInodeOp:
-		delete(c.reportedSizes, o.Inode)
+		c.forgetLookups(o.Inode, o.N)
 		return opErr
 	case *fuseops.BatchForgetOp:
 		for _, e := range o.Entries {
-			delete(c.reportedSizes, e.Inode)
+			c.forgetLookups(e.Inode, e.N)
 		}
 		return opErr
 	}
@@ -50,41 +58,77 @@ func (c *Connection) trackReportedSizes(op interface{}, opErr error) error {
 		return opErr
 	}
 
-	switch o := op.(type) {
+	switch o := state.op.(type) {
 	case *fuseops.LookUpInodeOp:
-		c.reportedSizes[o.Entry.Child] = o.Entry.Attributes.Size
+		c.recordEntry(o.Entry.Child, o.Entry.Attributes.Size)
 	case *fuseops.GetInodeAttributesOp:
-		c.reportedSizes[o.Inode] = o.Attributes.Size
+		c.recordSize(o.Inode, o.Attributes.Size)
 	case *fuseops.SetInodeAttributesOp:
-		c.reportedSizes[o.Inode] = o.Attributes.Size
+		c.recordSize(o.Inode, o.Attributes.Size)
 	case *fuseops.MkDirOp:
-		c.reportedSizes[o.Entry.Child] = o.Entry.Attributes.Size
+		c.recordEntry(o.Entry.Child, o.Entry.Attributes.Size)
 	case *fuseops.MkNodeOp:
-		c.reportedSizes[o.Entry.Child] = o.Entry.Attributes.Size
+		c.recordEntry(o.Entry.Child, o.Entry.Attributes.Size)
 	case *fuseops.CreateFileOp:
-		c.reportedSizes[o.Entry.Child] = o.Entry.Attributes.Size
+		c.recordEntry(o.Entry.Child, o.Entry.Attributes.Size)
 	case *fuseops.CreateSymlinkOp:
-		c.reportedSizes[o.Entry.Child] = o.Entry.Attributes.Size
+		c.recordEntry(o.Entry.Child, o.Entry.Attributes.Size)
 	case *fuseops.CreateLinkOp:
-		c.reportedSizes[o.Entry.Child] = o.Entry.Attributes.Size
+		c.recordEntry(o.Entry.Child, o.Entry.Attributes.Size)
 	case *fuseops.ReadDirPlusOp:
-		c.recordDirentPlusSizes(o.Dst[:o.BytesRead])
+		c.recordDirentPlusEntries(o.Dst[:o.BytesRead])
 	case *fuseops.WriteFileOp:
 		end := uint64(o.Offset) + uint64(len(o.Data))
-		if size, ok := c.reportedSizes[o.Inode]; ok && end > size {
-			c.reportedSizes[o.Inode] = end
+		if end > c.reportedInodes[o.Inode].size {
+			c.recordSize(o.Inode, end)
 		}
 	case *fuseops.ReadFileOp:
-		return c.checkReadLength(o)
+		return c.checkReadLength(o, state.sizeAtRead)
 	}
 	return nil
 }
 
-// recordDirentPlusSizes records the size in each fuse_direntplus entry of a
-// READDIRPLUS reply.
+// recordEntry records the size an entry reply reported for inode, and the
+// lookup the reply gives the kernel. Inode 0 is a negative entry, which gives
+// none.
 //
 // LOCKS_REQUIRED(c.mu)
-func (c *Connection) recordDirentPlusSizes(b []byte) {
+func (c *Connection) recordEntry(inode fuseops.InodeID, size uint64) {
+	if inode == 0 {
+		return
+	}
+	c.reportedInodes[inode] = reportedInode{size: size, lookups: c.reportedInodes[inode].lookups + 1}
+}
+
+// recordSize records size for an inode the kernel holds.
+//
+// LOCKS_REQUIRED(c.mu)
+func (c *Connection) recordSize(inode fuseops.InodeID, size uint64) {
+	if r, ok := c.reportedInodes[inode]; ok {
+		r.size = size
+		c.reportedInodes[inode] = r
+	}
+}
+
+// LOCKS_REQUIRED(c.mu)
+func (c *Connection) forgetLookups(inode fuseops.InodeID, n uint64) {
+	r, ok := c.reportedInodes[inode]
+	switch {
+	case !ok:
+	case r.lookups <= n:
+		delete(c.reportedInodes, inode)
+	default:
+		r.lookups -= n
+		c.reportedInodes[inode] = r
+	}
+}
+
+// recordDirentPlusEntries records each fuse_direntplus entry of a READDIRPLUS
+// reply as an entry reply. Like the kernel, it skips "." and "..", and stops
+// at an entry that does not fit.
+//
+// LOCKS_REQUIRED(c.mu)
+func (c *Connection) recordDirentPlusEntries(b []byte) {
 	const (
 		entryOutSize  = int(unsafe.Sizeof(fusekernel.EntryOut{}))
 		headerSize    = entryOutSize + fusekernel.DirentSize
@@ -93,26 +137,29 @@ func (c *Connection) recordDirentPlusSizes(b []byte) {
 		alignment     = 8
 	)
 	for len(b) >= headerSize {
-		inode := fuseops.InodeID(binary.NativeEndian.Uint64(b))
-		c.reportedSizes[inode] = binary.NativeEndian.Uint64(b[sizeOffset:])
-
-		n := headerSize + int(binary.NativeEndian.Uint32(b[namelenOffset:]))
-		n = (n + alignment - 1) &^ (alignment - 1)
+		namelen := int(binary.NativeEndian.Uint32(b[namelenOffset:]))
+		n := (headerSize + namelen + alignment - 1) &^ (alignment - 1)
 		if n > len(b) {
 			return
+		}
+
+		if name := string(b[headerSize : headerSize+namelen]); name != "." && name != ".." {
+			inode := fuseops.InodeID(binary.NativeEndian.Uint64(b))
+			c.recordEntry(inode, binary.NativeEndian.Uint64(b[sizeOffset:]))
 		}
 		b = b[n:]
 	}
 }
 
 // checkReadLength returns EIO when o's reply ends before both the end of the
-// read and the size last recorded for o.Inode.
+// read and the inode's size: the larger of sizeAtRead, the size recorded when
+// the read arrived, and the size recorded now.
 //
 // LOCKS_REQUIRED(c.mu)
-func (c *Connection) checkReadLength(o *fuseops.ReadFileOp) error {
-	size, ok := c.reportedSizes[o.Inode]
+func (c *Connection) checkReadLength(o *fuseops.ReadFileOp, sizeAtRead uint64) error {
+	size := max(sizeAtRead, c.reportedInodes[o.Inode].size)
 	offset := uint64(o.Offset)
-	if !ok || offset >= size {
+	if offset >= size {
 		return nil
 	}
 
@@ -123,4 +170,13 @@ func (c *Connection) checkReadLength(o *fuseops.ReadFileOp) error {
 	return fmt.Errorf(
 		"read of inode %d at offset %d returned %d bytes, want %d for size %d: %w",
 		o.Inode, o.Offset, o.BytesRead, want, size, syscall.EIO)
+}
+
+// reportedSize returns the size recorded for inode, or 0 when none is.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) reportedSize(inode fuseops.InodeID) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reportedInodes[inode].size
 }

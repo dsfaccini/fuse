@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -33,8 +34,11 @@ import (
 type testTransport struct {
 	messages [][]byte
 	reads    int
-	writes   [][]byte
 	writeErr error
+
+	// Reply writes concurrently.
+	mu     sync.Mutex
+	writes [][]byte
 }
 
 func (t *testTransport) ReadMessage(dst []byte) (int, error) {
@@ -53,6 +57,8 @@ func (t *testTransport) WriteMessage(message []byte) error {
 	if t.writeErr != nil {
 		return t.writeErr
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.writes = append(t.writes, append([]byte(nil), message...))
 	return nil
 }
@@ -65,6 +71,8 @@ func (t *testTransport) WritevMessage(parts [][]byte) error {
 	for _, part := range parts {
 		message = append(message, part...)
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.writes = append(t.writes, message)
 	return nil
 }

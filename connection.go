@@ -78,11 +78,11 @@ type Connection struct {
 	// GUARDED_BY(mu)
 	cancelFuncs map[uint64]func()
 
-	// The size last reported for each inode, kept only when the transport pads
-	// short reads. See trackReportedSizes.
+	// The size last reported for each inode the kernel holds, kept only when
+	// the transport pads short reads. See trackReportedSizes.
 	//
 	// GUARDED_BY(mu)
-	reportedSizes map[fuseops.InodeID]uint64
+	reportedInodes map[fuseops.InodeID]reportedInode
 
 	// Freelists, serviced by freelists.go.
 	inMessages  freelist.Freelist // GUARDED_BY(mu)
@@ -99,6 +99,10 @@ type opState struct {
 	outMsg *buffer.OutMessage
 	op     interface{}
 	wlog   *WireLogRecord
+
+	// For a ReadFileOp on a transport that pads short reads, the size recorded
+	// for its inode when it arrived.
+	sizeAtRead uint64
 }
 
 // Return the current wirelog record from the context if the MountConfig
@@ -131,7 +135,7 @@ func newConnection(
 		cancelFuncs: make(map[uint64]func()),
 	}
 	if p, ok := transport.(shortReadPadder); ok && p.padsShortReads() {
-		c.reportedSizes = make(map[fuseops.InodeID]uint64)
+		c.reportedInodes = make(map[fuseops.InodeID]reportedInode)
 	}
 
 	// Initialize.
@@ -493,7 +497,13 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		if c.wireLogger != nil {
 			wlog = NewWireLogRecord()
 		}
-		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog})
+		state := opState{inMsg: inMsg, outMsg: outMsg, op: op, wlog: wlog}
+		if c.reportedInodes != nil {
+			if read, ok := op.(*fuseops.ReadFileOp); ok {
+				state.sizeAtRead = c.reportedSize(read.Inode)
+			}
+		}
+		ctx = context.WithValue(ctx, contextKey, state)
 
 		// Return the op to the user.
 		return ctx, op, nil
@@ -581,8 +591,8 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	c.finishOp(inMsg.Header().Opcode, inMsg.Header().Unique)
 
 	// Record sizes before the reply reaches the kernel, which may act on them.
-	if c.reportedSizes != nil {
-		opErr = c.trackReportedSizes(op, opErr)
+	if c.reportedInodes != nil {
+		opErr = c.trackReportedSizes(state, opErr)
 	}
 
 	logError := c.shouldLogError(op, opErr)

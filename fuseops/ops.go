@@ -743,10 +743,12 @@ type ReadFileOp struct {
 	// the reader padded with bytes that are not file data
 	// (https://github.com/macfuse/macfuse/issues/1231). There the library
 	// replies EIO instead when BytesRead is less than min(Offset+Size, S) -
-	// Offset, where S is the size in the attributes any op last returned for
-	// the inode, extended by any later write past it. So after a file shrinks,
+	// Offset. S is the larger of the inode's size when the read arrived and
+	// when it is answered, where the inode's size is the size in the
+	// attributes any op last returned for it, extended by any later write past
+	// it. Direct IO does not exempt a read from this. So after a file shrinks,
 	// reads inside its old size fail with EIO until a reply reports the new
-	// size.
+	// size, and so does a read that was in flight when it did.
 	BytesRead int
 	OpContext OpContext
 

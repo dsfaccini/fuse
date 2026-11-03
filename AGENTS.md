@@ -67,6 +67,9 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   attributes.
 - An op whose reply gains an inode's attributes must record the size there.
   Without it, the recorded size goes stale, and reads inside it fail with EIO.
+- An op whose reply gives the kernel a lookup must count it through
+  `recordEntry`. Without it, a forget drops the record while the kernel still
+  holds the inode.
 
 ## FSKit changes need a test that does not mount
 
