@@ -211,6 +211,12 @@ func (t *fskitTransport) setMountResult(succeeded bool) {
 	t.mu.Unlock()
 }
 
+// padsShortReads reports the behavior described in
+// https://github.com/macfuse/macfuse/issues/1231.
+func (t *fskitTransport) padsShortReads() bool {
+	return true
+}
+
 func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 	t.mu.Lock()
 	if t.closed {

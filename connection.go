@@ -78,6 +78,12 @@ type Connection struct {
 	// GUARDED_BY(mu)
 	cancelFuncs map[uint64]func()
 
+	// The size last reported for each inode, kept only when the transport pads
+	// short reads. See trackReportedSizes.
+	//
+	// GUARDED_BY(mu)
+	reportedSizes map[fuseops.InodeID]uint64
+
 	// Freelists, serviced by freelists.go.
 	inMessages  freelist.Freelist // GUARDED_BY(mu)
 	outMessages freelist.Freelist // GUARDED_BY(mu)
@@ -123,6 +129,9 @@ func newConnection(
 		wireLogger:  wireLogger,
 		transport:   transport,
 		cancelFuncs: make(map[uint64]func()),
+	}
+	if p, ok := transport.(shortReadPadder); ok && p.padsShortReads() {
+		c.reportedSizes = make(map[fuseops.InodeID]uint64)
 	}
 
 	// Initialize.
@@ -536,8 +545,9 @@ var writeLock sync.Mutex
 // (or nil if successful). The context must be the context returned by ReadOp.
 //
 // The kernel receives the first syscall.Errno in opErr's chain, or EIO when
-// the chain has none. A reply the kernel refuses with ENOENT, because the
-// request was interrupted, is not an error.
+// the chain has none. On FSKit, a short ReadFileOp reply becomes EIO; see
+// fuseops.ReadFileOp.BytesRead. A reply the kernel refuses with ENOENT,
+// because the request was interrupted, is not an error.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) Reply(ctx context.Context, opErr error) error {
@@ -569,6 +579,11 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 
 	// Clean up state for this op.
 	c.finishOp(inMsg.Header().Opcode, inMsg.Header().Unique)
+
+	// Record sizes before the reply reaches the kernel, which may act on them.
+	if c.reportedSizes != nil {
+		opErr = c.trackReportedSizes(op, opErr)
+	}
 
 	logError := c.shouldLogError(op, opErr)
 

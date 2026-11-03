@@ -21,7 +21,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - No CI job sets `FUSE_RUN_MOUNT_TESTS` yet.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
-  fails the writes `Reply` makes.
+  fails the writes `Reply` makes. `newOpTestConnection` in
+  `short_reads_test.go` completes `Init` over it and drives ops through
+  `ReadOp` and `Reply`.
 
 ## Validate a change
 
@@ -56,6 +58,15 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - The kernel reply, the error log and the wire log all judge the errno that
   `Errno` finds. When `Errno` finds none, the kernel gets EIO and the wire-log
   `Status` stays 0.
+
+## Ops that return attributes feed the FSKit short-read check
+
+- On FSKit, `Connection` replies EIO to a `ReadFileOp` reply shorter than the
+  size it last reported for the inode (macfuse#1231). `trackReportedSizes` in
+  `short_reads.go` records those sizes from every reply that carries
+  attributes.
+- An op whose reply gains an inode's attributes must record the size there.
+  Without it, the recorded size goes stale, and reads inside it fail with EIO.
 
 ## FSKit changes need a test that does not mount
 

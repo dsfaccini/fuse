@@ -31,6 +31,14 @@ type connectionTransport interface {
 	Close() error
 }
 
+// shortReadPadder is implemented by a transport that delivers a READ reply
+// shorter than the size it cached for the file padded to that size, with bytes
+// that are not file data. The connection then replies EIO to such a read; see
+// Connection.trackReportedSizes.
+type shortReadPadder interface {
+	padsShortReads() bool
+}
+
 type transportReader struct {
 	transport connectionTransport
 }

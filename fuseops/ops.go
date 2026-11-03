@@ -738,6 +738,15 @@ type ReadFileOp struct {
 	// LookUpInode, GetInodeAttributes, etc.
 	//
 	// If direct IO is enabled, semantics should match those of read(2).
+	//
+	// On FSKit, a reply shorter than the size FSKit cached for the file reaches
+	// the reader padded with bytes that are not file data
+	// (https://github.com/macfuse/macfuse/issues/1231). There the library
+	// replies EIO instead when BytesRead is less than min(Offset+Size, S) -
+	// Offset, where S is the size in the attributes any op last returned for
+	// the inode, extended by any later write past it. So after a file shrinks,
+	// reads inside its old size fail with EIO until a reply reports the new
+	// size.
 	BytesRead int
 	OpContext OpContext
 
