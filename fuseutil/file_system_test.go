@@ -16,8 +16,10 @@ package fuseutil
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"syscall"
 	"testing"
 
 	"github.com/dsfaccini/fuse"
@@ -43,19 +45,21 @@ func TestBatchForgetFallsBackToForgetInodeOnENOSYS(t *testing.T) {
 	tests := []struct {
 		name     string
 		batchErr error
+		wantErr  error
 		want     []fuseops.InodeID
 	}{
-		{"bare ENOSYS", fuse.ENOSYS, []fuseops.InodeID{2, 3}},
-		{"wrapped ENOSYS", fmt.Errorf("batch forget: %w", fuse.ENOSYS), []fuseops.InodeID{2, 3}},
-		{"implemented", nil, nil},
+		{"bare ENOSYS", fuse.ENOSYS, nil, []fuseops.InodeID{2, 3}},
+		{"wrapped ENOSYS", fmt.Errorf("batch forget: %w", fuse.ENOSYS), nil, []fuseops.InodeID{2, 3}},
+		{"implemented", nil, nil, nil},
+		{"other error", syscall.EIO, syscall.EIO, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fs := &forgetRecorder{batchErr: tt.batchErr}
 			s := &fileSystemServer{fs: fs}
 			op := &fuseops.BatchForgetOp{Entries: []fuseops.BatchForgetEntry{{Inode: 2, N: 1}, {Inode: 3, N: 1}}}
-			if err := s.batchForget(context.Background(), op); err != nil {
-				t.Errorf("batchForget = %v, want nil", err)
+			if err := s.batchForget(context.Background(), op); !errors.Is(err, tt.wantErr) {
+				t.Errorf("batchForget = %v, want %v", err, tt.wantErr)
 			}
 			if !slices.Equal(fs.forgotten, tt.want) {
 				t.Errorf("forgotten inodes = %v, want %v", fs.forgotten, tt.want)
