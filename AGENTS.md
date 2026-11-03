@@ -68,11 +68,14 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   lookup. Entry replies create records and count lookups. Getattr and setattr
   replies only update existing records. `trackReportedSizes` records growth
   before a reply is written, and `shrinkReportedSizes` records a shrink after
-  the kernel has the reply.
+  the kernel has the reply. Each reply that can change a record holds
+  `sizeReplyMu` from recording its growth, through its write, to recording its
+  shrink, so records change in write order.
 - An op whose reply gains an inode's attributes must report them in
   `forEachReportedSize`, with `lookup` true when the reply gives the kernel a
-  lookup. A missed size goes stale and fails reads inside it with EIO. A missed
-  lookup lets a forget drop the record while the kernel still holds the inode.
+  lookup, and must be listed in `changesReportedSizes`. A missed size goes
+  stale and fails reads inside it with EIO. A missed lookup lets a forget drop
+  the record while the kernel still holds the inode.
 
 ## FSKit changes need a test that does not mount
 

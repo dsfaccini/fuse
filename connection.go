@@ -84,6 +84,12 @@ type Connection struct {
 	// GUARDED_BY(mu)
 	reportedInodes map[fuseops.InodeID]reportedInode
 
+	// Held by each reply that can change a size record, from recording its
+	// growth, through its write, to applying its shrink, so records change in
+	// the order the kernel receives the replies. Taken before mu, and only when
+	// reportedInodes is kept. See changesReportedSizes.
+	sizeReplyMu sync.Mutex
+
 	// Freelists, serviced by freelists.go.
 	inMessages  freelist.Freelist // GUARDED_BY(mu)
 	outMessages freelist.Freelist // GUARDED_BY(mu)
@@ -593,6 +599,10 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	// Record growth before the reply reaches the kernel, which may act on it.
 	// A shrink waits until the kernel has the reply.
 	if c.reportedInodes != nil {
+		if changesReportedSizes(op) {
+			c.sizeReplyMu.Lock()
+			defer c.sizeReplyMu.Unlock()
+		}
 		opErr = c.trackReportedSizes(state, opErr)
 	}
 

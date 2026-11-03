@@ -32,13 +32,30 @@ type reportedInode struct {
 	lookups uint64
 }
 
+// changesReportedSizes reports whether the reply to op can change a size
+// record. Such a reply holds c.sizeReplyMu from trackReportedSizes, through
+// its write, to shrinkReportedSizes. Otherwise a reply recorded and written
+// between another's write and shrink would see that shrink lower its size,
+// and two overlapping replies could be recorded in one order and written in
+// the other.
+func changesReportedSizes(op interface{}) bool {
+	switch op.(type) {
+	case *fuseops.LookUpInodeOp, *fuseops.GetInodeAttributesOp, *fuseops.SetInodeAttributesOp,
+		*fuseops.MkDirOp, *fuseops.MkNodeOp, *fuseops.CreateFileOp, *fuseops.CreateSymlinkOp,
+		*fuseops.CreateLinkOp, *fuseops.ReadDirPlusOp, *fuseops.WriteFileOp:
+		return true
+	}
+	return false
+}
+
 // trackReportedSizes runs before the reply to state.op is written. It counts
-// the lookups the reply gives the kernel, records each size it reports for a
-// new inode or above the recorded size, and extends a recorded size past the
-// end of a write. A forget lowers the lookup count by its N and drops the inode
-// at zero. Sizes the reply reports below the recorded ones wait for
-// shrinkReportedSizes. It returns the error to reply with: EIO for a
-// ReadFileOp reply that checkReadLength rejects, otherwise opErr.
+// the lookups the reply gives the kernel, creates a record for each inode an
+// entry reply reports, records each size above the recorded one, and extends a
+// recorded size past the end of a write. A forget lowers the lookup count by
+// its N and drops the inode at zero. Sizes the reply reports below the
+// recorded ones wait for shrinkReportedSizes. It returns the error to reply
+// with: EIO for a ReadFileOp reply that checkReadLength rejects, otherwise
+// opErr.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) trackReportedSizes(state opState, opErr error) error {

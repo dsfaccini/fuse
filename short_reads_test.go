@@ -17,6 +17,7 @@ package fuse
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"runtime"
 	"sync"
 	"syscall"
@@ -92,14 +93,15 @@ func (o *opTestConnection) send(opcode uint32, nodeid uint64, body ...[]byte) (c
 // nil for an op the kernel expects no reply to.
 func (o *opTestConnection) reply(ctx context.Context, opErr error) *fusekernel.OutHeader {
 	o.t.Helper()
-	writes := len(o.transport.writes)
+	before := len(o.transport.written())
 	if err := o.c.Reply(ctx, opErr); err != nil {
 		o.t.Fatalf("Reply: %v", err)
 	}
-	if len(o.transport.writes) == writes {
+	writes := o.transport.written()
+	if len(writes) == before {
 		return nil
 	}
-	return (*fusekernel.OutHeader)(unsafe.Pointer(&o.transport.writes[writes][0]))
+	return (*fusekernel.OutHeader)(unsafe.Pointer(&writes[before][0]))
 }
 
 // do sends one op and replies with what serve returns after filling the op in.
@@ -252,41 +254,70 @@ func TestShortReadOnOtherTransports(t *testing.T) {
 	}
 }
 
-// An entry reply records the inode and gives the kernel one lookup.
-func TestReportedSizeFromEveryEntryReply(t *testing.T) {
+// sizeReporter is an op whose reply reports a size for inode 2.
+type sizeReporter struct {
+	name   string
+	opcode uint32
+	body   [][]byte
+	lookup bool // whether the reply gives the kernel a lookup
+	serve  func(size uint64) func(op interface{}) error
+}
+
+func sizeReporters() []sizeReporter {
 	var (
-		mkdir      fusekernel.MkdirIn
-		mknod      fusekernel.MknodIn
-		create     fusekernel.CreateIn
-		link       = fusekernel.LinkIn{Oldnodeid: 2}
-		dirplus    = fusekernel.ReadIn{Size: 4096}
-		serveEntry = func(op interface{}) error {
-			setEntry(op, 2, 100)
+		setattr fusekernel.SetattrIn
+		mkdir   fusekernel.MkdirIn
+		mknod   fusekernel.MknodIn
+		create  fusekernel.CreateIn
+		link    = fusekernel.LinkIn{Oldnodeid: 2}
+		dirplus = fusekernel.ReadIn{Size: 4096}
+	)
+	entry := func(size uint64) func(op interface{}) error {
+		return func(op interface{}) error {
+			setEntry(op, 2, size)
 			return nil
 		}
-	)
-	tests := []struct {
-		name   string
-		opcode uint32
-		serve  func(op interface{}) error
-		body   [][]byte
-	}{
-		{"lookup", fusekernel.OpLookup, serveEntry, [][]byte{[]byte("f\x00")}},
-		{"mkdir", fusekernel.OpMkdir, serveEntry, [][]byte{structBytes(&mkdir), []byte("d\x00")}},
-		{"mknod", fusekernel.OpMknod, serveEntry, [][]byte{structBytes(&mknod), []byte("n\x00")}},
-		{"create", fusekernel.OpCreate, serveEntry, [][]byte{structBytes(&create), []byte("c\x00")}},
-		{"symlink", fusekernel.OpSymlink, serveEntry, [][]byte{[]byte("s\x00t\x00")}},
-		{"link", fusekernel.OpLink, serveEntry, [][]byte{structBytes(&link), []byte("l\x00")}},
-		{"readdirplus", fusekernel.OpReaddirplus, func(op interface{}) error {
-			o := op.(*fuseops.ReadDirPlusOp)
-			o.BytesRead = copy(o.Dst, direntPlus(2, 100, "f"))
-			return nil
-		}, [][]byte{structBytes(&dirplus)}},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name+" of a new inode", func(t *testing.T) {
+	return []sizeReporter{
+		{"lookup", fusekernel.OpLookup, [][]byte{[]byte("f\x00")}, true, entry},
+		{"mkdir", fusekernel.OpMkdir, [][]byte{structBytes(&mkdir), []byte("d\x00")}, true, entry},
+		{"mknod", fusekernel.OpMknod, [][]byte{structBytes(&mknod), []byte("n\x00")}, true, entry},
+		{"create", fusekernel.OpCreate, [][]byte{structBytes(&create), []byte("c\x00")}, true, entry},
+		{"symlink", fusekernel.OpSymlink, [][]byte{[]byte("s\x00t\x00")}, true, entry},
+		{"link", fusekernel.OpLink, [][]byte{structBytes(&link), []byte("l\x00")}, true, entry},
+		{"readdirplus", fusekernel.OpReaddirplus, [][]byte{structBytes(&dirplus)}, true, func(size uint64) func(op interface{}) error {
+			return func(op interface{}) error {
+				o := op.(*fuseops.ReadDirPlusOp)
+				o.BytesRead = copy(o.Dst, direntPlus(2, size, "f"))
+				return nil
+			}
+		}},
+		{"getattr", fusekernel.OpGetattr, nil, false, getattrReply},
+		{"setattr", fusekernel.OpSetattr, [][]byte{structBytes(&setattr)}, false, func(size uint64) func(op interface{}) error {
+			return func(op interface{}) error {
+				op.(*fuseops.SetInodeAttributesOp).Attributes.Size = size
+				return nil
+			}
+		}},
+	}
+}
+
+func getattrReply(size uint64) func(op interface{}) error {
+	return func(op interface{}) error {
+		op.(*fuseops.GetInodeAttributesOp).Attributes.Size = size
+		return nil
+	}
+}
+
+// An entry reply records the inode and gives the kernel one lookup.
+func TestReportedSizeFromEveryEntryReply(t *testing.T) {
+	for _, r := range sizeReporters() {
+		if !r.lookup {
+			continue
+		}
+		t.Run(r.name+" of a new inode", func(t *testing.T) {
 			o := newOpTestConnection(t, true)
-			o.do(tt.opcode, 2, tt.serve, tt.body...)
+			o.do(r.opcode, 2, r.serve(100), r.body...)
 			if errno, n := o.read(2, 0, 512, 100); errno != 0 || n != 100 {
 				t.Errorf("read reply = errno %d with %d bytes, want 100 bytes", errno, n)
 			}
@@ -298,10 +329,10 @@ func TestReportedSizeFromEveryEntryReply(t *testing.T) {
 				t.Errorf("read after forgetting one lookup = errno %d with %d bytes, want 46 bytes", errno, n)
 			}
 		})
-		t.Run(tt.name+" shrinking a held inode", func(t *testing.T) {
+		t.Run(r.name+" shrinking a held inode", func(t *testing.T) {
 			o := newOpTestConnection(t, true)
 			o.lookUp(2, 200)
-			o.do(tt.opcode, 2, tt.serve, tt.body...)
+			o.do(r.opcode, 2, r.serve(100), r.body...)
 			if errno, n := o.read(2, 0, 512, 100); errno != 0 || n != 100 {
 				t.Errorf("read reply = errno %d with %d bytes, want 100 bytes", errno, n)
 			}
@@ -313,58 +344,197 @@ func TestReportedSizeFromEveryEntryReply(t *testing.T) {
 	}
 }
 
-// An attributes reply updates an inode the kernel holds, gives it no lookup,
-// and creates no record.
+// An attributes reply updates an inode the kernel holds, leaves its lookup
+// count alone, and creates no record.
 func TestReportedSizeFromEveryAttributesReply(t *testing.T) {
-	var setattr fusekernel.SetattrIn
-	tests := []struct {
-		name   string
-		opcode uint32
-		serve  func(size uint64) func(op interface{}) error
-		body   [][]byte
-	}{
-		{"getattr", fusekernel.OpGetattr, func(size uint64) func(op interface{}) error {
-			return func(op interface{}) error {
-				op.(*fuseops.GetInodeAttributesOp).Attributes.Size = size
-				return nil
-			}
-		}, nil},
-		{"setattr", fusekernel.OpSetattr, func(size uint64) func(op interface{}) error {
-			return func(op interface{}) error {
-				op.(*fuseops.SetInodeAttributesOp).Attributes.Size = size
-				return nil
-			}
-		}, [][]byte{structBytes(&setattr)}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name+" of a held inode", func(t *testing.T) {
+	for _, r := range sizeReporters() {
+		if r.lookup {
+			continue
+		}
+		for _, size := range []uint64{100, 300} {
+			t.Run(fmt.Sprintf("%s reporting %d for a held inode", r.name, size), func(t *testing.T) {
+				o := newOpTestConnection(t, true)
+				o.lookUp(2, 200)
+				o.lookUp(2, 200)
+				o.do(r.opcode, 2, r.serve(size), r.body...)
+				if errno, n := o.read(2, 0, 512, int(size)); errno != 0 || n != int(size) {
+					t.Errorf("read reply = errno %d with %d bytes, want %d bytes", errno, n, size)
+				}
+				if errno, _ := o.read(2, 0, 512, int(size)-1); errno != syscall.EIO {
+					t.Errorf("short read reply = errno %d, want EIO", errno)
+				}
+				o.forget(2, 1)
+				if errno, _ := o.read(2, 0, 512, int(size)-1); errno != syscall.EIO {
+					t.Errorf("short read after forgetting one of two lookups = errno %d, want EIO", errno)
+				}
+				o.forget(2, 1)
+				if errno, n := o.read(2, 0, 512, 46); errno != 0 || n != 46 {
+					t.Errorf("read after forgetting both lookups = errno %d with %d bytes, want 46 bytes", errno, n)
+				}
+			})
+		}
+		t.Run(r.name+" of an inode no entry reply reported", func(t *testing.T) {
 			o := newOpTestConnection(t, true)
-			o.lookUp(2, 200)
-			o.lookUp(2, 200)
-			o.do(tt.opcode, 2, tt.serve(100), tt.body...)
-			if errno, n := o.read(2, 0, 512, 100); errno != 0 || n != 100 {
-				t.Errorf("read reply = errno %d with %d bytes, want 100 bytes", errno, n)
-			}
-			if errno, _ := o.read(2, 0, 512, 99); errno != syscall.EIO {
-				t.Errorf("short read reply = errno %d, want EIO", errno)
-			}
-			o.forget(2, 1)
-			if errno, _ := o.read(2, 0, 512, 99); errno != syscall.EIO {
-				t.Errorf("short read after forgetting one of two lookups = errno %d, want EIO", errno)
-			}
-			o.forget(2, 1)
-			if errno, n := o.read(2, 0, 512, 46); errno != 0 || n != 46 {
-				t.Errorf("read after forgetting both lookups = errno %d with %d bytes, want 46 bytes", errno, n)
-			}
-		})
-		t.Run(tt.name+" of an inode no entry reply reported", func(t *testing.T) {
-			o := newOpTestConnection(t, true)
-			o.do(tt.opcode, 2, tt.serve(200), tt.body...)
+			o.do(r.opcode, 2, r.serve(200), r.body...)
 			if errno, n := o.read(2, 0, 512, 46); errno != 0 || n != 46 {
 				t.Errorf("read reply = errno %d with %d bytes, want 46 bytes", errno, n)
 			}
 		})
 	}
+}
+
+// hookTransport pads short reads and calls before and after, once each,
+// around the next reply it writes, while the Reply that writes it waits.
+type hookTransport struct {
+	*testTransport
+	mu            sync.Mutex
+	before, after func()
+}
+
+func (*hookTransport) padsShortReads() bool { return true }
+
+func (h *hookTransport) WriteMessage(message []byte) error {
+	return h.WritevMessage([][]byte{message})
+}
+
+func (h *hookTransport) WritevMessage(parts [][]byte) error {
+	h.mu.Lock()
+	before := h.before
+	h.before = nil
+	h.mu.Unlock()
+	if before != nil {
+		before()
+	}
+
+	err := h.testTransport.WritevMessage(parts)
+
+	h.mu.Lock()
+	after := h.after
+	h.after = nil
+	h.mu.Unlock()
+	if after != nil {
+		after()
+	}
+	return err
+}
+
+func newHookTestConnection(t *testing.T) (*opTestConnection, *hookTransport) {
+	t.Helper()
+	init := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
+	transport := &testTransport{messages: [][]byte{makeOpMessage(fusekernel.OpInit, 1, 0, structBytes(&init))}}
+	hooks := &hookTransport{testTransport: transport}
+	c, err := newConnection(MountConfig{OpContext: context.Background()}, nil, nil, nil, hooks)
+	if err != nil {
+		t.Fatalf("newConnection: %v", err)
+	}
+	return &opTestConnection{t: t, transport: transport, c: c, unique: 1}, hooks
+}
+
+// replyDuring replies to ctx from inside another reply's write. A reply that
+// changes size records waits for the other to finish, because the other
+// holds sizeReplyMu. Only when nothing holds it does replyDuring wait for the
+// reply, so that the reply lands inside the other's window.
+func (o *opTestConnection) replyDuring(ctx context.Context, wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(done)
+		if err := o.c.Reply(ctx, nil); err != nil {
+			o.t.Errorf("Reply: %v", err)
+		}
+	}()
+	if o.c.sizeReplyMu.TryLock() {
+		o.c.sizeReplyMu.Unlock()
+		<-done
+	}
+}
+
+// The kernel has a reply's shrink before Reply applies it, and can grow the
+// file again in that time. The growth must survive the shrink.
+func TestShrinkKeepsLaterGrowth(t *testing.T) {
+	for _, r := range sizeReporters() {
+		t.Run(r.name, func(t *testing.T) {
+			o, hooks := newHookTestConnection(t)
+			o.lookUp(2, 200)
+			var wg sync.WaitGroup
+			hooks.after = func() {
+				ctx, op := o.send(fusekernel.OpGetattr, 2)
+				getattrReply(300)(op)
+				o.replyDuring(ctx, &wg)
+			}
+			o.do(r.opcode, 2, r.serve(100), r.body...)
+			wg.Wait()
+			if errno, n := o.read(2, 0, 512, 299); errno != syscall.EIO {
+				t.Errorf("read reply = errno %d with %d bytes, want EIO: the kernel's last size is 300", errno, n)
+			}
+		})
+	}
+}
+
+// The kernel has a truncation before Reply applies it, and can write past
+// the new size in that time.
+func TestShrinkKeepsLaterWrite(t *testing.T) {
+	var setattr fusekernel.SetattrIn
+	o, hooks := newHookTestConnection(t)
+	o.lookUp(2, 200)
+	var wg sync.WaitGroup
+	hooks.after = func() {
+		in := fusekernel.WriteIn{Offset: 100, Size: 50}
+		ctx, _ := o.send(fusekernel.OpWrite, 2, structBytes(&in), make([]byte, 50))
+		o.replyDuring(ctx, &wg)
+	}
+	o.do(fusekernel.OpSetattr, 2, func(op interface{}) error {
+		op.(*fuseops.SetInodeAttributesOp).Attributes.Size = 100
+		return nil
+	}, structBytes(&setattr))
+	wg.Wait()
+	if errno, n := o.read(2, 0, 512, 120); errno != syscall.EIO {
+		t.Errorf("read reply = errno %d with %d bytes, want EIO: the kernel's size is 150 after its write", errno, n)
+	}
+}
+
+// Two replies overlap: one is recorded first, and the other is answered
+// before it is written. The record must match the reply the kernel got last.
+func TestOverlappingRepliesRecordedInWriteOrder(t *testing.T) {
+	o, hooks := newHookTestConnection(t)
+	o.lookUp(2, 200)
+	sizes := map[uint64]uint64{}
+
+	first, op := o.send(fusekernel.OpGetattr, 2)
+	getattrReply(300)(op)
+	sizes[o.unique] = 300
+	second, op := o.send(fusekernel.OpGetattr, 2)
+	getattrReply(100)(op)
+	sizes[o.unique] = 100
+
+	var wg sync.WaitGroup
+	hooks.before = func() { o.replyDuring(second, &wg) }
+	if err := o.c.Reply(first, nil); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	wg.Wait()
+
+	var last uint64
+	for _, w := range o.transport.written() {
+		if unique := (*fusekernel.OutHeader)(unsafe.Pointer(&w[0])).Unique; sizes[unique] != 0 {
+			last = sizes[unique]
+		}
+	}
+	if got := o.c.reportedSize(2); got != last {
+		t.Errorf("recorded size = %d, want %d from the reply the kernel got last", got, last)
+	}
+}
+
+// The kernel can read a file as soon as it has the lookup reply.
+func TestGrowthRecordedBeforeWrite(t *testing.T) {
+	o, hooks := newHookTestConnection(t)
+	hooks.after = func() {
+		if errno, n := o.read(2, 0, 512, 100); errno != syscall.EIO {
+			t.Errorf("read reply = errno %d with %d bytes, want EIO", errno, n)
+		}
+	}
+	o.lookUp(2, 300)
 }
 
 // Growth counts once the reply is sent, a shrink only once the kernel has it.
@@ -447,12 +617,30 @@ func TestNegativeEntryNotRecorded(t *testing.T) {
 	}
 }
 
-func TestReportedSizeKeptOnFailedReply(t *testing.T) {
-	o := newOpTestConnection(t, true)
-	o.lookUp(2, 200)
-	o.do(fusekernel.OpGetattr, 2, func(interface{}) error { return syscall.ENOENT })
-	if errno, _ := o.read(2, 0, 512, 46); errno != syscall.EIO {
-		t.Errorf("short read reply = errno %d, want EIO", errno)
+// The kernel takes no attributes from an error reply.
+func TestReportedSizeUnchangedByFailedReply(t *testing.T) {
+	for _, r := range sizeReporters() {
+		for _, size := range []uint64{0, 300} {
+			t.Run(fmt.Sprintf("%s reporting %d", r.name, size), func(t *testing.T) {
+				o := newOpTestConnection(t, true)
+				o.lookUp(2, 200)
+				serve := r.serve(size)
+				o.do(r.opcode, 2, func(op interface{}) error {
+					serve(op)
+					return syscall.EIO
+				}, r.body...)
+				if errno, _ := o.read(2, 0, 512, 199); errno != syscall.EIO {
+					t.Errorf("short read reply = errno %d, want EIO", errno)
+				}
+				if errno, n := o.read(2, 0, 512, 200); errno != 0 || n != 200 {
+					t.Errorf("read reply = errno %d with %d bytes, want 200 bytes", errno, n)
+				}
+				o.forget(2, 1)
+				if errno, n := o.read(2, 0, 512, 46); errno != 0 || n != 46 {
+					t.Errorf("read after forgetting the only lookup = errno %d with %d bytes, want 46 bytes", errno, n)
+				}
+			})
+		}
 	}
 }
 
@@ -463,6 +651,11 @@ func TestReportedSizeDroppedOnForget(t *testing.T) {
 		// The kernel has forgotten the inode whatever the file system returns.
 		"forget the file system fails": func(o *opTestConnection, inode fuseops.InodeID, n uint64) {
 			o.reply(o.sendForget(inode, n), syscall.ENOSYS)
+		},
+		"batch forget the file system fails": func(o *opTestConnection, inode fuseops.InodeID, n uint64) {
+			count := fusekernel.BatchForgetCountIn{Count: 1}
+			entry := fusekernel.BatchForgetEntryIn{Inode: int64(inode), Nlookup: n}
+			o.do(fusekernel.OpBatchForget, 0, func(interface{}) error { return syscall.ENOSYS }, structBytes(&count), structBytes(&entry))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -548,11 +741,17 @@ func TestConcurrentOpsTrackSizes(t *testing.T) {
 
 	for round := range rounds {
 		first := fuseops.InodeID(2 + round*inodes)
-		var lookups []context.Context
+		var replies []context.Context
 		for inode := first; inode < first+inodes; inode++ {
 			ctx, op := o.send(fusekernel.OpLookup, 1, []byte("f\x00"))
 			setEntry(op, inode, 200)
-			lookups = append(lookups, ctx)
+			replies = append(replies, ctx)
+		}
+		// Forgets change records without sizeReplyMu.
+		if round > 0 {
+			for inode := first - inodes; inode < first; inode++ {
+				replies = append(replies, o.sendForget(inode, 1))
+			}
 		}
 		for inode := first; inode < first+inodes; inode++ {
 			in := fusekernel.ReadIn{Size: 512}
@@ -560,11 +759,11 @@ func TestConcurrentOpsTrackSizes(t *testing.T) {
 			o.transport.messages = append(o.transport.messages, makeOpMessage(fusekernel.OpRead, o.unique, uint64(inode), structBytes(&in)))
 		}
 
-		for _, ctx := range lookups {
+		for _, ctx := range replies {
 			reply(ctx)
 		}
-		// ReadOp reads each read while the lookups are answered. Yielding
-		// after it, without taking a lock, lets them write in between.
+		// ReadOp reads each read while the lookups and forgets are answered.
+		// Yielding after it, without taking a lock, lets them write in between.
 		for range inodes {
 			ctx, op, err := o.c.ReadOp()
 			if err != nil {

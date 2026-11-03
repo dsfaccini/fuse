@@ -79,6 +79,12 @@ func (t *testTransport) WritevMessage(parts [][]byte) error {
 
 func (t *testTransport) Close() error { return nil }
 
+func (t *testTransport) written() [][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.writes
+}
+
 func TestConnectionTransportReadsWholeMessages(t *testing.T) {
 	oldFuseT := fusekernel.IsPlatformFuseT
 	fusekernel.IsPlatformFuseT = false
