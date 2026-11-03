@@ -105,12 +105,22 @@ jobs:
     - name: Use this checkout
       working-directory: artifact-fs
       run: |
-        if ! go list -m github.com/dsfaccini/fuse; then
-          echo "::error::artifact-fs does not require github.com/dsfaccini/fuse"
-          exit 1
+        # Shim: delete this block after the artifact-fs path switch to
+        # github.com/dsfaccini/fuse merges.
+        if go mod edit -json | jq -e '.Require[]? | select(.Path == "github.com/jacobsa/fuse")' >/dev/null; then
+          grep -rl --null --include='*.go' 'github.com/jacobsa/fuse' . |
+            xargs -0 -r perl -pi -e 's#github\.com/jacobsa/fuse#github.com/dsfaccini/fuse#g'
+          go mod edit -droprequire github.com/jacobsa/fuse -dropreplace github.com/jacobsa/fuse
+          echo "::notice::artifact-fs requires github.com/jacobsa/fuse; the shim rewrote its imports to github.com/dsfaccini/fuse"
         fi
         go mod edit -replace github.com/dsfaccini/fuse=../fuse
         go mod tidy
+        # Without this check, a build against the fuse that artifact-fs pins
+        # would pass.
+        if [ "$(go list -m -f '{{with .Replace}}{{.Path}}{{end}}' github.com/dsfaccini/fuse)" != ../fuse ]; then
+          echo "::error::artifact-fs does not require github.com/dsfaccini/fuse"
+          exit 1
+        fi
     - name: Build and vet
       working-directory: artifact-fs
       run: |
