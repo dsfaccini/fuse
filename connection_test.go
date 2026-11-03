@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jacobsa/fuse/internal/buffer"
+	"github.com/dsfaccini/fuse/internal/buffer"
 )
 
 func TestSanitizeMaxPagesAndWrite(t *testing.T) {

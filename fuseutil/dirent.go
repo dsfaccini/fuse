@@ -15,12 +15,12 @@
 package fuseutil
 
 import (
-	"github.com/jacobsa/fuse"
-	"github.com/jacobsa/fuse/internal/fusekernel"
+	"github.com/dsfaccini/fuse"
+	"github.com/dsfaccini/fuse/internal/fusekernel"
 	"syscall"
 	"unsafe"
 
-	"github.com/jacobsa/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 type DirentType uint32

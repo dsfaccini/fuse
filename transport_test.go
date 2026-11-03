@@ -23,8 +23,8 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/jacobsa/fuse/internal/buffer"
-	"github.com/jacobsa/fuse/internal/fusekernel"
+	"github.com/dsfaccini/fuse/internal/buffer"
+	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
 type testTransport struct {

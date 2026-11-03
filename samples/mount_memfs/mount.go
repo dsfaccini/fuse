@@ -21,8 +21,8 @@ import (
 	"os/user"
 	"strconv"
 
-	"github.com/jacobsa/fuse"
-	"github.com/jacobsa/fuse/samples/memfs"
+	"github.com/dsfaccini/fuse"
+	"github.com/dsfaccini/fuse/samples/memfs"
 )
 
 var fMountPoint = flag.String("mount_point", "", "Path to mount point.")

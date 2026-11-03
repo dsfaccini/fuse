@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/jacobsa/fuse"
-	"github.com/jacobsa/fuse/samples/notify_inval"
+	"github.com/dsfaccini/fuse"
+	"github.com/dsfaccini/fuse/samples/notify_inval"
 )
 
 var mountPoint = flag.String("mountpoint", "", "directory to mount the filesystem")

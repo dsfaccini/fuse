@@ -22,7 +22,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jacobsa/fuse/fuseops"
+	"github.com/dsfaccini/fuse/fuseops"
 )
 
 // NewWireLogRecord creates a new empty WireLogRecord.
@@ -35,7 +35,7 @@ func NewWireLogRecord() *WireLogRecord {
 }
 
 // A WireLogRecord is created for each FUSE operation when WireLogger is
-// non-nil. Fields are filled in by jacobsa/fuse; file system implementations
+// non-nil. Fields are filled in by dsfaccini/fuse; file system implementations
 // can add their own fields by writing to the Extra map.
 type WireLogRecord struct {
 	Operation string
