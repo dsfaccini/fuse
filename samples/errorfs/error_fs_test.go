@@ -24,13 +24,17 @@ import (
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/fuseutil"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/errorfs"
 	. "github.com/jacobsa/oglematchers"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestErrorFS(t *testing.T) { RunTests(t) }
+func TestErrorFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Boilerplate

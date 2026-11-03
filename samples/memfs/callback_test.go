@@ -5,12 +5,16 @@ import (
 	"path"
 	"testing"
 
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/memfs"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestFuseServerCallbacks(t *testing.T) { RunTests(t) }
+func TestFuseServerCallbacks(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 type CallbackTest struct {
 	samples.SampleTest

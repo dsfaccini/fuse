@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/roloopbackfs"
 	. "github.com/jacobsa/ogletest"
@@ -34,7 +35,10 @@ var (
 	letters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 )
 
-func TestReadonlyLoopbackFS(t *testing.T) { RunTests(t) }
+func TestReadonlyLoopbackFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 type ReadonlyLoopbackFSTest struct {
 	samples.SampleTest

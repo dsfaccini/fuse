@@ -20,12 +20,16 @@ import (
 	"path"
 	"testing"
 
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/forgetfs"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestForgetFS(t *testing.T) { RunTests(t) }
+func TestForgetFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Boilerplate

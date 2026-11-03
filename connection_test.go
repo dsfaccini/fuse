@@ -47,7 +47,7 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			name:       "only MaxWrite given (128KB)",
 			inputPages: 0,
 			inputWrite: 128 * 1024,
-			wantPages:  defaultMaxPages, // max(128KB, 1MB) / 4KB
+			wantPages:  defaultMaxPages,
 			wantWrite:  128 * 1024,
 			wantErr:    false,
 		},
@@ -55,7 +55,7 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			name:       "only MaxWrite given (not page aligned, 129KB)",
 			inputPages: 0,
 			inputWrite: 129 * 1024,
-			wantPages:  defaultMaxPages, // max(129KB, 1MB) / 4KB
+			wantPages:  defaultMaxPages,
 			wantWrite:  129 * 1024,
 			wantErr:    false,
 		},
@@ -63,7 +63,7 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			name:       "only MaxWrite given (larger than 1MB, e.g. 2MB)",
 			inputPages: 0,
 			inputWrite: 2 * 1024 * 1024,
-			wantPages:  512, // 2MB / 4KB
+			wantPages:  uint16(2 * 1024 * 1024 / pageSize),
 			wantWrite:  2 * 1024 * 1024,
 			wantErr:    false,
 		},
@@ -72,7 +72,7 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			inputPages: 256,
 			inputWrite: 0,
 			wantPages:  256,
-			wantWrite:  defaultMaxWrite, // 256 * 4KB
+			wantWrite:  256 * pageSize,
 			wantErr:    false,
 		},
 		{
@@ -80,7 +80,7 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			inputPages: 32,
 			inputWrite: 0,
 			wantPages:  32,
-			wantWrite:  128 * 1024, // 32 * 4KB
+			wantWrite:  32 * pageSize,
 			wantErr:    false,
 		},
 		{
@@ -88,7 +88,7 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			inputPages: 1,
 			inputWrite: 0,
 			wantPages:  1,
-			wantWrite:  4096, // 1 * 4KB
+			wantWrite:  pageSize,
 			wantErr:    false,
 		},
 		{
@@ -100,11 +100,11 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			name:       "both given (invalid, MaxPages=16, MaxWrite=128KB)",
+			name:       "both given (invalid, MaxWrite one page above MaxPages=16)",
 			inputPages: 16,
-			inputWrite: 128 * 1024,
+			inputWrite: 17 * pageSize,
 			wantPages:  16,
-			wantWrite:  128 * 1024,
+			wantWrite:  17 * pageSize,
 			wantErr:    true,
 			errSubstr:  "must be at least MaxWrite",
 		},

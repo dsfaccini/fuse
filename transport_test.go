@@ -17,10 +17,13 @@ package fuse
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/dsfaccini/fuse/internal/buffer"
@@ -105,12 +108,21 @@ func TestConnectionTransportWritesWholeReplies(t *testing.T) {
 	}
 }
 
+// The kernel takes each write(2) to /dev/fuse as one whole message, so a short
+// write must fail instead of sending the rest as a second message.
 func TestFileTransportWritesWholeMessage(t *testing.T) {
-	r, w, err := os.Pipe()
-	if err != nil {
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
 		t.Fatal(err)
 	}
+	r := os.NewFile(uintptr(fds[0]), "pipe-read")
 	defer r.Close()
+	// os.NewFile keeps a non-blocking descriptor non-blocking, even through
+	// Fd, so a write into a full pipe comes back short.
+	if err := syscall.SetNonblock(fds[1], true); err != nil {
+		t.Fatal(err)
+	}
+	w := os.NewFile(uintptr(fds[1]), "pipe-write")
 	defer w.Close()
 
 	transport := newFileTransport(w)
@@ -124,6 +136,31 @@ func TestFileTransportWritesWholeMessage(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("read bytes = %q, want %q", got, want)
+	}
+
+	// Fill the pipe, then free one page so the next write is short.
+	fill := make([]byte, 1<<16)
+	for {
+		_, err := syscall.Write(fds[1], fill)
+		if err == syscall.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatalf("filling the pipe: %v", err)
+		}
+	}
+	if _, err := io.ReadFull(r, make([]byte, os.Getpagesize())); err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+
+	// os.File.Write would wait for the pipe to drain and finish the message.
+	// The deadline bounds that wait.
+	if err := w.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	err := transport.WriteMessage(make([]byte, 1<<20))
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("WriteMessage into a nearly full pipe = %v, want a short-write error", err)
 	}
 }
 

@@ -28,11 +28,15 @@ import (
 	"testing"
 
 	"github.com/dsfaccini/fuse/fusetesting"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	. "github.com/jacobsa/oglematchers"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestPosix(t *testing.T) { RunTests(t) }
+func TestPosix(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Helpers

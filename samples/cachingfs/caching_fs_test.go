@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/dsfaccini/fuse/fuseutil"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/cachingfs"
 	. "github.com/jacobsa/oglematchers"
@@ -32,7 +33,10 @@ import (
 	"github.com/jacobsa/timeutil"
 )
 
-func TestCachingFS(t *testing.T) { RunTests(t) }
+func TestCachingFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Boilerplate
