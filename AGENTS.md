@@ -6,19 +6,14 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 
 ## Tests never mount by default
 
-- Plain `go test ./...` never mounts a file system. Tests that mount skip unless
+- Every mounting test calls `mounttest.SkipUnlessEnabled` first, so plain
+  `go test ./...` mounts nothing. The mounting tests run only with
   `FUSE_RUN_MOUNT_TESTS=1`.
-- `TestMountingTestsAreGated` in `internal/mounttest` checks the test files of
-  each directory. Code reaches a mount when it names `Mount`, ogletest's
-  `RunTests`, a `SetUp` method, or a function or package-level variable in the
-  same directory's test files that reaches a mount. Its message names the fix.
-  - A test, benchmark or fuzz target that reaches a mount must call the gate
-    first.
-  - An example cannot call the gate. One that reaches a mount must have no
-    `// Output:` comment, so `go test` does not run it.
-  - No `init` may reach a mount.
-  - Limit: the check matches names without type checking. It misses a mount
-    reached through non-test code under a name other than those three.
+- `TestMountingTestsAreGated` in `internal/mounttest` enforces the gate. Its
+  failure names the fix.
+- That test matches names without type checking, so it can miss a mount
+  reached through a shape it does not model, such as non-test code or another
+  package. Read new mounting code by hand.
 - Set `FUSE_RUN_MOUNT_TESTS=1` only on a host that can mount. On Linux that
   needs `fuse3`. On darwin the tests mount through FUSE-T, the default
   `MountConfig.FuseImpl`, which needs `go-nfsv4` at `/usr/local/bin/go-nfsv4`

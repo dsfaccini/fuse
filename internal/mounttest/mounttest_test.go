@@ -91,16 +91,16 @@ func TestMountingTestsAreGated(t *testing.T) {
 
 func TestUngatedMountsFindsIndirectMounts(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		src     string
-		wantErr bool
+		name     string
+		src      string
+		wantErrs int
 	}{
 		{
 			name: "helper",
 			src: `package p
 func mountMinimalFS(t *testing.T) { fuse.Mount("", nil, nil) }
 func TestMountViaHelper(t *testing.T) { mountMinimalFS(t) }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "gated helper",
@@ -118,7 +118,7 @@ func ExampleMount() {
 	fuse.Mount("", nil, nil)
 	// Output:
 }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "example without output",
@@ -129,27 +129,27 @@ func ExampleMount() { fuse.Mount("", nil, nil) }`,
 			name: "direct SetUp",
 			src: `package p
 func TestHelloSetUpDirect(t *testing.T) { (&samples.SampleTest{}).SetUp(nil) }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "fuzz target",
 			src: `package p
 func FuzzMount(f *testing.F) { f.Fuzz(func(t *testing.T, dir string) { fuse.Mount(dir, nil, nil) }) }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "named subtest",
 			src: `package p
 func mountSub(t *testing.T) { fuse.Mount("", nil, nil) }
 func TestNamedSubtest(t *testing.T) { t.Run("mount", mountSub) }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "named fuzz function",
 			src: `package p
 func fuzzMount(t *testing.T, dir string) { fuse.Mount(dir, nil, nil) }
 func FuzzNamed(f *testing.F) { f.Fuzz(fuzzMount) }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "function table",
@@ -160,20 +160,67 @@ func TestTable(t *testing.T) {
 		fn(t)
 	}
 }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "package-level func var",
 			src: `package p
 var mountVar = func(t *testing.T) { fuse.Mount("", nil, nil) }
 func TestFuncVar(t *testing.T) { mountVar(t) }`,
-			wantErr: true,
+			wantErrs: 1,
 		},
 		{
 			name: "init",
 			src: `package p
 func init() { fuse.Mount("", nil, nil) }`,
-			wantErr: true,
+			wantErrs: 1,
+		},
+		{
+			name: "whole-file example",
+			src: `package p
+type exampleFS struct{}
+func ExampleMount() {
+	fuse.Mount("", nil, nil)
+	// Output:
+}`,
+			wantErrs: 1,
+		},
+		{
+			name: "multi-name var",
+			src: `package p
+var mountA, mountB = mountPair()
+func mountPair() (func(*testing.T), func(*testing.T)) {
+	return func(t *testing.T) { fuse.Mount("", nil, nil) }, nil
+}
+func TestSecondName(t *testing.T) { mountB(t) }`,
+			wantErrs: 1,
+		},
+		{
+			name: "package-level initializer",
+			src: `package p
+var fixture = mountAtInit()
+func mountAtInit() int { fuse.Mount("", nil, nil); return 0 }`,
+			wantErrs: 1,
+		},
+		{
+			name: "blank initializer",
+			src: `package p
+var _ = mountAtInit()
+func mountAtInit() int { fuse.Mount("", nil, nil); return 0 }
+func TestUnrelated(t *testing.T) { _ = 1 }`,
+			wantErrs: 1,
+		},
+		{
+			name: "package-level func literal",
+			src: `package p
+var mountLater = func(t *testing.T) { fuse.Mount("", nil, nil) }`,
+		},
+		{
+			name: "init storing a mounting function",
+			src: `package p
+var subtests []func(*testing.T)
+func mountSub(t *testing.T) { fuse.Mount("", nil, nil) }
+func init() { subtests = append(subtests, mountSub) }`,
 		},
 		{
 			name: "init registering a suite",
@@ -188,8 +235,8 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 				t.Fatal(err)
 			}
 			errs, _ := ungatedMounts(fset, []*ast.File{file})
-			if gotErr := len(errs) > 0; gotErr != test.wantErr {
-				t.Errorf("ungatedMounts errors = %v, want errors: %v", errs, test.wantErr)
+			if len(errs) != test.wantErrs {
+				t.Errorf("ungatedMounts errors = %v, want %d", errs, test.wantErrs)
 			}
 		})
 	}
@@ -211,15 +258,16 @@ var mountCallees = []string{"Mount", "RunTests", "SetUp"}
 // another one that reaches a mount. A test, benchmark or fuzz target that
 // reaches a mount must call SkipUnlessEnabled first. An example cannot skip, so
 // an example that reaches a mount must have no output comment, which keeps go
-// test from running it. No init may reach a mount, because init runs before any
-// gate. ungatedMounts returns one error per violation and the number of entry
-// points that reach a mount.
+// test from running it. No init and no package-level initializer may call a
+// function that mounts, because both run before any gate. ungatedMounts returns one error per
+// violation and the number of entry points that reach a mount.
 func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 	reaching := map[string]bool{}
 	for _, name := range mountCallees {
 		reaching[name] = true
 	}
 	var decls []*ast.FuncDecl
+	var initializers []ast.Expr
 	values := map[string][]ast.Node{}
 	for _, file := range files {
 		for _, decl := range file.Decls {
@@ -231,11 +279,21 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 				}
 			case *ast.GenDecl:
 				for _, spec := range decl.Specs {
-					if spec, ok := spec.(*ast.ValueSpec); ok {
-						for i, value := range spec.Values {
-							name := spec.Names[i].Name
-							values[name] = append(values[name], value)
+					spec, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					initializers = append(initializers, spec.Values...)
+					for i, ident := range spec.Names {
+						if ident.Name == "_" || len(spec.Values) == 0 {
+							continue
 						}
+						// var a, b = f() gives both names the one value.
+						value := spec.Values[0]
+						if len(spec.Values) == len(spec.Names) {
+							value = spec.Values[i]
+						}
+						values[ident.Name] = append(values[ident.Name], value)
 					}
 				}
 			}
@@ -253,27 +311,58 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 		}
 	}
 
-	runs := map[*ast.BlockStmt]bool{}
+	// calling holds the functions that mount when called. A function literal
+	// inside a body does not run when the body runs.
+	calling := map[string]bool{}
+	for _, name := range mountCallees {
+		calling[name] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, fn := range decls {
+			if !calling[fn.Name.Name] && callsOutsideFuncLit(fn.Body, calling) {
+				calling[fn.Name.Name] = true
+				changed = true
+			}
+		}
+	}
+
+	// Code is the whole file for a file that holds one example and no tests,
+	// so key by name.
+	runs := map[string]bool{}
 	for _, example := range doc.Examples(files...) {
-		if body, ok := example.Code.(*ast.BlockStmt); ok && (example.Output != "" || example.EmptyOutput) {
-			runs[body] = true
+		if example.Output != "" || example.EmptyOutput {
+			runs["Example"+example.Name] = true
 		}
 	}
 
 	var errs []error
+	for _, value := range initializers {
+		if callsOutsideFuncLit(value, calling) {
+			errs = append(errs, fmt.Errorf("%s: a package-level initializer mounts before any gate can skip; move the mount into a gated test",
+				fset.Position(value.Pos())))
+		}
+	}
 	checked := 0
 	for _, fn := range decls {
 		name := fn.Name.Name
-		if fn.Recv != nil || !references(fn.Body, reaching) {
+		if fn.Recv != nil {
+			continue
+		}
+		if name == "init" {
+			if callsOutsideFuncLit(fn.Body, calling) {
+				errs = append(errs, fmt.Errorf("%s: init mounts before any gate can skip; move the mount into a gated test",
+					fset.Position(fn.Pos())))
+			}
+			continue
+		}
+		if !references(fn.Body, reaching) {
 			continue
 		}
 		if _, ok := mountFailureTests[name]; ok {
 			continue
 		}
 		switch {
-		case name == "init":
-			errs = append(errs, fmt.Errorf("%s: init mounts before any gate can skip; move the mount into a gated test",
-				fset.Position(fn.Pos())))
 		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
 			checked++
 			if !gated(fn.Body) {
@@ -282,7 +371,7 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 			}
 		case isEntry(name, "Example"):
 			checked++
-			if runs[fn.Body] {
+			if runs[name] {
 				errs = append(errs, fmt.Errorf("%s: %s mounts and cannot skip; remove its output comment so go test does not run it",
 					fset.Position(fn.Pos()), name))
 			}
@@ -315,6 +404,24 @@ func references(node ast.Node, names map[string]bool) bool {
 	return found
 }
 
+// callsOutsideFuncLit reports whether running node calls one of names. A
+// function literal in node does not run when node runs.
+func callsOutsideFuncLit(node ast.Node, names map[string]bool) bool {
+	found := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.CallExpr:
+			if names[calleeName(n)] {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
 func gated(body *ast.BlockStmt) bool {
 	if len(body.List) == 0 {
 		return false
@@ -333,4 +440,14 @@ func gated(body *ast.BlockStmt) bool {
 	}
 	pkg, ok := sel.X.(*ast.Ident)
 	return ok && pkg.Name == "mounttest" && sel.Sel.Name == "SkipUnlessEnabled"
+}
+
+func calleeName(call *ast.CallExpr) string {
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		return fun.Sel.Name
+	}
+	return ""
 }
