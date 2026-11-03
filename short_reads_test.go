@@ -383,15 +383,16 @@ func TestReportedSizeFromEveryAttributesReply(t *testing.T) {
 	}
 }
 
-// hookTransport pads short reads and calls before and after, once each,
-// around the next reply it writes, while the Reply that writes it waits.
+// hookTransport calls before and after, once each, around the next reply it
+// writes, while the Reply that writes it waits.
 type hookTransport struct {
 	*testTransport
+	pads          bool
 	mu            sync.Mutex
 	before, after func()
 }
 
-func (*hookTransport) padsShortReads() bool { return true }
+func (h *hookTransport) padsShortReads() bool { return h.pads }
 
 func (h *hookTransport) WriteMessage(message []byte) error {
 	return h.WritevMessage([][]byte{message})
@@ -418,11 +419,11 @@ func (h *hookTransport) WritevMessage(parts [][]byte) error {
 	return err
 }
 
-func newHookTestConnection(t *testing.T) (*opTestConnection, *hookTransport) {
+func newHookTestConnection(t *testing.T, padsShortReads bool) (*opTestConnection, *hookTransport) {
 	t.Helper()
 	init := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
 	transport := &testTransport{messages: [][]byte{makeOpMessage(fusekernel.OpInit, 1, 0, structBytes(&init))}}
-	hooks := &hookTransport{testTransport: transport}
+	hooks := &hookTransport{testTransport: transport, pads: padsShortReads}
 	c, err := newConnection(MountConfig{OpContext: context.Background()}, nil, nil, nil, hooks)
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
@@ -455,7 +456,7 @@ func (o *opTestConnection) replyDuring(ctx context.Context, wg *sync.WaitGroup) 
 func TestShrinkKeepsLaterGrowth(t *testing.T) {
 	for _, r := range sizeReporters() {
 		t.Run(r.name, func(t *testing.T) {
-			o, hooks := newHookTestConnection(t)
+			o, hooks := newHookTestConnection(t, true)
 			o.lookUp(2, 200)
 			var wg sync.WaitGroup
 			hooks.after = func() {
@@ -476,7 +477,7 @@ func TestShrinkKeepsLaterGrowth(t *testing.T) {
 // the new size in that time.
 func TestShrinkKeepsLaterWrite(t *testing.T) {
 	var setattr fusekernel.SetattrIn
-	o, hooks := newHookTestConnection(t)
+	o, hooks := newHookTestConnection(t, true)
 	o.lookUp(2, 200)
 	var wg sync.WaitGroup
 	hooks.after = func() {
@@ -497,7 +498,7 @@ func TestShrinkKeepsLaterWrite(t *testing.T) {
 // Two replies overlap: one is recorded first, and the other is answered
 // before it is written. The record must match the reply the kernel got last.
 func TestOverlappingRepliesRecordedInWriteOrder(t *testing.T) {
-	o, hooks := newHookTestConnection(t)
+	o, hooks := newHookTestConnection(t, true)
 	o.lookUp(2, 200)
 	sizes := map[uint64]uint64{}
 
@@ -526,15 +527,149 @@ func TestOverlappingRepliesRecordedInWriteOrder(t *testing.T) {
 	}
 }
 
-// The kernel can read a file as soon as it has the lookup reply.
-func TestGrowthRecordedBeforeWrite(t *testing.T) {
-	o, hooks := newHookTestConnection(t)
-	hooks.after = func() {
-		if errno, n := o.read(2, 0, 512, 100); errno != syscall.EIO {
-			t.Errorf("read reply = errno %d with %d bytes, want EIO", errno, n)
+// sizeGrowth is a reply that grows inode 2 to 300.
+type sizeGrowth struct {
+	name   string
+	held   bool // whether inode 2 is held at 200 first
+	opcode uint32
+	body   [][]byte
+	serve  func(op interface{}) error
+}
+
+func sizeGrowths() []sizeGrowth {
+	write := fusekernel.WriteIn{Offset: 200, Size: 100}
+	growths := []sizeGrowth{{"write", true, fusekernel.OpWrite, [][]byte{structBytes(&write), make([]byte, 100)}, func(interface{}) error { return nil }}}
+	for _, r := range sizeReporters() {
+		growths = append(growths, sizeGrowth{r.name + " of a held inode", true, r.opcode, r.body, r.serve(300)})
+		if r.lookup {
+			growths = append(growths, sizeGrowth{r.name + " of a new inode", false, r.opcode, r.body, r.serve(300)})
 		}
 	}
-	o.lookUp(2, 300)
+	return growths
+}
+
+func arrivalSize(ctx context.Context) uint64 {
+	return ctx.Value(contextKey).(opState).sizeAtRead
+}
+
+// The kernel can read a file as soon as it has a reply that grows it.
+func TestGrowthRecordedBeforeWrite(t *testing.T) {
+	for _, g := range sizeGrowths() {
+		t.Run(g.name, func(t *testing.T) {
+			o, hooks := newHookTestConnection(t, true)
+			if g.held {
+				o.lookUp(2, 200)
+			}
+			// A READ reply waits for the growing reply, so only the READ
+			// arrives inside its write.
+			var read context.Context
+			var op interface{}
+			hooks.after = func() {
+				in := fusekernel.ReadIn{Size: 512}
+				read, op = o.send(fusekernel.OpRead, 2, structBytes(&in))
+			}
+			o.do(g.opcode, 2, g.serve, g.body...)
+			if got := arrivalSize(read); got != 300 {
+				t.Errorf("size when the read arrived = %d, want 300", got)
+			}
+			if errno, n := o.answerRead(read, op, 250); errno != syscall.EIO {
+				t.Errorf("read reply = errno %d with %d bytes, want EIO", errno, n)
+			}
+		})
+	}
+}
+
+// A growth answered while a READ reply is being written reaches the kernel
+// after that reply, never between its check and its write.
+func TestReadReplyWrittenBeforeLaterGrowth(t *testing.T) {
+	o, hooks := newHookTestConnection(t, true)
+	o.lookUp(2, 200)
+	in := fusekernel.ReadIn{Size: 512}
+	read, op := o.send(fusekernel.OpRead, 2, structBytes(&in))
+	readUnique := o.unique
+	getattr, attrOp := o.send(fusekernel.OpGetattr, 2)
+	getattrReply(300)(attrOp)
+	getattrUnique := o.unique
+
+	var wg sync.WaitGroup
+	hooks.before = func() { o.replyDuring(getattr, &wg) }
+	op.(*fuseops.ReadFileOp).BytesRead = 250
+	if err := o.c.Reply(read, nil); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	wg.Wait()
+
+	grown := false
+	for _, w := range o.transport.written() {
+		h := (*fusekernel.OutHeader)(unsafe.Pointer(&w[0]))
+		switch h.Unique {
+		case getattrUnique:
+			grown = true
+		case readUnique:
+			if n := int(h.Len) - buffer.OutMessageHeaderSize; grown && h.Error == 0 && n < 300 {
+				t.Errorf("the kernel got a %d-byte READ reply after size 300", n)
+			}
+		}
+	}
+}
+
+// A reply that changes size records holds the write side of sizeReplyMu while
+// it is written, and a READ reply the read side.
+func TestRepliesHoldSizeReplyMuWhileWritten(t *testing.T) {
+	type check struct {
+		name   string
+		opcode uint32
+		body   [][]byte
+		serve  func(op interface{}) error
+		read   bool
+	}
+	var checks []check
+	for _, g := range sizeGrowths() {
+		if g.held {
+			checks = append(checks, check{g.name, g.opcode, g.body, g.serve, false})
+		}
+	}
+	in := fusekernel.ReadIn{Size: 512}
+	checks = append(checks, check{"read", fusekernel.OpRead, [][]byte{structBytes(&in)}, func(op interface{}) error {
+		op.(*fuseops.ReadFileOp).BytesRead = 200
+		return nil
+	}, true})
+
+	for _, ch := range checks {
+		t.Run(ch.name, func(t *testing.T) {
+			o, hooks := newHookTestConnection(t, true)
+			o.lookUp(2, 200)
+			hooks.before = func() {
+				if o.c.sizeReplyMu.TryLock() {
+					o.c.sizeReplyMu.Unlock()
+					t.Error("reply written without sizeReplyMu")
+				}
+				readable := o.c.sizeReplyMu.TryRLock()
+				if readable {
+					o.c.sizeReplyMu.RUnlock()
+				}
+				if readable != ch.read {
+					t.Errorf("read side free while written = %v, want %v", readable, ch.read)
+				}
+			}
+			o.do(ch.opcode, 2, ch.serve, ch.body...)
+		})
+	}
+}
+
+func TestOtherTransportsSkipSizeReplyMu(t *testing.T) {
+	o, hooks := newHookTestConnection(t, false)
+	free := func() {
+		if !o.c.sizeReplyMu.TryLock() {
+			t.Error("a transport that does not pad short reads took sizeReplyMu")
+			return
+		}
+		o.c.sizeReplyMu.Unlock()
+	}
+	hooks.before = free
+	o.lookUp(2, 200)
+	hooks.before = free
+	o.read(2, 0, 512, 46)
 }
 
 // Growth counts once the reply is sent, a shrink only once the kernel has it.

@@ -32,12 +32,18 @@ type reportedInode struct {
 	lookups uint64
 }
 
-// changesReportedSizes reports whether the reply to op can change a size
-// record. Such a reply holds c.sizeReplyMu from trackReportedSizes, through
-// its write, to shrinkReportedSizes. Otherwise a reply recorded and written
-// between another's write and shrink would see that shrink lower its size,
-// and two overlapping replies could be recorded in one order and written in
-// the other.
+// changesReportedSizes reports whether the reply to op reaches the kernel and
+// can change a size record. Such a reply holds the write side of
+// c.sizeReplyMu from trackReportedSizes, through its write, to
+// shrinkReportedSizes. Otherwise a reply recorded and written between
+// another's write and shrink would see that shrink lower its size, two
+// overlapping replies could be recorded in one order and written in the
+// other, and a size could reach the kernel between a ReadFileOp reply's check
+// and its write.
+//
+// Forgets change records but write nothing, so they take no lock beyond c.mu.
+// fuseutil answers ForgetInodeOp inline in its serve loop, which a forget
+// waiting on sizeReplyMu would stall.
 func changesReportedSizes(op interface{}) bool {
 	switch op.(type) {
 	case *fuseops.LookUpInodeOp, *fuseops.GetInodeAttributesOp, *fuseops.SetInodeAttributesOp,

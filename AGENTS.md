@@ -68,9 +68,11 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   lookup. Entry replies create records and count lookups. Getattr and setattr
   replies only update existing records. `trackReportedSizes` records growth
   before a reply is written, and `shrinkReportedSizes` records a shrink after
-  the kernel has the reply. Each reply that can change a record holds
-  `sizeReplyMu` from recording its growth, through its write, to recording its
-  shrink, so records change in write order.
+  the kernel has the reply. Each reply that can change a record holds the
+  write side of `sizeReplyMu` from recording its growth, through its write, to
+  recording its shrink, so records change in write order. A READ reply holds
+  the read side from its check through its write. Forgets change records too,
+  but write nothing and take neither side.
 - An op whose reply gains an inode's attributes must report them in
   `forEachReportedSize`, with `lookup` true when the reply gives the kernel a
   lookup, and must be listed in `changesReportedSizes`. A missed size goes
