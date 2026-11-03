@@ -71,6 +71,10 @@ func TestLoadFSKitAPIReportsMissingFramework(t *testing.T) {
 
 func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
 	if _, err := os.Stat(fskitFrameworkPath); err != nil {
+		// CI installs macFUSE, so there a missing framework is a failure.
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			t.Fatalf("macFUSE MFMount framework not installed: %v", err)
+		}
 		t.Skipf("macFUSE MFMount framework not installed: %v", err)
 	}
 	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {

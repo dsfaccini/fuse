@@ -9,10 +9,16 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Plain `go test ./...` never mounts a file system. Tests that mount skip unless
   `FUSE_RUN_MOUNT_TESTS=1`.
 - `TestMountingTestsAreGated` in `internal/mounttest` checks the test files of
-  each directory. It flags a test, benchmark, fuzz target or example that calls
-  `Mount`, ogletest's `RunTests` or a `SetUp` method without the gate. It also
-  follows calls through functions declared in the same directory's test files.
-  Its message names the fix.
+  each directory. Code reaches a mount when it names `Mount`, ogletest's
+  `RunTests`, a `SetUp` method, or a function or package-level variable in the
+  same directory's test files that reaches a mount. Its message names the fix.
+  - A test, benchmark or fuzz target that reaches a mount must call the gate
+    first.
+  - An example cannot call the gate. One that reaches a mount must have no
+    `// Output:` comment, so `go test` does not run it.
+  - No `init` may reach a mount.
+  - Limit: the check matches names without type checking. It misses a mount
+    reached through non-test code under a name other than those three.
 - Set `FUSE_RUN_MOUNT_TESTS=1` only on a host that can mount. On Linux that
   needs `fuse3`. On darwin the tests mount through FUSE-T, the default
   `MountConfig.FuseImpl`, which needs `go-nfsv4` at `/usr/local/bin/go-nfsv4`
@@ -34,8 +40,10 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 `master`:
 
 - `gofmt`.
-- `linux` and `macos`: build, vet and `go test -race -count=1 ./...`. `macos` installs
-  macFUSE, so the FSKit tests load the real MFMount framework.
+- `linux` and `macos`: build, vet and `go test -race -count=1 ./...`.
+- `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
+  That test loads the installed MFMount framework. It fails when
+  `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.

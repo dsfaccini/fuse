@@ -137,6 +137,49 @@ func TestHelloSetUpDirect(t *testing.T) { (&samples.SampleTest{}).SetUp(nil) }`,
 func FuzzMount(f *testing.F) { f.Fuzz(func(t *testing.T, dir string) { fuse.Mount(dir, nil, nil) }) }`,
 			wantErr: true,
 		},
+		{
+			name: "named subtest",
+			src: `package p
+func mountSub(t *testing.T) { fuse.Mount("", nil, nil) }
+func TestNamedSubtest(t *testing.T) { t.Run("mount", mountSub) }`,
+			wantErr: true,
+		},
+		{
+			name: "named fuzz function",
+			src: `package p
+func fuzzMount(t *testing.T, dir string) { fuse.Mount(dir, nil, nil) }
+func FuzzNamed(f *testing.F) { f.Fuzz(fuzzMount) }`,
+			wantErr: true,
+		},
+		{
+			name: "function table",
+			src: `package p
+func mountSub(t *testing.T) { fuse.Mount("", nil, nil) }
+func TestTable(t *testing.T) {
+	for _, fn := range []func(*testing.T){mountSub} {
+		fn(t)
+	}
+}`,
+			wantErr: true,
+		},
+		{
+			name: "package-level func var",
+			src: `package p
+var mountVar = func(t *testing.T) { fuse.Mount("", nil, nil) }
+func TestFuncVar(t *testing.T) { mountVar(t) }`,
+			wantErr: true,
+		},
+		{
+			name: "init",
+			src: `package p
+func init() { fuse.Mount("", nil, nil) }`,
+			wantErr: true,
+		},
+		{
+			name: "init registering a suite",
+			src: `package p
+func init() { RegisterTestSuite(&HelloFSTest{}) }`,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fset := token.NewFileSet()
@@ -163,31 +206,49 @@ var mountFailureTests = map[string]string{
 // samples.SubprocessTest.
 var mountCallees = []string{"Mount", "RunTests", "SetUp"}
 
-// ungatedMounts checks the test files of one directory. A test, benchmark or
-// fuzz target that reaches a mount, directly or through functions declared in
-// files, must call SkipUnlessEnabled first. An example cannot skip, so an
-// example that reaches a mount must have no output comment, which keeps go test
-// from running it. ungatedMounts returns one error per violation and the
-// number of entry points that reach a mount.
+// ungatedMounts checks the test files of one directory. A function or
+// package-level variable reaches a mount when its body names a mount callee or
+// another one that reaches a mount. A test, benchmark or fuzz target that
+// reaches a mount must call SkipUnlessEnabled first. An example cannot skip, so
+// an example that reaches a mount must have no output comment, which keeps go
+// test from running it. No init may reach a mount, because init runs before any
+// gate. ungatedMounts returns one error per violation and the number of entry
+// points that reach a mount.
 func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 	reaching := map[string]bool{}
 	for _, name := range mountCallees {
 		reaching[name] = true
 	}
 	var decls []*ast.FuncDecl
+	values := map[string][]ast.Node{}
 	for _, file := range files {
 		for _, decl := range file.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
-				decls = append(decls, fn)
+			switch decl := decl.(type) {
+			case *ast.FuncDecl:
+				if decl.Body != nil {
+					decls = append(decls, decl)
+					values[decl.Name.Name] = append(values[decl.Name.Name], decl.Body)
+				}
+			case *ast.GenDecl:
+				for _, spec := range decl.Specs {
+					if spec, ok := spec.(*ast.ValueSpec); ok {
+						for i, value := range spec.Values {
+							name := spec.Names[i].Name
+							values[name] = append(values[name], value)
+						}
+					}
+				}
 			}
 		}
 	}
 	for changed := true; changed; {
 		changed = false
-		for _, fn := range decls {
-			if !reaching[fn.Name.Name] && calls(fn.Body, reaching) {
-				reaching[fn.Name.Name] = true
-				changed = true
+		for name, nodes := range values {
+			for _, node := range nodes {
+				if !reaching[name] && references(node, reaching) {
+					reaching[name] = true
+					changed = true
+				}
 			}
 		}
 	}
@@ -203,13 +264,16 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 	checked := 0
 	for _, fn := range decls {
 		name := fn.Name.Name
-		if fn.Recv != nil || !calls(fn.Body, reaching) {
+		if fn.Recv != nil || !references(fn.Body, reaching) {
 			continue
 		}
 		if _, ok := mountFailureTests[name]; ok {
 			continue
 		}
 		switch {
+		case name == "init":
+			errs = append(errs, fmt.Errorf("%s: init mounts before any gate can skip; move the mount into a gated test",
+				fset.Position(fn.Pos())))
 		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
 			checked++
 			if !gated(fn.Body) {
@@ -238,10 +302,12 @@ func isEntry(name, prefix string) bool {
 	return rest == "" || !unicode.IsLower(r)
 }
 
-func calls(body *ast.BlockStmt, names map[string]bool) bool {
+// references reports whether node names one of names, as a call or as a
+// value such as a subtest function passed to t.Run.
+func references(node ast.Node, names map[string]bool) bool {
 	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok && names[calleeName(call)] {
+	ast.Inspect(node, func(n ast.Node) bool {
+		if ident, ok := n.(*ast.Ident); ok && names[ident.Name] {
 			found = true
 		}
 		return !found
@@ -267,14 +333,4 @@ func gated(body *ast.BlockStmt) bool {
 	}
 	pkg, ok := sel.X.(*ast.Ident)
 	return ok && pkg.Name == "mounttest" && sel.Sel.Name == "SkipUnlessEnabled"
-}
-
-func calleeName(call *ast.CallExpr) string {
-	switch fun := call.Fun.(type) {
-	case *ast.Ident:
-		return fun.Name
-	case *ast.SelectorExpr:
-		return fun.Sel.Name
-	}
-	return ""
 }
