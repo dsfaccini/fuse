@@ -8,13 +8,17 @@ import (
 	"time"
 
 	"github.com/dsfaccini/fuse/fusetesting"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/notify_inval"
 
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestNotifyInvalFS(t *testing.T) { RunTests(t) }
+func TestNotifyInvalFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 func (t *NotifyInvalFSTest) setTime(tv time.Time) {
 	t.ticker.tickchan <- tv

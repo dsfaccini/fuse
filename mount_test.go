@@ -11,6 +11,7 @@ import (
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/fuseutil"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 )
 
 ////////////////////////////////////////////////////////////////////////
@@ -34,6 +35,8 @@ func (fs *minimalFS) StatFS(
 ////////////////////////////////////////////////////////////////////////
 
 func TestSuccessfulMount(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+
 	ctx := context.Background()
 
 	// Set up a temporary directory.

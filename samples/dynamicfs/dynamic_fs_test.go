@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/dsfaccini/fuse/fusetesting"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/dynamicfs"
 
@@ -19,7 +20,10 @@ import (
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestDynamicFS(t *testing.T) { RunTests(t) }
+func TestDynamicFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 type DynamicFSTest struct {
 	samples.SampleTest

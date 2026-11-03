@@ -33,6 +33,7 @@ import (
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fusetesting"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/memfs"
 	. "github.com/jacobsa/oglematchers"
@@ -40,7 +41,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestMemFS(t *testing.T) { RunTests(t) }
+func TestMemFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 // The radius we use for "expect mtime is within"-style assertions. We can't
 // share a synchronized clock with the ultimate source of mtimes because with

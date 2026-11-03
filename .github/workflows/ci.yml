@@ -8,17 +8,21 @@ on:
     branches:
       - '*'
 
+permissions:
+  contents: read
+
 jobs:
   gofmt:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Go
-      uses: actions/setup-go@v2.1.4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        go-version: ^1.19
-      id: go
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
     # Check the codebase has been formatted by `gofmt`.
     # We run two `gofmt` commands for different purposes:
     # 1. `gofmt -d .`: to print diffs in the CI log if any.
@@ -30,42 +34,89 @@ jobs:
         gofmt -d .
         test -z $(gofmt -l .)
 
-  linux-tests:
+  # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
+  linux:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Go
-      uses: actions/setup-go@v2.1.4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        go-version: ^1.19
-      id: go
-    - name: Install fuse
-      run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse-dev
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
     - name: Build
       run: go build ./...
     # composites and unsafeptr report existing findings in connection.go,
     # conversions.go and internal/buffer.
-    - name: Vet darwin code
-      run: GOOS=darwin go vet -composites=false -unsafeptr=false ./...
-    # Disabled running `go test` because running tests hung at random,
-    # preventing us from running the tests in CI reliably.
-    # (cf. https://github.com/jacobsa/fuse/issues/97)
+    - name: Vet
+      run: |
+        go vet -composites=false -unsafeptr=false ./...
+        GOARCH=arm64 go vet -composites=false -unsafeptr=false ./...
+    - name: Test
+      run: go test -race -count=1 ./...
 
-  macos-build:
+  # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
+  macos:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Go
-      uses: actions/setup-go@v2.1.4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        go-version: ^1.19
-      id: go
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+    # TestLoadFSKitAPIResolvesInstalledFramework loads the installed MFMount
+    # framework, and fails here when it is missing.
     - name: Install macfuse
       run: HOMEBREW_NO_AUTO_UPDATE=1 brew install macfuse
     - name: Build
+      run: go build ./...
+    # composites and unsafeptr report existing findings in connection.go,
+    # conversions.go and internal/buffer.
+    - name: Vet
+      run: go vet -composites=false -unsafeptr=false ./...
+    - name: Test
+      run: go test -race -count=1 ./...
+
+  # Builds and vets the consumer against this checkout, for Linux and darwin.
+  artifact-fs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        path: fuse
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: dsfaccini/artifact-fs
+        ref: main
+        path: artifact-fs
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: artifact-fs/go.mod
+        cache-dependency-path: artifact-fs/go.sum
+    - name: Use this checkout
+      working-directory: artifact-fs
+      run: |
+        go mod edit -replace github.com/dsfaccini/fuse=../fuse
+        go mod tidy
+        # Without this check, a build against the fuse that artifact-fs pins
+        # would pass.
+        if [ "$(go list -m -f '{{with .Replace}}{{.Path}}{{end}}' github.com/dsfaccini/fuse)" != ../fuse ]; then
+          echo "::error::artifact-fs does not require github.com/dsfaccini/fuse"
+          exit 1
+        fi
+    - name: Build and vet
+      working-directory: artifact-fs
       run: |
         go build ./...
-        go build ./samples/mount_hello/... ./samples/mount_roloopbackfs/... ./samples/mount_sample/...
-    # Skip running tests as `go test` hung in macOS.
+        go vet ./...
+        GOOS=darwin go build ./...
+        GOOS=darwin go vet ./...

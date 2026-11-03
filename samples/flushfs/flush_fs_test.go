@@ -32,12 +32,16 @@ import (
 
 	"github.com/dsfaccini/fuse/fsutil"
 	"github.com/dsfaccini/fuse/fusetesting"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	. "github.com/jacobsa/oglematchers"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestFlushFS(t *testing.T) { RunTests(t) }
+func TestFlushFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Boilerplate
@@ -162,19 +166,6 @@ func (t *flushFSTest) getFsyncs() []string {
 		panic(err)
 	}
 	return p
-}
-
-// Like syscall.Dup2, but correctly annotates the syscall as blocking. See here
-// for more info: https://github.com/golang/go/issues/10202
-func dup2(oldfd int, newfd int) error {
-	_, _, e1 := syscall.Syscall(
-		syscall.SYS_DUP2, uintptr(oldfd), uintptr(newfd), 0)
-
-	if e1 != 0 {
-		return e1
-	}
-
-	return nil
 }
 
 // Call msync(2) with the MS_SYNC flag on a slice previously returned by
@@ -554,7 +545,7 @@ func (t *NoErrorsTest) Dup2() {
 
 	// Duplicate the temporary file descriptor on top of the file from our file
 	// system. We should see a flush.
-	err = dup2(int(t.f2.Fd()), int(t.f1.Fd()))
+	err = unix.Dup2(int(t.f2.Fd()), int(t.f1.Fd()))
 	ExpectEq(nil, err)
 
 	ExpectThat(t.getFlushes(), ElementsAre("taco"))
@@ -869,7 +860,7 @@ func (t *FlushErrorTest) Dup2() {
 
 	// Duplicate the temporary file descriptor on top of the file from our file
 	// system. We shouldn't see the flush error.
-	err = dup2(int(t.f2.Fd()), int(t.f1.Fd()))
+	err = unix.Dup2(int(t.f2.Fd()), int(t.f1.Fd()))
 	ExpectEq(nil, err)
 }
 

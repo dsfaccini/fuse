@@ -26,10 +26,14 @@ import (
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestWireLog(t *testing.T) { RunTests(t) }
+func TestWireLog(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 type WireLogTest struct {
 	ctx context.Context

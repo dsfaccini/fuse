@@ -28,12 +28,16 @@ import (
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/fuseutil"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/statfs"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestStatFS(t *testing.T) { RunTests(t) }
+func TestStatFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 const fsName = "some_fs_name"
 const volumeName = "Some volume"

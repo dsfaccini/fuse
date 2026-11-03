@@ -23,13 +23,17 @@ import (
 	"testing"
 
 	"github.com/dsfaccini/fuse/fusetesting"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/hellofs"
 	. "github.com/jacobsa/oglematchers"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestHelloFS(t *testing.T) { RunTests(t) }
+func TestHelloFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Boilerplate

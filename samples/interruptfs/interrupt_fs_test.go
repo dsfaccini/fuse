@@ -23,13 +23,17 @@ import (
 	"time"
 
 	"github.com/dsfaccini/fuse/fuseutil"
+	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/interruptfs"
 	. "github.com/jacobsa/oglematchers"
 	. "github.com/jacobsa/ogletest"
 )
 
-func TestInterruptFS(t *testing.T) { RunTests(t) }
+func TestInterruptFS(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	RunTests(t)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Boilerplate
