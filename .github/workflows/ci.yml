@@ -55,7 +55,7 @@ jobs:
         go vet -composites=false -unsafeptr=false ./...
         GOARCH=arm64 go vet -composites=false -unsafeptr=false ./...
     - name: Test
-      run: go test -race ./...
+      run: go test -race -count=1 ./...
 
   # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
   macos:
@@ -79,10 +79,9 @@ jobs:
     - name: Vet
       run: go vet -composites=false -unsafeptr=false ./...
     - name: Test
-      run: go test -race ./...
+      run: go test -race -count=1 ./...
 
-  # Builds and vets the consumer against this checkout, for Linux and darwin,
-  # once per build tag artifact-fs still has.
+  # Builds and vets the consumer against this checkout, for Linux and darwin.
   artifact-fs:
     runs-on: ubuntu-latest
 
@@ -105,14 +104,6 @@ jobs:
     - name: Use this checkout
       working-directory: artifact-fs
       run: |
-        # Shim: delete this block after the artifact-fs path switch to
-        # github.com/dsfaccini/fuse merges.
-        if go mod edit -json | jq -e '.Require[]? | select(.Path == "github.com/jacobsa/fuse")' >/dev/null; then
-          grep -rl --null --include='*.go' 'github.com/jacobsa/fuse' . |
-            xargs -0 -r perl -pi -e 's#github\.com/jacobsa/fuse#github.com/dsfaccini/fuse#g'
-          go mod edit -droprequire github.com/jacobsa/fuse -dropreplace github.com/jacobsa/fuse
-          echo "::notice::artifact-fs requires github.com/jacobsa/fuse; the shim rewrote its imports to github.com/dsfaccini/fuse"
-        fi
         go mod edit -replace github.com/dsfaccini/fuse=../fuse
         go mod tidy
         # Without this check, a build against the fuse that artifact-fs pins
@@ -124,15 +115,7 @@ jobs:
     - name: Build and vet
       working-directory: artifact-fs
       run: |
-        tags=("")
-        if grep -rqE --include='*.go' '^//go:build .*\bfskit\b' .; then
-          tags+=(fskit)
-        fi
-        for tag in "${tags[@]}"; do
-          echo "::group::tags=\"$tag\""
-          go build -tags "$tag" ./...
-          go vet -tags "$tag" ./...
-          GOOS=darwin go build -tags "$tag" ./...
-          GOOS=darwin go vet -tags "$tag" ./...
-          echo "::endgroup::"
-        done
+        go build ./...
+        go vet ./...
+        GOOS=darwin go build ./...
+        GOOS=darwin go vet ./...

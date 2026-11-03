@@ -15,7 +15,9 @@
 package mounttest
 
 import (
+	"fmt"
 	"go/ast"
+	"go/doc"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -23,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestSkipUnlessEnabledSkipsByDefault(t *testing.T) {
@@ -37,15 +41,8 @@ func TestSkipUnlessEnabledSkipsByDefault(t *testing.T) {
 	}
 }
 
-// mountFailureTests call Mount but fail before anything is mounted.
-var mountFailureTests = map[string]string{
-	"TestNonexistentMountPoint":        "checkMountPoint rejects the directory",
-	"TestMountReturnsTypedFSKitErrors": "the FSKit preflight fails",
-}
-
-// TestMountingTestsAreGated scans every test in the module. A test that calls
-// Mount, or ogletest's RunTests whose suites mount in SetUp, must call
-// SkipUnlessEnabled first.
+// TestMountingTestsAreGated runs ungatedMounts on the test files of every
+// directory in the module.
 func TestMountingTestsAreGated(t *testing.T) {
 	root := filepath.Join("..", "..")
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
@@ -53,7 +50,7 @@ func TestMountingTestsAreGated(t *testing.T) {
 	}
 
 	fset := token.NewFileSet()
-	checked := 0
+	filesByDir := map[string][]*ast.File{}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -67,42 +64,185 @@ func TestMountingTestsAreGated(t *testing.T) {
 		if !strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			return err
 		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil || fn.Body == nil || !strings.HasPrefix(fn.Name.Name, "Test") {
-				continue
-			}
-			if _, ok := mountFailureTests[fn.Name.Name]; ok || !mounts(fn.Body) {
-				continue
-			}
-			checked++
-			if !gated(fn.Body) {
-				t.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled(t) as its first statement",
-					fset.Position(fn.Pos()), fn.Name.Name)
-			}
-		}
+		dir := filepath.Dir(path)
+		filesByDir[dir] = append(filesByDir[dir], file)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	checked := 0
+	for _, files := range filesByDir {
+		errs, n := ungatedMounts(fset, files)
+		checked += n
+		for _, err := range errs {
+			t.Error(err)
+		}
 	}
 	if checked == 0 {
 		t.Fatal("found no mounting tests; the scan is broken")
 	}
 }
 
-func mounts(body *ast.BlockStmt) bool {
+func TestUngatedMountsFindsIndirectMounts(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		src     string
+		wantErr bool
+	}{
+		{
+			name: "helper",
+			src: `package p
+func mountMinimalFS(t *testing.T) { fuse.Mount("", nil, nil) }
+func TestMountViaHelper(t *testing.T) { mountMinimalFS(t) }`,
+			wantErr: true,
+		},
+		{
+			name: "gated helper",
+			src: `package p
+func mountMinimalFS(t *testing.T) { fuse.Mount("", nil, nil) }
+func TestMountViaHelper(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	mountMinimalFS(t)
+}`,
+		},
+		{
+			name: "example with output",
+			src: `package p
+func ExampleMount() {
+	fuse.Mount("", nil, nil)
+	// Output:
+}`,
+			wantErr: true,
+		},
+		{
+			name: "example without output",
+			src: `package p
+func ExampleMount() { fuse.Mount("", nil, nil) }`,
+		},
+		{
+			name: "direct SetUp",
+			src: `package p
+func TestHelloSetUpDirect(t *testing.T) { (&samples.SampleTest{}).SetUp(nil) }`,
+			wantErr: true,
+		},
+		{
+			name: "fuzz target",
+			src: `package p
+func FuzzMount(f *testing.F) { f.Fuzz(func(t *testing.T, dir string) { fuse.Mount(dir, nil, nil) }) }`,
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "p_test.go", test.src, parser.ParseComments|parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatal(err)
+			}
+			errs, _ := ungatedMounts(fset, []*ast.File{file})
+			if gotErr := len(errs) > 0; gotErr != test.wantErr {
+				t.Errorf("ungatedMounts errors = %v, want errors: %v", errs, test.wantErr)
+			}
+		})
+	}
+}
+
+// mountFailureTests call Mount but fail before anything is mounted.
+var mountFailureTests = map[string]string{
+	"TestNonexistentMountPoint":        "checkMountPoint rejects the directory",
+	"TestMountReturnsTypedFSKitErrors": "the FSKit preflight fails",
+}
+
+// mountCallees mount when called: Mount directly, ogletest's RunTests through
+// suites that mount in SetUp, and SetUp on samples.SampleTest and
+// samples.SubprocessTest.
+var mountCallees = []string{"Mount", "RunTests", "SetUp"}
+
+// ungatedMounts checks the test files of one directory. A test, benchmark or
+// fuzz target that reaches a mount, directly or through functions declared in
+// files, must call SkipUnlessEnabled first. An example cannot skip, so an
+// example that reaches a mount must have no output comment, which keeps go test
+// from running it. ungatedMounts returns one error per violation and the
+// number of entry points that reach a mount.
+func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
+	reaching := map[string]bool{}
+	for _, name := range mountCallees {
+		reaching[name] = true
+	}
+	var decls []*ast.FuncDecl
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
+				decls = append(decls, fn)
+			}
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, fn := range decls {
+			if !reaching[fn.Name.Name] && calls(fn.Body, reaching) {
+				reaching[fn.Name.Name] = true
+				changed = true
+			}
+		}
+	}
+
+	runs := map[*ast.BlockStmt]bool{}
+	for _, example := range doc.Examples(files...) {
+		if body, ok := example.Code.(*ast.BlockStmt); ok && (example.Output != "" || example.EmptyOutput) {
+			runs[body] = true
+		}
+	}
+
+	var errs []error
+	checked := 0
+	for _, fn := range decls {
+		name := fn.Name.Name
+		if fn.Recv != nil || !calls(fn.Body, reaching) {
+			continue
+		}
+		if _, ok := mountFailureTests[name]; ok {
+			continue
+		}
+		switch {
+		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
+			checked++
+			if !gated(fn.Body) {
+				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled as its first statement",
+					fset.Position(fn.Pos()), name))
+			}
+		case isEntry(name, "Example"):
+			checked++
+			if runs[fn.Body] {
+				errs = append(errs, fmt.Errorf("%s: %s mounts and cannot skip; remove its output comment so go test does not run it",
+					fset.Position(fn.Pos()), name))
+			}
+		}
+	}
+	return errs, checked
+}
+
+// isEntry reports whether name is a go test entry point with prefix, such as
+// TestXxx for "Test".
+func isEntry(name, prefix string) bool {
+	rest, ok := strings.CutPrefix(name, prefix)
+	if !ok {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return rest == "" || !unicode.IsLower(r)
+}
+
+func calls(body *ast.BlockStmt, names map[string]bool) bool {
 	found := false
 	ast.Inspect(body, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok {
-			switch calleeName(call) {
-			case "Mount", "RunTests":
-				found = true
-			}
+		if call, ok := n.(*ast.CallExpr); ok && names[calleeName(call)] {
+			found = true
 		}
 		return !found
 	})
