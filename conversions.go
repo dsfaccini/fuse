@@ -805,7 +805,8 @@ func (c *Connection) kernelResponse(
 
 		if !handled {
 			m.OutHeader().Error = -int32(syscall.EIO)
-			if errno, ok := opErr.(syscall.Errno); ok {
+			var errno syscall.Errno
+			if errors.As(opErr, &errno) {
 				m.OutHeader().Error = -int32(errno)
 			}
 

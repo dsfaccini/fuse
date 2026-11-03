@@ -34,6 +34,7 @@ type testTransport struct {
 	messages [][]byte
 	reads    int
 	writes   [][]byte
+	writeErr error
 }
 
 func (t *testTransport) ReadMessage(dst []byte) (int, error) {
@@ -49,11 +50,17 @@ func (t *testTransport) ReadMessage(dst []byte) (int, error) {
 }
 
 func (t *testTransport) WriteMessage(message []byte) error {
+	if t.writeErr != nil {
+		return t.writeErr
+	}
 	t.writes = append(t.writes, append([]byte(nil), message...))
 	return nil
 }
 
 func (t *testTransport) WritevMessage(parts [][]byte) error {
+	if t.writeErr != nil {
+		return t.writeErr
+	}
 	var message []byte
 	for _, part := range parts {
 		message = append(message, part...)

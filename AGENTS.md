@@ -19,6 +19,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `MountConfig.FuseImpl`, which needs `go-nfsv4` at `/usr/local/bin/go-nfsv4`
   or at `$FUSE_NFSSRV_PATH`.
 - No CI job sets `FUSE_RUN_MOUNT_TESTS` yet.
+- To test `Connection` without a mount, use `testTransport` in
+  `transport_test.go`. It feeds canned messages to `ReadOp` and records or
+  fails the writes `Reply` makes.
 
 ## Validate a change
 
