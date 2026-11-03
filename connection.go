@@ -64,10 +64,9 @@ type Connection struct {
 	errorLogger *log.Logger
 	wireLogger  io.Writer
 
-	// The device through which we're talking to the kernel, and the protocol
-	// version that we're using to talk to it.
-	dev      *os.File
-	protocol fusekernel.Protocol
+	// The kernel-facing transport and the protocol version used with it.
+	transport connectionTransport
+	protocol  fusekernel.Protocol
 
 	mu sync.Mutex
 
@@ -105,8 +104,8 @@ func GetWirelog(ctx context.Context) *WireLogRecord {
 	return nil
 }
 
-// Create a connection wrapping the supplied file descriptor connected to the
-// kernel. You must eventually call c.close().
+// Create a connection wrapping the supplied kernel transport. You must
+// eventually call c.close().
 //
 // The loggers may be nil.
 func newConnection(
@@ -114,13 +113,13 @@ func newConnection(
 	debugLogger *log.Logger,
 	errorLogger *log.Logger,
 	wireLogger io.Writer,
-	dev *os.File) (*Connection, error) {
+	transport connectionTransport) (*Connection, error) {
 	c := &Connection{
 		cfg:         cfg,
 		debugLogger: debugLogger,
 		errorLogger: errorLogger,
 		wireLogger:  wireLogger,
-		dev:         dev,
+		transport:   transport,
 		cancelFuncs: make(map[uint64]func()),
 	}
 
@@ -392,7 +391,7 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 	// Loop past transient errors.
 	for {
 		// Attempt a read.
-		err := m.Init(c.dev)
+		err := m.Init(transportReader{transport: c.transport})
 
 		// Special cases:
 		//
@@ -431,26 +430,11 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 			writeLock.Lock()
 			defer writeLock.Unlock()
 		}
-		_, err = writev(int(c.dev.Fd()), outMsg.Sglist)
+		err = c.transport.WritevMessage(outMsg.Sglist)
 	} else {
-		err = c.writeMessage(outMsg.OutHeaderBytes())
+		err = c.transport.WriteMessage(outMsg.OutHeaderBytes())
 	}
 	return err
-}
-
-// Write the supplied message to the kernel.
-func (c *Connection) writeMessage(msg []byte) error {
-	// Avoid the retry loop in os.File.Write.
-	n, err := syscall.Write(int(c.dev.Fd()), msg)
-	if err != nil {
-		return err
-	}
-
-	if n != len(msg) {
-		return fmt.Errorf("Wrote %d bytes; expected %d", n, len(msg))
-	}
-
-	return nil
 }
 
 // ReadOp consumes the next op from the kernel process, returning the op and a
@@ -656,11 +640,11 @@ func (c *Connection) sanitizeMaxPagesAndWrite() error {
 	return nil
 }
 
-// Close the connection. Must not be called until operations that were read
-// from the connection have been responded to.
+// Close the connection. Must not be called until operations read from the
+// connection have been responded to.
+//
+// The transport owns platform-specific synchronization for releasing its
+// endpoint safely.
 func (c *Connection) close() error {
-	// Posix doesn't say that close can be called concurrently with read or
-	// write, but luckily we exclude the possibility of a race by requiring the
-	// user to respond to all ops first.
-	return c.dev.Close()
+	return c.transport.Close()
 }
