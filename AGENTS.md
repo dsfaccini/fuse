@@ -61,15 +61,18 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 
 ## Ops that return attributes feed the FSKit short-read check
 
-- On FSKit, `Connection` replies EIO to a `ReadFileOp` reply shorter than the
-  size it last reported for the inode (macfuse#1231). `trackReportedSizes` in
-  `short_reads.go` records those sizes from every reply that carries
-  attributes.
-- An op whose reply gains an inode's attributes must record the size there.
-  Without it, the recorded size goes stale, and reads inside it fail with EIO.
-- An op whose reply gives the kernel a lookup must count it through
-  `recordEntry`. Without it, a forget drops the record while the kernel still
-  holds the inode.
+- On FSKit, `Connection` replies EIO to a `ReadFileOp` reply that ends before
+  both the read and the inode's size (macfuse#1231). That size is the larger of
+  the sizes recorded when the read arrived and when it is answered.
+- `short_reads.go` keeps a record for each inode the kernel holds through a
+  lookup. Entry replies create records and count lookups. Getattr and setattr
+  replies only update existing records. `trackReportedSizes` records growth
+  before a reply is written, and `shrinkReportedSizes` records a shrink after
+  the kernel has the reply.
+- An op whose reply gains an inode's attributes must report them in
+  `forEachReportedSize`, with `lookup` true when the reply gives the kernel a
+  lookup. A missed size goes stale and fails reads inside it with EIO. A missed
+  lookup lets a forget drop the record while the kernel still holds the inode.
 
 ## FSKit changes need a test that does not mount
 

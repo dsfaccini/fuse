@@ -590,7 +590,8 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	// Clean up state for this op.
 	c.finishOp(inMsg.Header().Opcode, inMsg.Header().Unique)
 
-	// Record sizes before the reply reaches the kernel, which may act on them.
+	// Record growth before the reply reaches the kernel, which may act on it.
+	// A shrink waits until the kernel has the reply.
 	if c.reportedInodes != nil {
 		opErr = c.trackReportedSizes(state, opErr)
 	}
@@ -628,6 +629,9 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 			return fmt.Errorf(writeErrMsg)
 		}
 		outMsg.Sglist = nil
+		if err == nil && c.reportedInodes != nil {
+			c.shrinkReportedSizes(op, opErr)
+		}
 	}
 
 	if c.wireLogger != nil {
