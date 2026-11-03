@@ -91,6 +91,10 @@ type Connection struct {
 	// read side from its check through its write, so no size reaches the
 	// kernel between the two. Forgets change records too, but write nothing,
 	// and take no side. See changesReportedSizes.
+	//
+	// The cost: size-changing replies are serialized through their writes and
+	// wait for every READ reply in flight, and once one waits, new READ replies
+	// wait behind it.
 	sizeReplyMu sync.RWMutex
 
 	// Freelists, serviced by freelists.go.

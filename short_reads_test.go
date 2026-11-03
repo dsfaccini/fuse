@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -580,7 +581,7 @@ func TestGrowthRecordedBeforeWrite(t *testing.T) {
 }
 
 // A growth answered while a READ reply is being written reaches the kernel
-// after that reply, never between its check and its write.
+// after that reply.
 func TestReadReplyWrittenBeforeLaterGrowth(t *testing.T) {
 	o, hooks := newHookTestConnection(t, true)
 	o.lookUp(2, 200)
@@ -653,6 +654,164 @@ func TestRepliesHoldSizeReplyMuWhileWritten(t *testing.T) {
 				}
 			}
 			o.do(ch.opcode, 2, ch.serve, ch.body...)
+		})
+	}
+}
+
+// parkedInReply reports whether a goroutine is blocked in frame, called from
+// Connection.Reply.
+func parkedInReply(frame string) bool {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, frame) && strings.Contains(g, "(*Connection).Reply") {
+			return true
+		}
+	}
+	return false
+}
+
+func waitParkedInReply(t *testing.T, frame string, done <-chan struct{}) {
+	t.Helper()
+	for !parkedInReply(frame) {
+		select {
+		case <-done:
+			t.Fatalf("Reply returned without blocking in %s", frame)
+		default:
+		}
+		runtime.Gosched()
+	}
+}
+
+func replyInBackground(t *testing.T, o *opTestConnection, ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := o.c.Reply(ctx, nil); err != nil {
+			t.Errorf("Reply: %v", err)
+		}
+	}()
+	return done
+}
+
+// A READ reply checks only once it holds the read side, so a growth recorded
+// and written by a size-changing reply in flight counts in its check.
+func TestReadCheckWaitsForReadSide(t *testing.T) {
+	o := newOpTestConnection(t, true)
+	o.lookUp(2, 200)
+	in := fusekernel.ReadIn{Size: 512}
+	read, op := o.send(fusekernel.OpRead, 2, structBytes(&in))
+	readUnique := o.unique
+	op.(*fuseops.ReadFileOp).BytesRead = 250
+
+	// Stand in for a size-changing reply that grows inode 2 to 300.
+	o.c.sizeReplyMu.Lock()
+	done := replyInBackground(t, o, read)
+	waitParkedInReply(t, "sync.(*RWMutex).RLock", done)
+	o.c.mu.Lock()
+	o.c.reportedInodes[2] = reportedInode{size: 300, lookups: 1}
+	o.c.mu.Unlock()
+	o.c.sizeReplyMu.Unlock()
+	<-done
+
+	for _, w := range o.transport.written() {
+		if h := (*fusekernel.OutHeader)(unsafe.Pointer(&w[0])); h.Unique == readUnique && syscall.Errno(-h.Error) != syscall.EIO {
+			t.Errorf("READ reply after growth to 300 = errno %d, want EIO", -h.Error)
+		}
+	}
+}
+
+// A size-changing reply records nothing before it holds the write side.
+func TestSizeChangeRecordedUnderWriteSide(t *testing.T) {
+	o := newOpTestConnection(t, true)
+	o.lookUp(2, 200)
+	ctx, op := o.send(fusekernel.OpGetattr, 2)
+	getattrReply(300)(op)
+
+	// Stand in for a READ reply in flight.
+	o.c.sizeReplyMu.RLock()
+	done := replyInBackground(t, o, ctx)
+	waitParkedInReply(t, "sync.(*RWMutex).Lock", done)
+	if got := o.c.reportedSize(2); got != 200 {
+		t.Errorf("size recorded while the reply waits for the write side = %d, want 200", got)
+	}
+	o.c.sizeReplyMu.RUnlock()
+	<-done
+	if got := o.c.reportedSize(2); got != 300 {
+		t.Errorf("size recorded after the reply = %d, want 300", got)
+	}
+}
+
+// heldSizeReplyMuLog fails the test when it is written while sizeReplyMu is
+// free.
+type heldSizeReplyMuLog struct {
+	t     *testing.T
+	c     *Connection
+	armed bool
+}
+
+func (l *heldSizeReplyMuLog) Write(p []byte) (int, error) {
+	if l.armed && l.c.sizeReplyMu.TryLock() {
+		l.c.sizeReplyMu.Unlock()
+		l.t.Error("sizeReplyMu free after a size-changing reply's shrink, before Reply returns")
+	}
+	return len(p), nil
+}
+
+// A size-changing reply holds the write side until its shrink is applied.
+// Reply writes the wire log after the shrink, before it releases the lock.
+func TestSizeChangeHoldsWriteSideThroughShrink(t *testing.T) {
+	init := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
+	transport := &testTransport{messages: [][]byte{makeOpMessage(fusekernel.OpInit, 1, 0, structBytes(&init))}}
+	wireLog := &heldSizeReplyMuLog{t: t}
+	c, err := newConnection(MountConfig{OpContext: context.Background()}, nil, nil, wireLog, paddingTestTransport{transport})
+	if err != nil {
+		t.Fatalf("newConnection: %v", err)
+	}
+	wireLog.c = c
+	o := &opTestConnection{t: t, transport: transport, c: c, unique: 1}
+	o.lookUp(2, 200)
+
+	wireLog.armed = true
+	o.do(fusekernel.OpGetattr, 2, getattrReply(100))
+	wireLog.armed = false
+	if got := o.c.reportedSize(2); got != 100 {
+		t.Errorf("recorded size = %d, want 100", got)
+	}
+}
+
+// fuseutil answers ForgetInodeOp inline in its serve loop, so a forget must
+// never wait on sizeReplyMu.
+func TestForgetTakesNoSideOfSizeReplyMu(t *testing.T) {
+	for name, send := range map[string]func(o *opTestConnection) context.Context{
+		"forget": func(o *opTestConnection) context.Context { return o.sendForget(2, 1) },
+		"batch forget": func(o *opTestConnection) context.Context {
+			count := fusekernel.BatchForgetCountIn{Count: 1}
+			entry := fusekernel.BatchForgetEntryIn{Inode: 2, Nlookup: 1}
+			ctx, _ := o.send(fusekernel.OpBatchForget, 0, structBytes(&count), structBytes(&entry))
+			return ctx
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			o := newOpTestConnection(t, true)
+			o.lookUp(2, 200)
+			ctx := send(o)
+
+			// Stand in for a size-changing reply in flight.
+			o.c.sizeReplyMu.Lock()
+			defer o.c.sizeReplyMu.Unlock()
+			done := replyInBackground(t, o, ctx)
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if parkedInReply("sync.(*RWMutex).Lock") || parkedInReply("sync.(*RWMutex).RLock") {
+					t.Fatal("forget waits on sizeReplyMu")
+				}
+				runtime.Gosched()
+			}
 		})
 	}
 }
