@@ -275,14 +275,17 @@ func TestFormatWireLogEntryStatus(t *testing.T) {
 }
 
 // fmt recovers from a panic in Error when it formats the error value itself.
-func TestReplyDebugLogsErrorWhoseErrorPanics(t *testing.T) {
+func TestReplyDebugLogsOpError(t *testing.T) {
 	tests := []struct {
 		name        string
 		opErr       error
 		errorLogger bool
+		want        string
 	}{
-		{"nil path error", nilPathErr, false},
-		{"suppressed errno joined with nil path error", errors.Join(syscall.ENOSYS, nilPathErr), true},
+		{"ordinary error", errors.New("lookup failed"), false, `-> Error: "lookup failed"`},
+		{"nil path error", nilPathErr, false, "-> Error: <nil>"},
+		{"suppressed errno joined with nil path error", errors.Join(syscall.ENOSYS, nilPathErr), true,
+			"-> Error: %!q(PANIC=Error method: runtime error: invalid memory address or nil pointer dereference)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -305,8 +308,8 @@ func TestReplyDebugLogsErrorWhoseErrorPanics(t *testing.T) {
 			if err := c.Reply(ctx, tt.opErr); err != nil {
 				t.Errorf("Reply: %v", err)
 			}
-			if !strings.Contains(debugged.String(), "-> Error:") {
-				t.Errorf("debug log = %q, want the error reply", debugged.String())
+			if !strings.HasSuffix(debugged.String(), "] "+tt.want+"\n") {
+				t.Errorf("debug log = %q, want it to end with %q", debugged.String(), tt.want)
 			}
 		})
 	}
