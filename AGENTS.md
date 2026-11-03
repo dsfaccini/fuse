@@ -46,6 +46,16 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.
 
+## Find an op error's errno with `operror.Errno`
+
+- An op error is the error a file system returns for an op.
+- Call `Errno` in `internal/operror` to find its errno. Never call `errors.As`
+  or `errors.Is` on an op error.
+- Unwrapping a nil `*os.PathError` panics, and `Errno` recovers from that
+  panic.
+- One helper also keeps the kernel reply, the error log and the wire log on
+  the same errno.
+
 ## FSKit changes need a test that does not mount
 
 Ship every change to `mount_fskit*.go` with a test that exercises the changed

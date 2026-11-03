@@ -16,12 +16,12 @@ package fuseutil
 
 import (
 	"context"
-	"errors"
 	"io"
 	"sync"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
+	"github.com/dsfaccini/fuse/internal/operror"
 )
 
 // An interface with a method for each op type in the fuseops package. This can
@@ -241,7 +241,7 @@ func (s *fileSystemServer) batchForget(
 	ctx context.Context,
 	op *fuseops.BatchForgetOp) error {
 	err := s.fs.BatchForget(ctx, op)
-	if errors.Is(err, fuse.ENOSYS) {
+	if errno, _ := operror.Errno(err); errno == fuse.ENOSYS {
 		// Handle as a series of single-inode forget operations
 		for _, entry := range op.Entries {
 			err = s.fs.ForgetInode(ctx, &fuseops.ForgetInodeOp{

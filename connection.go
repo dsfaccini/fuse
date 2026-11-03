@@ -30,6 +30,7 @@ import (
 	"github.com/dsfaccini/fuse/internal/buffer"
 	"github.com/dsfaccini/fuse/internal/freelist"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
+	"github.com/dsfaccini/fuse/internal/operror"
 )
 
 type contextKeyType uint64
@@ -505,8 +506,7 @@ func (c *Connection) shouldLogError(
 	}
 
 	// Judge the errno that kernelResponse sends, not any errno in the chain.
-	var errno syscall.Errno
-	errors.As(err, &errno)
+	errno, _ := operror.Errno(err)
 
 	switch op.(type) {
 	case *fuseops.LookUpInodeOp:

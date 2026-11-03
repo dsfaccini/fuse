@@ -30,6 +30,9 @@ import (
 	"github.com/dsfaccini/fuse/internal/buffer"
 )
 
+// A nil *os.PathError panics when errors.As or errors.Is unwraps it.
+var nilPathErr error = (*os.PathError)(nil)
+
 func TestKernelResponseKeepsWrappedErrno(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -40,6 +43,10 @@ func TestKernelResponseKeepsWrappedErrno(t *testing.T) {
 		{"wrapped errno", fmt.Errorf("lookup: %w", syscall.ENOENT), syscall.ENOENT},
 		{"path error", &os.PathError{Op: "open", Path: "f", Err: syscall.EACCES}, syscall.EACCES},
 		{"no errno", errors.New("lookup failed"), syscall.EIO},
+		{"EIO before ENOENT", fmt.Errorf("lookup: %w (cleanup: %w)", syscall.EIO, syscall.ENOENT), syscall.EIO},
+		{"joined EACCES and ENOENT", errors.Join(syscall.EACCES, syscall.ENOENT), syscall.EACCES},
+		{"nil path error", nilPathErr, syscall.EIO},
+		{"wrapped nil path error", fmt.Errorf("lookup: %w", nilPathErr), syscall.EIO},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -70,6 +77,9 @@ func TestShouldLogErrorMatchesWrappedErrno(t *testing.T) {
 		{"lookup EIO", &fuseops.LookUpInodeOp{}, wrap(syscall.EIO), true},
 		{"lookup EIO before ENOENT", &fuseops.LookUpInodeOp{}, fmt.Errorf("lookup: %w (cleanup: %w)", syscall.EIO, syscall.ENOENT), true},
 		{"lookup joined EACCES and ENOENT", &fuseops.LookUpInodeOp{}, errors.Join(syscall.EACCES, syscall.ENOENT), true},
+		{"lookup no errno", &fuseops.LookUpInodeOp{}, errors.New("lookup failed"), true},
+		{"lookup nil path error", &fuseops.LookUpInodeOp{}, nilPathErr, true},
+		{"lookup wrapped nil path error", &fuseops.LookUpInodeOp{}, fmt.Errorf("lookup: %w", nilPathErr), true},
 	}
 	c := &Connection{errorLogger: log.New(io.Discard, "", 0)}
 	for _, tt := range tests {
@@ -237,5 +247,11 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFormatWireLogEntryWithNilPathError(t *testing.T) {
+	if _, err := formatWireLogEntry(&fuseops.LookUpInodeOp{}, nilPathErr, NewWireLogRecord()); err != nil {
+		t.Errorf("formatWireLogEntry: %v", err)
 	}
 }

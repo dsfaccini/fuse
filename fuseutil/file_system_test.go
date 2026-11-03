@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"syscall"
 	"testing"
@@ -42,6 +43,10 @@ func (fs *forgetRecorder) ForgetInode(_ context.Context, op *fuseops.ForgetInode
 }
 
 func TestBatchForgetFallsBackToForgetInodeOnENOSYS(t *testing.T) {
+	eioBeforeENOSYS := fmt.Errorf("batch forget: %w (cleanup: %w)", syscall.EIO, fuse.ENOSYS)
+	// A nil *os.PathError panics when errors.As or errors.Is unwraps it.
+	var nilPathErr error = (*os.PathError)(nil)
+	wrappedNilPathErr := fmt.Errorf("batch forget: %w", nilPathErr)
 	tests := []struct {
 		name     string
 		batchErr error
@@ -52,6 +57,9 @@ func TestBatchForgetFallsBackToForgetInodeOnENOSYS(t *testing.T) {
 		{"wrapped ENOSYS", fmt.Errorf("batch forget: %w", fuse.ENOSYS), nil, []fuseops.InodeID{2, 3}},
 		{"implemented", nil, nil, nil},
 		{"other error", syscall.EIO, syscall.EIO, nil},
+		{"EIO before ENOSYS", eioBeforeENOSYS, eioBeforeENOSYS, nil},
+		{"nil path error", nilPathErr, nilPathErr, nil},
+		{"wrapped nil path error", wrappedNilPathErr, wrappedNilPathErr, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
