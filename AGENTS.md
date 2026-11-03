@@ -19,6 +19,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `MountConfig.FuseImpl`, which needs `go-nfsv4` at `/usr/local/bin/go-nfsv4`
   or at `$FUSE_NFSSRV_PATH`.
 - No CI job sets `FUSE_RUN_MOUNT_TESTS` yet.
+- To test `Connection` without a mount, use `testTransport` in
+  `transport_test.go`. It feeds canned messages to `ReadOp` and records or
+  fails the writes `Reply` makes.
 
 ## Validate a change
 
@@ -42,6 +45,17 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.
+
+## Find an op error's errno with `operror.Errno`
+
+- An op error is the error a file system returns for an op.
+- Call `Errno` in `internal/operror` to find its errno. Never call `errors.As`
+  or `errors.Is` on an op error.
+- Unwrapping a nil `*os.PathError` panics, and `Errno` recovers from that
+  panic.
+- The kernel reply, the error log and the wire log all judge the errno that
+  `Errno` finds. When `Errno` finds none, the kernel gets EIO and the wire-log
+  `Status` stays 0.
 
 ## FSKit changes need a test that does not mount
 
