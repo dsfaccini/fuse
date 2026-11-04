@@ -159,6 +159,12 @@ func TestProbe(t *testing.T) {
 			wantErrs: 1,
 		},
 		{
+			name: "allowlisted test reaching an FSKit mount",
+			src: `package p
+func TestMountReturnsTypedFSKitErrors(t *testing.T) { mountFSKitTransport("", nil, nil) }`,
+			wantErrs: 1,
+		},
+		{
 			name: "mount behind the FSKit probe gate",
 			src: `package p
 func TestMount(t *testing.T) {
@@ -284,7 +290,8 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 	}
 }
 
-// mountFailureTests call Mount but fail before anything is mounted.
+// mountFailureTests call Mount but fail before anything is mounted. A test
+// that reaches an FSKit mount cannot be listed.
 var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
 	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
@@ -412,19 +419,24 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 		if !references(fn.Body, reaching) {
 			continue
 		}
+		fskit := references(fn.Body, reachingFSKit)
 		if _, ok := mountFailureTests[name]; ok {
+			if fskit {
+				errs = append(errs, fmt.Errorf("%s: %s reaches an FSKit mount, which mountFailureTests cannot exempt; call mounttest.SkipUnlessFSKitProbeEnabled as its first statement",
+					fset.Position(fn.Pos()), name))
+			}
 			continue
 		}
 		switch {
 		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
 			checked++
-			gate := "SkipUnlessEnabled"
-			if references(fn.Body, reachingFSKit) {
-				gate = "SkipUnlessFSKitProbeEnabled"
-			}
-			if !gated(fn.Body, gate) {
-				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.%s as its first statement, or list it in mountFailureTests if it fails before anything is mounted",
-					fset.Position(fn.Pos()), name, gate))
+			switch {
+			case fskit && !gated(fn.Body, "SkipUnlessFSKitProbeEnabled"):
+				errs = append(errs, fmt.Errorf("%s: %s mounts through FSKit; call mounttest.SkipUnlessFSKitProbeEnabled as its first statement",
+					fset.Position(fn.Pos()), name))
+			case !fskit && !gated(fn.Body, "SkipUnlessEnabled"):
+				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled as its first statement, or list it in mountFailureTests if it fails before anything is mounted",
+					fset.Position(fn.Pos()), name))
 			}
 		case isEntry(name, "Example"):
 			checked++
