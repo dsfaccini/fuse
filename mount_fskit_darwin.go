@@ -109,9 +109,7 @@ func mountFSKitTransport(
 		return nil, err
 	}
 
-	options := cfg.toMap()
-	delete(options, "backend")
-	mountOptions, err := syscall.BytePtrFromString(mapToOptionsString(options))
+	mountOptions, err := syscall.BytePtrFromString(fskitMountOptions(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("FSKit mount options: %w", err)
 	}
@@ -168,12 +166,16 @@ func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
 	}
 }
 
+// fskitMountOptions returns the option string MFMount receives for cfg.
+func fskitMountOptions(cfg *MountConfig) string {
+	options := cfg.toMap()
+	delete(options, "backend")
+	return mapToOptionsString(options)
+}
+
 func validateFSKitMount(dir string, cfg *MountConfig) error {
 	if dir == "" {
 		return fmt.Errorf("FSKit mount point must not be empty")
-	}
-	if cfg == nil {
-		return fmt.Errorf("FSKit mount config must not be nil")
 	}
 
 	// Check availability before allocating a native channel.
@@ -182,12 +184,7 @@ func validateFSKitMount(dir string, cfg *MountConfig) error {
 		return fmt.Errorf("reading macOS version for FSKit: %w", err)
 	}
 	_, local := cfg.Options["local"]
-	if err := validateFSKitOSVersion(version, local); err != nil {
-		return err
-	}
-
-	validation := Connection{cfg: *cfg}
-	return validation.sanitizeMaxPagesAndWrite()
+	return validateFSKitOSVersion(version, local)
 }
 
 // validateFSKitOSVersion checks version against the macFUSE FSKit module that

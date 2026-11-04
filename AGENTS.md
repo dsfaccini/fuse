@@ -25,6 +25,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test how an op is decoded and answered, add a case to `protocolCases` in
   `protocol_test.go`. Each case runs over a fake kernel transport on every OS,
   and through `Mount` and the fake MFMount on darwin.
+- To test `Mount`'s config validation without a mount, pass a mount point that
+  does not exist. `Mount` validates the config before it checks the mount
+  point. A regression then fails with ENOENT instead of mounting.
 
 ## Validate a change
 

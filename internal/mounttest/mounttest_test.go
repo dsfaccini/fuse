@@ -251,8 +251,9 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 
 // mountFailureTests call Mount but fail before anything is mounted.
 var mountFailureTests = map[string]string{
-	"TestNonexistentMountPoint":        "checkMountPoint rejects the directory",
-	"TestMountReturnsTypedFSKitErrors": "the FSKit preflight fails",
+	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
+	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
+	"TestMountRejectsInvalidConfigBeforeMounting": "config validation fails",
 }
 
 // fakeMounts call Mount through the fake MFMount, which mounts nothing. They
@@ -268,8 +269,9 @@ var mountCallees = []string{"Mount", "RunTests", "SetUp"}
 
 // ungatedMounts checks the test files of one directory. A function or
 // package-level variable reaches a mount when its body names a mount callee or
-// another one that reaches a mount, unless fakeMounts names it. A test, benchmark or fuzz target that
-// reaches a mount must call SkipUnlessEnabled first. An example cannot skip, so
+// another one that reaches a mount, unless fakeMounts names it. A test,
+// benchmark or fuzz target that reaches a mount must call SkipUnlessEnabled
+// first. An example cannot skip, so
 // an example that reaches a mount must have no output comment, which keeps go
 // test from running it. No init and no package-level initializer may call a
 // function that mounts, because both run before any gate. ungatedMounts returns one error per
@@ -385,7 +387,7 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
 			checked++
 			if !gated(fn.Body) {
-				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled as its first statement",
+				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled as its first statement, or list it in mountFailureTests if it fails before anything is mounted",
 					fset.Position(fn.Pos()), name))
 			}
 		case isEntry(name, "Example"):

@@ -23,7 +23,7 @@ func fuserunmount(dir string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(fusermount, "-u", dir)
+	cmd := exec.Command(fusermount, "-u", "--", dir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if len(output) > 0 {
