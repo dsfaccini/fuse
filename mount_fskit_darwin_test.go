@@ -15,14 +15,18 @@
 package fuse
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/dsfaccini/fuse/internal/fusekernel"
 	"github.com/ebitengine/purego"
 )
 
@@ -217,5 +221,118 @@ func TestFSKitTransportCloseDrainsOperationsBeforeRelease(t *testing.T) {
 	case <-released:
 	default:
 		t.Fatal("Close did not release the native channel")
+	}
+}
+
+func TestFSKitTransportReadsMessages(t *testing.T) {
+	f := newFakeMFMount(t)
+	tr := f.transport(t)
+	// FSKit hands over a WRITE's payload in a second body buffer.
+	write := FakeRequest(
+		fusekernel.InHeader{Opcode: fusekernel.OpWrite, Unique: 2},
+		NativeBytes(&fusekernel.WriteIn{Size: 7}),
+		[]byte("payload"))
+	f.kernel.SendErrno(syscall.EINTR)
+	f.kernel.Send(write...)
+	f.kernel.SendErrno(syscall.EINVAL)
+	f.kernel.Send(make([]byte, 8192))
+	f.kernel.HangUp()
+
+	dst := make([]byte, 4096)
+	n, err := tr.ReadMessage(dst)
+	if want := bytes.Join(write, nil); err != nil || !bytes.Equal(dst[:n], want) {
+		t.Errorf("ReadMessage after EINTR = %d bytes, %v; want the %d bytes of both body buffers", n, err, len(want))
+	}
+	var pathErr *os.PathError
+	if _, err := tr.ReadMessage(dst); !errors.As(err, &pathErr) || pathErr.Err != syscall.EINVAL {
+		t.Errorf("ReadMessage on EINVAL = %v, want *os.PathError with EINVAL", err)
+	}
+	if _, err := tr.ReadMessage(dst); err == nil {
+		t.Error("ReadMessage accepted a message larger than its buffer")
+	}
+	if _, err := tr.ReadMessage(dst); err != io.EOF {
+		t.Errorf("ReadMessage after the hang-up = %v, want io.EOF", err)
+	}
+	// newFakeMFMount checks that every message was released.
+}
+
+func TestFSKitTransportSendsWholeMessages(t *testing.T) {
+	f := newFakeMFMount(t)
+	tr := f.transport(t)
+	parts := [][]byte{[]byte("header"), {}, []byte("payload")}
+	if err := tr.WritevMessage(parts); err != nil {
+		t.Fatalf("WritevMessage: %v", err)
+	}
+	if got := string(f.kernel.NextReply(t)); got != "headerpayload" {
+		t.Errorf("sent %q, want %q", got, "headerpayload")
+	}
+
+	f.sendResult = func(n int) (int, syscall.Errno) { return n - 1, 0 }
+	if err := tr.WritevMessage(parts); err == nil {
+		t.Error("WritevMessage accepted a short send")
+	}
+	// The kernel refuses a reply to an interrupted request with ENOENT, which
+	// Reply treats as benign.
+	f.sendResult = func(int) (int, syscall.Errno) { return -1, syscall.ENOENT }
+	if err := tr.WritevMessage(parts); !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("WritevMessage error = %v, want ENOENT", err)
+	}
+}
+
+// drainServer answers every op with ENOSYS until the connection ends.
+type drainServer struct{}
+
+func (drainServer) ServeOps(c *Connection) {
+	for {
+		ctx, _, err := c.ReadOp()
+		if err != nil {
+			return
+		}
+		c.Reply(ctx, syscall.ENOSYS)
+	}
+}
+
+func TestMountWrapsFSKitMountResult(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		afterInit bool
+		result    int32
+	}{
+		// newConnection fails to read INIT, and Mount returns the result.
+		{name: "before INIT", result: FSKitMountResultFileSystemExtensionRequiresApproval},
+		// The connection is up when MFMount returns the result.
+		{name: "after INIT", afterInit: true, result: FSKitMountResultUnexpectedFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFakeMFMount(t)
+			f.mount = func() int32 {
+				if test.afterInit && !f.answerInit() {
+					t.Error("no INIT reply")
+				}
+				f.kernel.HangUp()
+				return test.result
+			}
+			_, err := MountWithFakeMFMount(t, f, drainServer{}, MountConfig{})
+			// artifact-fs finds the result with errors.As to decide whether
+			// to fall back to the kernel extension.
+			var mountErr FSKitMountError
+			if !errors.As(err, &mountErr) || mountErr.Result != test.result {
+				t.Errorf("Mount error = %v, want a wrapped FSKitMountError with result %d", err, test.result)
+			}
+			if err == nil || !strings.HasPrefix(err.Error(), "mount (background): ") {
+				t.Errorf("Mount error = %v, want the prefix %q", err, "mount (background): ")
+			}
+
+			select {
+			case <-f.released:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the transport did not release the channel within 5s")
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.channelCloses != 0 {
+				t.Errorf("MFChannelClose calls = %d, want 0: MFMount closes the channel when it fails", f.channelCloses)
+			}
+		})
 	}
 }

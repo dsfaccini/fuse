@@ -223,6 +223,13 @@ func mountSub(t *testing.T) { fuse.Mount("", nil, nil) }
 func init() { subtests = append(subtests, mountSub) }`,
 		},
 		{
+			name: "fake MFMount",
+			src: `package p
+func MountWithFakeMFMount(t *testing.T) { fuse.Mount("", nil, nil) }
+func serveFake(t *testing.T) { MountWithFakeMFMount(t) }
+func TestFakeMount(t *testing.T) { serveFake(t) }`,
+		},
+		{
 			name: "init registering a suite",
 			src: `package p
 func init() { RegisterTestSuite(&HelloFSTest{}) }`,
@@ -248,6 +255,12 @@ var mountFailureTests = map[string]string{
 	"TestMountReturnsTypedFSKitErrors": "the FSKit preflight fails",
 }
 
+// fakeMounts call Mount through the fake MFMount, which mounts nothing. They
+// and their callers do not reach a mount.
+var fakeMounts = map[string]string{
+	"MountWithFakeMFMount": "it installs the fake MFMount and forces the fskit backend before it calls Mount",
+}
+
 // mountCallees mount when called: Mount directly, ogletest's RunTests through
 // suites that mount in SetUp, and SetUp on samples.SampleTest and
 // samples.SubprocessTest.
@@ -255,7 +268,7 @@ var mountCallees = []string{"Mount", "RunTests", "SetUp"}
 
 // ungatedMounts checks the test files of one directory. A function or
 // package-level variable reaches a mount when its body names a mount callee or
-// another one that reaches a mount. A test, benchmark or fuzz target that
+// another one that reaches a mount, unless fakeMounts names it. A test, benchmark or fuzz target that
 // reaches a mount must call SkipUnlessEnabled first. An example cannot skip, so
 // an example that reaches a mount must have no output comment, which keeps go
 // test from running it. No init and no package-level initializer may call a
@@ -302,6 +315,9 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 	for changed := true; changed; {
 		changed = false
 		for name, nodes := range values {
+			if _, ok := fakeMounts[name]; ok {
+				continue
+			}
 			for _, node := range nodes {
 				if !reaching[name] && references(node, reaching) {
 					reaching[name] = true
@@ -320,6 +336,9 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 	for changed := true; changed; {
 		changed = false
 		for _, fn := range decls {
+			if _, ok := fakeMounts[fn.Name.Name]; ok {
+				continue
+			}
 			if !calling[fn.Name.Name] && callsOutsideFuncLit(fn.Body, calling) {
 				calling[fn.Name.Name] = true
 				changed = true

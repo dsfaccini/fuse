@@ -22,6 +22,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- To test how an op is decoded and answered, add a case to `protocolCases` in
+  `protocol_test.go`. Each case runs over a fake kernel transport on every OS,
+  and through `Mount` and the fake MFMount on darwin.
 
 ## Validate a change
 
@@ -62,6 +65,19 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 Ship every change to `mount_fskit*.go` with a test that exercises the changed
 code without mounting. CI never mounts through FSKit, so only such a test
 covers the change.
+
+- Use the fake MFMount in `mount_fskit_fake_darwin_test.go`. Its functions are
+  purego callbacks, so the transport makes its real purego calls.
+- `newFakeMFMount` activates a fake for one test. Its cleanup fails the test
+  unless the channel and every message are released exactly once.
+- Test transport methods on the transport that `fakeMFMount.transport` returns.
+- For behavior that only `Mount` reaches, call `MountWithFakeMFMount`. Set
+  `fakeMFMount.mount` to script what MFMount does and returns.
+- Call `Mount` with a fake through `MountWithFakeMFMount` only. The gate
+  scanner exempts that name and flags any other path to `Mount`.
+- Queue requests with `fakeMFMount.kernel.Send` and read replies with
+  `NextReply`. A request is a list of body buffers. FSKit sends a WRITE's
+  payload in a buffer of its own.
 
 ## Keep this file current
 
