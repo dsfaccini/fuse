@@ -24,6 +24,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -506,7 +507,7 @@ func TestReadOpErrorIsFatal(t *testing.T) {
 	}
 }
 
-func TestReplyToUnknownRequestIsFatal(t *testing.T) {
+func TestSecondReplyIsFatal(t *testing.T) {
 	read := fusekernel.ReadIn{Size: 1}
 	transport := &testTransport{messages: [][]byte{
 		testMessage(fusekernel.OpRead, 5, structBytes(&read)),
@@ -575,6 +576,85 @@ func TestSecondReplyAfterMessagesAreReused(t *testing.T) {
 	}
 	if in, out := drainFreelists(c); len(in) != 0 || len(out) != 0 {
 		t.Errorf("freelists hold request 6's messages: %d in, %d out", len(in), len(out))
+	}
+}
+
+// The macFUSE kext reuses a request ID once its reply is written
+// (osxfuse#208).
+func TestSecondReplyAfterRequestIDIsReused(t *testing.T) {
+	transport := &testTransport{messages: [][]byte{
+		testMessage(fusekernel.OpGetattr, 5),
+		testMessage(fusekernel.OpGetattr, 5),
+	}}
+	c := newTestConnection(transport)
+	old, _, err := c.ReadOp()
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if err := c.Reply(old, syscall.ENOSYS); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	cur, _, err := c.ReadOp()
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+
+	if err := c.Reply(old, syscall.ENOSYS); err == nil {
+		t.Error("second Reply to the old request succeeded, want an error")
+	}
+	if len(transport.writes) != 1 {
+		t.Errorf("replies = %d, want 1", len(transport.writes))
+	}
+	if cur.Err() != nil {
+		t.Errorf("the request in flight under ID 5 was cancelled: %v", cur.Err())
+	}
+	if in, out := drainFreelists(c); len(in) != 0 || len(out) != 0 {
+		t.Errorf("freelists hold the in-flight request's messages: %d in, %d out", len(in), len(out))
+	}
+}
+
+// finishOp keeps no state for FORGET, so only the op itself can tell that it
+// was answered.
+func TestSecondReplyToForgetIsFatal(t *testing.T) {
+	forget := fusekernel.ForgetIn{Nlookup: 1}
+	c := newTestConnection(&testTransport{messages: [][]byte{testMessage(fusekernel.OpForget, 5, structBytes(&forget))}})
+	ctx, _, err := c.ReadOp()
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if err := c.Reply(ctx, nil); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+
+	if err := c.Reply(ctx, nil); err == nil {
+		t.Error("second Reply succeeded, want an error")
+	}
+	if in, out := drainFreelists(c); len(in) != 1 || len(out) != 1 {
+		t.Errorf("freelists hold %d in and %d out messages, want 1 and 1", len(in), len(out))
+	}
+}
+
+// An answer under that ID would answer the request in flight.
+func TestReadOpCorruptBodyWithInFlightIDIsFatal(t *testing.T) {
+	transport := &testTransport{messages: [][]byte{
+		testMessage(fusekernel.OpGetattr, 5),
+		testMessage(fusekernel.OpLookup, 5, []byte("a")),
+		testMessage(fusekernel.OpGetattr, 6),
+	}}
+	c := newTestConnection(transport)
+	if _, _, err := c.ReadOp(); err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+
+	_, op, err := c.ReadOp()
+	if err == nil || err == io.EOF {
+		t.Fatalf("ReadOp = %T, %v; want a fatal error", op, err)
+	}
+	if len(transport.writes) != 0 {
+		t.Errorf("replies = %x, want none", transport.writes)
+	}
+	if transport.reads != 2 {
+		t.Errorf("reads = %d, want 2", transport.reads)
 	}
 }
 
@@ -674,10 +754,15 @@ func TestReadOpRejectWriteErrorIsNotFatal(t *testing.T) {
 	}
 }
 
-// Linux does not bound xattr replies by max_pages.
-func TestReadOpCapsXattrAtXattrSizeMax(t *testing.T) {
+// Neither kernel bounds xattr replies by max_pages.
+func TestReadOpCapsXattrAtFloor(t *testing.T) {
 	pageSize := uint32(buffer.GetPageSize())
-	limit := max(pageSize, xattrSizeMax)
+	// Linux's XATTR_SIZE_MAX, or the osxfuse kext's FUSE_REASONABLE_XATTRSIZE.
+	floor := uint32(64 << 10)
+	if runtime.GOOS == "darwin" {
+		floor = 128 << 10
+	}
+	limit := max(pageSize, floor)
 	readdir := func(size uint32) []byte {
 		in := fusekernel.ReadIn{Size: size}
 		return structBytes(&in)

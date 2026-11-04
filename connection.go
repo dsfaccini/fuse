@@ -24,6 +24,7 @@ import (
 	"path"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -104,6 +105,9 @@ type opState struct {
 	// when the op is answered.
 	fuseID uint64
 	opCode uint32
+
+	// Set by the op's first Reply.
+	replied *atomic.Bool
 }
 
 // Return the current wirelog record from the context if the MountConfig
@@ -482,11 +486,13 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 //
 // When a request's body fails to decode, ReadOp answers the request itself and
 // reads on. The answer is EINVAL for a reply size above the cap, and EIO
-// otherwise. The cap is MaxPages pages, and at least 64 KiB for xattrs. Any
-// other error is fatal to the connection, and ReadOp returns it from then on.
-// Fatal errors are a failed read, a malformed message, a request ID already in
-// flight, a Reply to an unknown request ID, and an INIT that fails to decode.
-// A fatal error does not unmount the file system.
+// otherwise. The cap is MaxPages pages, and for xattrs at least 64 KiB, or 128
+// KiB on darwin.
+//
+// Any other error is fatal to the connection, and ReadOp returns it from then
+// on. Fatal errors are a failed read, a malformed message, a request ID
+// already in flight, a second Reply to one op, and an INIT that fails to
+// decode. A fatal error does not unmount the file system.
 //
 // If err == nil, the user is responsible for later calling c.Reply with the
 // returned context.
@@ -523,7 +529,9 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		if err != nil {
 			err = fmt.Errorf("convertInMessage: %w", err)
 			opCode := inMsg.Header().Opcode
-			c.rejectMessage(inMsg, outMsg, err)
+			if dupErr := c.rejectMessage(inMsg, outMsg, err); dupErr != nil {
+				return nil, nil, c.recordFatal(dupErr)
+			}
 			// Init waits for this request, and the kernel sends it only once.
 			if opCode == fusekernel.OpInit {
 				return nil, nil, c.recordFatal(err)
@@ -557,7 +565,7 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 			wlog = NewWireLogRecord()
 		}
 		h := inMsg.Header()
-		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog, h.Unique, h.Opcode})
+		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog, h.Unique, h.Opcode, new(atomic.Bool)})
 
 		// Return the op to the user.
 		return ctx, op, nil
@@ -566,13 +574,14 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 
 // rejectMessage answers a request whose body failed to decode with the errno
 // in err, or EIO, and recycles its messages. The kernel expects no reply to
-// FORGET, BATCH_FORGET and INTERRUPT.
+// FORGET, BATCH_FORGET and INTERRUPT. rejectMessage sends nothing and returns
+// an error when another request with the same ID is in flight.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) rejectMessage(
 	inMsg *buffer.InMessage,
 	outMsg *buffer.OutMessage,
-	err error) {
+	err error) error {
 	defer func() {
 		c.putInMessage(inMsg)
 		c.putOutMessage(outMsg)
@@ -585,7 +594,15 @@ func (c *Connection) rejectMessage(
 
 	switch h.Opcode {
 	case fusekernel.OpForget, fusekernel.OpBatchForget, fusekernel.OpInterrupt:
-		return
+		return nil
+	}
+
+	// A reply would answer the request in flight under this ID.
+	c.mu.Lock()
+	_, inFlight := c.cancelFuncs[h.Unique]
+	c.mu.Unlock()
+	if inFlight {
+		return fmt.Errorf("Already have cancel func for request %v", h.Unique)
 	}
 
 	c.kernelResponse(outMsg, h.Unique, nil, err)
@@ -594,6 +611,7 @@ func (c *Connection) rejectMessage(
 	if writeErr != nil && !errors.Is(writeErr, syscall.ENOENT) && c.errorLogger != nil {
 		c.errorLogger.Printf("writeMessage: %v %v", writeErr, outMsg.OutHeaderBytes())
 	}
+	return nil
 }
 
 // Skip errors that happen as a matter of course, since they spook users.
@@ -660,8 +678,15 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	outMsg := state.outMsg
 	fuseID := state.fuseID
 
-	// Clean up state for this op. An unknown ID means the op was already
-	// answered, so its messages may belong to another op by now.
+	// After the first Reply, the op's messages and even its request ID may
+	// belong to another request.
+	if !state.replied.CompareAndSwap(false, true) {
+		err := fmt.Errorf("Reply called twice for request %v", fuseID)
+		c.recordFatal(err)
+		return err
+	}
+
+	// Clean up state for this op.
 	if err := c.finishOp(state.opCode, fuseID); err != nil {
 		c.recordFatal(err)
 		return err

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -658,7 +659,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrSizeMax)); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrCapFloor())); err != nil {
 			return nil, err
 		}
 
@@ -679,7 +680,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrSizeMax)); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrCapFloor())); err != nil {
 			return nil, err
 		}
 	case fusekernel.OpSetxattr:
@@ -742,9 +743,17 @@ func convertInMessage(
 	return o, nil
 }
 
-// xattrSizeMax is Linux's XATTR_SIZE_MAX and XATTR_LIST_MAX. The kernel does
-// not bound xattr replies by max_pages, so their cap never drops below this.
-const xattrSizeMax = 64 << 10
+// xattrCapFloor returns the least cap on a GETXATTR or LISTXATTR reply size.
+// Neither kernel bounds xattr replies by max_pages. Linux sends sizes up to
+// XATTR_SIZE_MAX and XATTR_LIST_MAX, 64 KiB. The osxfuse kext sends the
+// caller's buffer size, and handles sizes up to FUSE_REASONABLE_XATTRSIZE,
+// 128 KiB, as ordinary.
+func xattrCapFloor() uint64 {
+	if runtime.GOOS == "darwin" {
+		return 128 << 10
+	}
+	return 64 << 10
+}
 
 // maxReplySize returns the largest reply, in bytes, that config's MaxPages
 // allows.
