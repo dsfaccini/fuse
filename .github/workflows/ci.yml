@@ -57,6 +57,58 @@ jobs:
     - name: Test
       run: go test -race -count=1 ./...
 
+  # Runs the mounting tests twice: as the runner user, where Mount falls back
+  # to fusermount3, and as root, where Mount mounts directly.
+  linux-mount:
+    name: linux-mount (${{ matrix.user }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        user: [runner, root]
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+    - name: Set up FUSE
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes fuse3
+        test -c /dev/fuse
+    # samples/flushfs runs go build, so root keeps the runner's PATH and HOME.
+    - name: Test
+      env:
+        FUSE_RUN_MOUNT_TESTS: "1"
+        MOUNT_USER: ${{ matrix.user }}
+      run: |
+        set -o pipefail
+        exec_flag=()
+        if [ "$MOUNT_USER" = root ]; then
+          exec_flag=(-exec "sudo env PATH=$PATH HOME=$HOME FUSE_RUN_MOUNT_TESTS=1")
+        fi
+        go test "${exec_flag[@]}" -race -count=1 -timeout 10m -json ./... \
+          | tee "$RUNNER_TEMP/test.json" \
+          | jq -rj 'select(.Action == "output") | .Output'
+    # mounttest.SkipUnlessEnabled logs the marker in each test it lets run. A
+    # broken gate skips every mounting test, and the step above passes.
+    - name: Check that a mounting test passed
+      run: |
+        jq -se '
+          (map(select(.Test and .Action == "output"
+                      and (.Output | contains("FUSE_RUN_MOUNT_TESTS=1: mounting")))
+               | [.Package, .Test]) | unique) as $mounting
+          | any(.[]; .Test and .Action == "pass" and ([.Package, .Test] | IN($mounting[])))
+        ' "$RUNNER_TEMP/test.json" > /dev/null || {
+          echo "::error::no mounting test passed; check the FUSE_RUN_MOUNT_TESTS gate"
+          exit 1
+        }
+
   # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
   macos:
     runs-on: macos-latest

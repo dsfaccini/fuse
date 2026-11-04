@@ -26,11 +26,15 @@ const Env = "FUSE_RUN_MOUNT_TESTS"
 
 // SkipUnlessEnabled skips t unless FUSE_RUN_MOUNT_TESTS=1. Every test that
 // mounts calls it before anything else.
+//
+// A test it lets run logs "FUSE_RUN_MOUNT_TESTS=1: mounting". CI fails the
+// mounting job when no test that logged it passed.
 func SkipUnlessEnabled(t testing.TB) {
 	t.Helper()
 	if os.Getenv(Env) != "1" {
 		t.Skipf("mounts a file system; set %s=1 to run", Env)
 	}
+	t.Logf("%s=1: mounting", Env)
 }
 
 // FSKitProbeEnv enables TestFSKitProbe when set to "1". The probe mounts
