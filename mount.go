@@ -15,7 +15,6 @@
 package fuse
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -37,11 +36,17 @@ type Server interface {
 
 // Mount attempts to mount a file system on the given directory, using the
 // supplied Server to serve connection requests. It blocks until the file
-// system is successfully mounted.
+// system is successfully mounted. It validates config before it mounts
+// anything.
 func Mount(
 	dir string,
 	server Server,
 	config *MountConfig) (*MountedFileSystem, error) {
+	cfg, err := config.normalize()
+	if err != nil {
+		return nil, fmt.Errorf("mount config: %w", err)
+	}
+
 	// Sanity check: make sure the mount point exists and is a directory. This
 	// saves us from some confusing errors later on OS X.
 	if err := checkMountPoint(dir); err != nil {
@@ -55,51 +60,45 @@ func Mount(
 	}
 
 	// Begin the mounting process, which will continue in the background.
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Beginning the mounting kickoff process")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Beginning the mounting kickoff process")
 	}
 	ready := make(chan error, 1)
-	transport, err := mountTransport(dir, config, ready)
+	transport, err := mountTransport(dir, &cfg, ready)
 	if err != nil {
 		return nil, fmt.Errorf("mount: %w", err)
 	}
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Completed the mounting kickoff process")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Completed the mounting kickoff process")
 	}
 
-	// Choose a parent context for ops.
-	cfgCopy := *config
-	if cfgCopy.OpContext == nil {
-		cfgCopy.OpContext = context.Background()
-	}
-
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Creating a connection object")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Creating a connection object")
 	}
 	// Create a Connection object wrapping the transport.
 	connection, err := newConnection(
-		cfgCopy,
-		config.DebugLogger,
-		config.ErrorLogger,
-		config.WireLogger,
+		cfg,
+		cfg.DebugLogger,
+		cfg.ErrorLogger,
+		cfg.WireLogger,
 		transport)
 	if err != nil {
-		if config.Options["backend"] == "fskit" {
+		if cfg.Options["backend"] == "fskit" {
 			if mountErr := <-ready; mountErr != nil {
 				return nil, fmt.Errorf("mount (background): %w", mountErr)
 			}
 		}
 		return nil, fmt.Errorf("newConnection: %v", err)
 	}
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Successfully created the connection")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Successfully created the connection")
 	}
 
 	// Serve the connection in the background. When done, set the join status.
 	go mfs.serve(server, connection)
 
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Waiting for mounting process to complete")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Waiting for mounting process to complete")
 	}
 
 	// Wait for the mount process to complete.

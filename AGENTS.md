@@ -24,6 +24,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   fails the writes `Reply` makes.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
+- To test `Mount`'s config validation without a mount, pass a mount point that
+  does not exist. `Mount` validates the config before it checks the mount
+  point. A regression then fails with ENOENT instead of mounting.
 
 ## Validate a change
 

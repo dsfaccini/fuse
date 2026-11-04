@@ -222,14 +222,12 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := &Connection{
-				cfg: MountConfig{
-					MaxPages: tc.inputPages,
-					MaxWrite: tc.inputWrite,
-				},
+			cfg := MountConfig{
+				MaxPages: tc.inputPages,
+				MaxWrite: tc.inputWrite,
 			}
 
-			err := c.sanitizeMaxPagesAndWrite()
+			err := cfg.sanitizeMaxPagesAndWrite()
 
 			if tc.wantErr {
 				if err == nil {
@@ -242,11 +240,11 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				if c.cfg.MaxPages != tc.wantPages {
-					t.Errorf("MaxPages = %d, want %d", c.cfg.MaxPages, tc.wantPages)
+				if cfg.MaxPages != tc.wantPages {
+					t.Errorf("MaxPages = %d, want %d", cfg.MaxPages, tc.wantPages)
 				}
-				if c.cfg.MaxWrite != tc.wantWrite {
-					t.Errorf("MaxWrite = %d, want %d", c.cfg.MaxWrite, tc.wantWrite)
+				if cfg.MaxWrite != tc.wantWrite {
+					t.Errorf("MaxWrite = %d, want %d", cfg.MaxWrite, tc.wantWrite)
 				}
 			}
 		})
@@ -319,19 +317,19 @@ func TestReplyDebugLogsOpError(t *testing.T) {
 }
 
 // newTestConnection returns a connection over transport, configured the way
-// Init leaves it.
+// Mount and Init leave it.
 func newTestConnection(transport connectionTransport) *Connection {
-	c := &Connection{
-		cfg:         MountConfig{OpContext: context.Background()},
-		transport:   transport,
-		protocol:    fusekernel.Protocol{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor},
-		cancelFuncs: make(map[uint64]func()),
-	}
-	if err := c.sanitizeMaxPagesAndWrite(); err != nil {
+	cfg, err := (&MountConfig{}).normalize()
+	if err != nil {
 		panic(err)
 	}
-	c.inMessageBufSize = buffer.GetPageSize() + int(c.cfg.MaxWrite)
-	return c
+	return &Connection{
+		cfg:              cfg,
+		transport:        transport,
+		protocol:         fusekernel.Protocol{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor},
+		cancelFuncs:      make(map[uint64]func()),
+		inMessageBufSize: buffer.GetPageSize() + int(cfg.MaxWrite),
+	}
 }
 
 // testMessage frames the body parts as one kernel request.
@@ -434,11 +432,7 @@ func TestInitFailsOnInitThatFailsToDecode(t *testing.T) {
 		testMessage(fusekernel.OpInit, 1),
 		testMessage(fusekernel.OpInit, 2, structBytes(&valid)),
 	}}
-	c := &Connection{
-		cfg:         MountConfig{OpContext: context.Background()},
-		transport:   transport,
-		cancelFuncs: make(map[uint64]func()),
-	}
+	c := newTestConnection(transport)
 	if err := c.Init(); err == nil {
 		t.Fatal("Init succeeded, want an error")
 	}
