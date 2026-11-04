@@ -11,6 +11,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `FUSE_RUN_MOUNT_TESTS=1`.
 - The FSKit probe calls `mounttest.SkipUnlessFSKitProbeEnabled` instead. See
   "The FSKit probe".
+- Gate every test that mounts through FSKit with
+  `mounttest.SkipUnlessFSKitProbeEnabled`. The scanner checks this only for
+  calls to `mountFSKitTransport`, not for `Mount` with the `fskit` backend.
 - `TestMountingTestsAreGated` in `internal/mounttest` enforces the gate. Its
   failure names the fix.
 - That test matches names without type checking, so it can miss a mount
@@ -68,7 +71,7 @@ covers the change.
 ## The FSKit probe
 
 - `TestFSKitProbe` measures how macFUSE's FSKit backend treats the FUSE
-  protocol. One run makes exactly 5 FSKit mounts. Its doc comment lists the
+  protocol. One run makes at most 5 FSKit mounts. Its doc comment lists the
   mounts and what each measures.
 - Its gate is `FUSE_RUN_FSKIT_PROBE=1`. `FUSE_RUN_MOUNT_TESTS` does not run it.
 - Run it only on David's go-ahead in his own words. A click on an option you
