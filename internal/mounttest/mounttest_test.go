@@ -29,15 +29,24 @@ import (
 	"unicode/utf8"
 )
 
-func TestSkipUnlessEnabledSkipsByDefault(t *testing.T) {
-	t.Setenv(Env, "")
-	reached := false
-	t.Run("gated", func(t *testing.T) {
-		SkipUnlessEnabled(t)
-		reached = true
-	})
-	if reached {
-		t.Errorf("SkipUnlessEnabled did not skip with %s unset", Env)
+func TestGatesSkipByDefault(t *testing.T) {
+	for _, gate := range []struct {
+		env  string
+		skip func(testing.TB)
+	}{
+		{Env, SkipUnlessEnabled},
+		{FSKitProbeEnv, SkipUnlessFSKitProbeEnabled},
+	} {
+		t.Setenv(Env, "")
+		t.Setenv(FSKitProbeEnv, "")
+		reached := false
+		t.Run(gate.env, func(t *testing.T) {
+			gate.skip(t)
+			reached = true
+		})
+		if reached {
+			t.Errorf("the %s gate did not skip with it unset", gate.env)
+		}
 	}
 }
 
@@ -124,6 +133,53 @@ func ExampleMount() {
 			name: "example without output",
 			src: `package p
 func ExampleMount() { fuse.Mount("", nil, nil) }`,
+		},
+		{
+			name: "FSKit probe gate",
+			src: `package p
+func runProbe(t *testing.T) { mountFSKitTransport("", nil, nil) }
+func TestProbe(t *testing.T) {
+	mounttest.SkipUnlessFSKitProbeEnabled(t)
+	runProbe(t)
+}`,
+		},
+		{
+			name: "ungated FSKit transport",
+			src: `package p
+func TestProbe(t *testing.T) { mountFSKitTransport("", nil, nil) }`,
+			wantErrs: 1,
+		},
+		{
+			name: "FSKit transport behind the mount-test gate",
+			src: `package p
+func TestProbe(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	mountFSKitTransport("", nil, nil)
+}`,
+			wantErrs: 1,
+		},
+		{
+			name: "allowlisted test reaching an FSKit mount",
+			src: `package p
+func TestMountReturnsTypedFSKitErrors(t *testing.T) { mountFSKitTransport("", nil, nil) }`,
+			wantErrs: 1,
+		},
+		{
+			name: "allowlisted test behind the FSKit probe gate",
+			src: `package p
+func TestMountReturnsTypedFSKitErrors(t *testing.T) {
+	mounttest.SkipUnlessFSKitProbeEnabled(t)
+	mountFSKitTransport("", nil, nil)
+}`,
+		},
+		{
+			name: "mount behind the FSKit probe gate",
+			src: `package p
+func TestMount(t *testing.T) {
+	mounttest.SkipUnlessFSKitProbeEnabled(t)
+	fuse.Mount("", nil, nil)
+}`,
+			wantErrs: 1,
 		},
 		{
 			name: "direct SetUp",
@@ -242,31 +298,34 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 	}
 }
 
-// mountFailureTests call Mount but fail before anything is mounted.
+// mountFailureTests call Mount but fail before anything is mounted. Listing a
+// test does not exempt an FSKit test from its gate: it must still start with
+// SkipUnlessFSKitProbeEnabled.
 var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
 	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
 	"TestMountRejectsInvalidConfigBeforeMounting": "config validation fails",
 }
 
-// mountCallees mount when called: Mount directly, ogletest's RunTests through
-// suites that mount in SetUp, and SetUp on samples.SampleTest and
-// samples.SubprocessTest.
-var mountCallees = []string{"Mount", "RunTests", "SetUp"}
+// mountCallees mount when called: Mount directly, mountFSKitTransport under
+// the FSKit probe, ogletest's RunTests through suites that mount in SetUp, and
+// SetUp on samples.SampleTest and samples.SubprocessTest.
+var mountCallees = []string{"Mount", "mountFSKitTransport", "RunTests", "SetUp"}
+
+// fskitMountCallees mount through FSKit. Only the FSKit probe's gate may guard
+// them, so that FUSE_RUN_MOUNT_TESTS never starts an FSKit mount.
+var fskitMountCallees = []string{"mountFSKitTransport"}
 
 // ungatedMounts checks the test files of one directory. A function or
 // package-level variable reaches a mount when its body names a mount callee or
 // another one that reaches a mount. A test, benchmark or fuzz target that
-// reaches a mount must call SkipUnlessEnabled first. An example cannot skip, so
+// reaches a mount must call SkipUnlessEnabled first, or
+// SkipUnlessFSKitProbeEnabled when it reaches an FSKit mount. An example cannot skip, so
 // an example that reaches a mount must have no output comment, which keeps go
 // test from running it. No init and no package-level initializer may call a
 // function that mounts, because both run before any gate. ungatedMounts returns one error per
 // violation and the number of entry points that reach a mount.
 func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
-	reaching := map[string]bool{}
-	for _, name := range mountCallees {
-		reaching[name] = true
-	}
 	var decls []*ast.FuncDecl
 	var initializers []ast.Expr
 	values := map[string][]ast.Node{}
@@ -300,17 +359,26 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 			}
 		}
 	}
-	for changed := true; changed; {
-		changed = false
-		for name, nodes := range values {
-			for _, node := range nodes {
-				if !reaching[name] && references(node, reaching) {
-					reaching[name] = true
-					changed = true
+	reach := func(callees []string) map[string]bool {
+		reaching := map[string]bool{}
+		for _, name := range callees {
+			reaching[name] = true
+		}
+		for changed := true; changed; {
+			changed = false
+			for name, nodes := range values {
+				for _, node := range nodes {
+					if !reaching[name] && references(node, reaching) {
+						reaching[name] = true
+						changed = true
+					}
 				}
 			}
 		}
+		return reaching
 	}
+	reaching := reach(mountCallees)
+	reachingFSKit := reach(fskitMountCallees)
 
 	// calling holds the functions that mount when called. A function literal
 	// inside a body does not run when the body runs.
@@ -360,13 +428,19 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 		if !references(fn.Body, reaching) {
 			continue
 		}
-		if _, ok := mountFailureTests[name]; ok {
+		fskit := references(fn.Body, reachingFSKit)
+		// mountFailureTests cannot exempt an FSKit mount from its gate.
+		if _, ok := mountFailureTests[name]; ok && !fskit {
 			continue
 		}
 		switch {
 		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
 			checked++
-			if !gated(fn.Body) {
+			switch {
+			case fskit && !gated(fn.Body, "SkipUnlessFSKitProbeEnabled"):
+				errs = append(errs, fmt.Errorf("%s: %s mounts through FSKit; call mounttest.SkipUnlessFSKitProbeEnabled as its first statement",
+					fset.Position(fn.Pos()), name))
+			case !fskit && !gated(fn.Body, "SkipUnlessEnabled"):
 				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled as its first statement, or list it in mountFailureTests if it fails before anything is mounted",
 					fset.Position(fn.Pos()), name))
 			}
@@ -423,7 +497,8 @@ func callsOutsideFuncLit(node ast.Node, names map[string]bool) bool {
 	return found
 }
 
-func gated(body *ast.BlockStmt) bool {
+// gated reports whether body starts with a call to mounttest's gate function.
+func gated(body *ast.BlockStmt, gate string) bool {
 	if len(body.List) == 0 {
 		return false
 	}
@@ -440,7 +515,7 @@ func gated(body *ast.BlockStmt) bool {
 		return false
 	}
 	pkg, ok := sel.X.(*ast.Ident)
-	return ok && pkg.Name == "mounttest" && sel.Sel.Name == "SkipUnlessEnabled"
+	return ok && pkg.Name == "mounttest" && sel.Sel.Name == gate
 }
 
 func calleeName(call *ast.CallExpr) string {

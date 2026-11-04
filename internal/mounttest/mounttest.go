@@ -32,3 +32,16 @@ func SkipUnlessEnabled(t testing.TB) {
 		t.Skipf("mounts a file system; set %s=1 to run", Env)
 	}
 }
+
+// FSKitProbeEnv enables TestFSKitProbe when set to "1". The probe mounts
+// through macFUSE's FSKit backend, so FUSE_RUN_MOUNT_TESTS does not run it.
+const FSKitProbeEnv = "FUSE_RUN_FSKIT_PROBE"
+
+// SkipUnlessFSKitProbeEnabled skips t unless FUSE_RUN_FSKIT_PROBE=1. The FSKit
+// probe calls it before anything else.
+func SkipUnlessFSKitProbeEnabled(t testing.TB) {
+	t.Helper()
+	if os.Getenv(FSKitProbeEnv) != "1" {
+		t.Skipf("mounts through FSKit; set %s=1 to run", FSKitProbeEnv)
+	}
+}
