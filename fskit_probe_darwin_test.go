@@ -53,11 +53,13 @@ const (
 	// probeMountLimit bounds the measurements on one mount.
 	probeMountLimit = 5 * time.Minute
 	// probeCleanupReserve is left before the go test deadline, which kills
-	// the process without running cleanup. It covers the longest measurement
-	// step (about 65s), the teardown of one stuck mount (about 70s) and the
-	// final check of that mount point (about 60s). No mount starts while an
-	// earlier one is still mounted, so at most one mount can be stuck.
-	probeCleanupReserve = 4 * time.Minute
+	// the process without running cleanup. The worst case is about 220s: the
+	// longest step, a WRITE or an unmount (about 65s), the teardown of one
+	// stuck mount (about 95s: 30s for MFMount, 60s of unmount attempts, 5s for
+	// Join) and the final check of that mount point (about 60s). No mount
+	// starts while an earlier one is still mounted, so at most one mount can
+	// be stuck.
+	probeCleanupReserve = 5 * time.Minute
 	// probeDaemonTimeout matches the timeout mount's daemon_timeout option.
 	// macFUSE 5.5.0 sends FUSE_INTERRUPT for a request still pending after
 	// daemon_timeout, and closes the channel when the server stays silent for
@@ -110,6 +112,9 @@ type fskitProbe struct {
 	ctx         context.Context
 	dirs        []string
 	mountFailed bool
+	// stopReason, when set, says why a mount looked wedged. No further mount
+	// starts, because a stalled FSKit mount clears only on reboot.
+	stopReason string
 
 	// Findings that the results across mounts compare, by mount name.
 	rootAccess map[string]error
@@ -173,6 +178,7 @@ func runFSKitProbe(t *testing.T) {
 
 	for _, step := range plan {
 		if err := p.readyForMount(); err != nil {
+			reportProbe(t, probeResult{Item: "run_stopped", Mount: step.name, Result: err.Error()})
 			t.Errorf("no mount from %s on: %v", step.name, err)
 			break
 		}
@@ -225,7 +231,8 @@ func mfmountVersion() string {
 }
 
 // readyForMount returns why the next mount must not start: the probe was
-// stopped, an earlier mount failed, or a macFUSE or probe volume is mounted.
+// stopped, an earlier mount failed or looked wedged, or a macFUSE or probe
+// volume is mounted.
 // Every extra mount attempt counts toward the series that switches macFUSE's
 // FSKit extension off.
 func (p *fskitProbe) readyForMount() error {
@@ -234,6 +241,9 @@ func (p *fskitProbe) readyForMount() error {
 	}
 	if p.mountFailed {
 		return errors.New("an earlier mount failed")
+	}
+	if p.stopReason != "" {
+		return errors.New(p.stopReason)
 	}
 	volumes, err := probeConflicts()
 	if err != nil {
@@ -532,9 +542,23 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 // teardown releases held READs, unmounts whatever the measurements left
 // mounted, and reports what the server and the transport saw.
 func (m *probeMount) teardown() {
+	if err := m.ctx.Err(); err != nil {
+		m.p.stop(fmt.Sprintf("the measurements on %s stopped early: %v", m.name, err))
+	}
 	m.cancel()
+	// MFMount can still attach the volume until it returns, so wait for it
+	// before unmounting.
+	mfmountReturned := true
+	if m.pt != nil {
+		mfmountReturned = waitGroupWithin(&m.pt.native.mountDone, probeMountWait)
+		if mfmountReturned && m.mfs == nil && m.pt.mountSucceeded() {
+			// The INIT request never came, and MFMount succeeded late.
+			// Closing the channel ends the blocked INIT read.
+			m.pt.closeChannel()
+		}
+	}
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
-		attempts, gone := unmountVolume(m.dir)
+		attempts, gone := m.unmount()
 		m.report("teardown_unmount", yesNo(gone), map[string]string{"attempts": strings.Join(attempts, ",")})
 	}
 	if m.mfs != nil {
@@ -542,18 +566,36 @@ func (m *probeMount) teardown() {
 		m.reportServer()
 	}
 	m.reportReplyBuffers()
-	// MFMount can still attach the volume until it returns.
-	if m.pt != nil && !waitGroupWithin(&m.pt.native.mountDone, probeMountWait) {
+	if !mfmountReturned {
+		m.p.stop(fmt.Sprintf("MFMount did not return for %s", m.name))
 		m.t.Errorf("MFMount did not return for %s; check it with mount | grep -E 'macfuse|fskit-probe'", m.dir)
 		return
 	}
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
-		if attempts, gone := unmountVolume(m.dir); !gone {
-			m.t.Errorf("the FSKit probe left %s mounted (attempts: %s, mount table error: %v); run: diskutil unmount force %s", m.dir, strings.Join(attempts, ","), err, m.dir)
-			return
-		}
+		m.t.Errorf("the FSKit probe left %s mounted (mount table error: %v); run: diskutil unmount force %s", m.dir, err, m.dir)
+		return
 	}
 	os.Remove(m.dir)
+}
+
+// unmount unmounts the probe's volume. A forced unmount, or a volume that
+// stays mounted, stops further mounts.
+func (m *probeMount) unmount() ([]string, bool) {
+	attempts, gone := unmountVolume(m.dir)
+	switch {
+	case !gone:
+		m.p.stop(fmt.Sprintf("%s stayed mounted after %s", m.name, strings.Join(attempts, ",")))
+	case len(attempts) > 2:
+		m.p.stop(fmt.Sprintf("%s needed a forced unmount: %s", m.name, strings.Join(attempts, ",")))
+	}
+	return attempts, gone
+}
+
+// stop records the first reason to start no further mount.
+func (p *fskitProbe) stop(reason string) {
+	if p.stopReason == "" {
+		p.stopReason = reason
+	}
 }
 
 // waitGroupWithin waits up to d for wg.
@@ -917,9 +959,9 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 }
 
 // measurePaddingTimings runs the padding timing with a shrink and with a
-// growth. The shrink decides the window the library's short-read guard
-// leaves open: a GETATTR that reports a shrink while an earlier READ is
-// pending.
+// growth. The shrink run decides what a reader gets when a GETATTR reports a
+// shrink while an earlier READ is pending, the window that the short-read
+// guard in https://github.com/dsfaccini/fuse/pull/5 does not cover.
 func (m *probeMount) measurePaddingTimings() {
 	shrink := m.measurePaddingTiming("shrink", 5000)
 	grow := m.measurePaddingTiming("grow", 5100)
@@ -1195,7 +1237,7 @@ func (m *probeMount) measureSignalledSlowRead() {
 
 // unmountAndJoin unmounts the way a user does and reports what Join returns.
 func (m *probeMount) unmountAndJoin() {
-	attempts, gone := unmountVolume(m.dir)
+	attempts, gone := m.unmount()
 	m.report("join_after_unmount", m.join(probeWait), map[string]string{
 		"attempts":  strings.Join(attempts, ","),
 		"unmounted": yesNo(gone),
@@ -1745,6 +1787,13 @@ func (pt *probeTransport) closeChannel() (bool, syscall.Errno) {
 	return byte(closed) != 0, callErrno(errno)
 }
 
+// mountSucceeded reports MFMount's result once it has returned.
+func (pt *probeTransport) mountSucceeded() bool {
+	pt.native.mu.Lock()
+	defer pt.native.mu.Unlock()
+	return pt.native.mountSucceeded
+}
+
 func (pt *probeTransport) Close() error {
 	pt.closeMu.Lock()
 	pt.closing = true
@@ -2053,7 +2102,8 @@ func waitUnmounted(dir string, d time.Duration) bool {
 
 // unmountVolume unmounts the volume at dir, escalating from unmount(2) to
 // diskutil and then to the forced form of each. It returns each attempt's
-// result and whether the volume is gone.
+// result and whether the volume is gone. More than two attempts means a
+// forced form ran.
 func unmountVolume(dir string) ([]string, bool) {
 	var attempts []string
 	for _, step := range []struct {
