@@ -85,7 +85,8 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 	// purego runs Go code after a callback returns, before it reads errno.
 	// That code can start a GC, whose stop-the-world waits with a timeout and
 	// leaves ETIMEDOUT in errno. Keep the GC off so the errno a callback sets
-	// reaches the transport.
+	// reaches the transport. Fake-backed tests therefore never run the
+	// transport under GC.
 	gcPercent := debug.SetGCPercent(-1)
 	t.Cleanup(func() { debug.SetGCPercent(gcPercent) })
 	t.Cleanup(func() {

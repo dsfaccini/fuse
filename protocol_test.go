@@ -328,14 +328,34 @@ func protocolCases() []protocolCase {
 			noReply: true,
 		},
 		{
-			// Linux sends only the permission bits, which ConvertFileMode
-			// reads as a device, so MkDirOp.Mode then has os.ModeDevice too.
+			// A mode that carries the type bits.
 			name:    "mkdir",
 			request: request(fusekernel.OpMkdir, parent, join(fuse.NativeBytes(&fusekernel.MkdirIn{Mode: syscall.S_IFDIR | 0o755, Umask: 0o022}), names("dir"))),
 			serve: func(t *testing.T, op any) error {
 				if o := checkOp(t, op, &fuseops.MkDirOp{Parent: parent, Name: "dir", Mode: os.ModeDir | 0o755, OpContext: reqContext}); o != nil {
 					o.Entry = entry
 				}
+				return nil
+			},
+			reply: kernelEntry(),
+		},
+		{
+			// Linux sends only the permission bits (fs/fuse/dir.c fuse_mkdir).
+			name:    "mkdir without type bits",
+			request: request(fusekernel.OpMkdir, parent, join(fuse.NativeBytes(&fusekernel.MkdirIn{Mode: 0o755, Umask: 0o022}), names("dir"))),
+			serve: func(t *testing.T, op any) error {
+				o, ok := op.(*fuseops.MkDirOp)
+				if !ok {
+					t.Errorf("file system got %T, want *fuseops.MkDirOp", op)
+					return nil
+				}
+				// ConvertFileMode reads a mode without type bits as a device,
+				// so check only the directory bit and the permissions.
+				if o.Mode&os.ModeDir == 0 || o.Mode.Perm() != 0o755 {
+					t.Errorf("MkDirOp.Mode = %v, want a directory with permissions 0755", o.Mode)
+				}
+				checkOp(t, op, &fuseops.MkDirOp{Parent: parent, Name: "dir", Mode: o.Mode, OpContext: reqContext})
+				o.Entry = entry
 				return nil
 			},
 			reply: kernelEntry(),
