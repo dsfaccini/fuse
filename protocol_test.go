@@ -328,7 +328,7 @@ func protocolCases() []protocolCase {
 			noReply: true,
 		},
 		{
-			// A mode that carries the type bits.
+			// The osxfuse kext sends S_IFDIR (fuse_vnop_mkdir in osxfuse/kext).
 			name:    "mkdir",
 			request: request(fusekernel.OpMkdir, parent, join(fuse.NativeBytes(&fusekernel.MkdirIn{Mode: syscall.S_IFDIR | 0o755, Umask: 0o022}), names("dir"))),
 			serve: func(t *testing.T, op any) error {
@@ -340,22 +340,14 @@ func protocolCases() []protocolCase {
 			reply: kernelEntry(),
 		},
 		{
-			// Linux sends only the permission bits (fs/fuse/dir.c fuse_mkdir).
+			// Linux strips S_IFDIR and keeps the sticky bit (fs/fuse/dir.c
+			// fuse_mkdir).
 			name:    "mkdir without type bits",
-			request: request(fusekernel.OpMkdir, parent, join(fuse.NativeBytes(&fusekernel.MkdirIn{Mode: 0o755, Umask: 0o022}), names("dir"))),
+			request: request(fusekernel.OpMkdir, parent, join(fuse.NativeBytes(&fusekernel.MkdirIn{Mode: syscall.S_ISVTX | 0o755, Umask: 0o022}), names("dir"))),
 			serve: func(t *testing.T, op any) error {
-				o, ok := op.(*fuseops.MkDirOp)
-				if !ok {
-					t.Errorf("file system got %T, want *fuseops.MkDirOp", op)
-					return nil
+				if o := checkOp(t, op, &fuseops.MkDirOp{Parent: parent, Name: "dir", Mode: os.ModeDir | os.ModeSticky | 0o755, OpContext: reqContext}); o != nil {
+					o.Entry = entry
 				}
-				// ConvertFileMode reads a mode without type bits as a device,
-				// so check only the directory bit and the permissions.
-				if o.Mode&os.ModeDir == 0 || o.Mode.Perm() != 0o755 {
-					t.Errorf("MkDirOp.Mode = %v, want a directory with permissions 0755", o.Mode)
-				}
-				checkOp(t, op, &fuseops.MkDirOp{Parent: parent, Name: "dir", Mode: o.Mode, OpContext: reqContext})
-				o.Entry = entry
 				return nil
 			},
 			reply: kernelEntry(),
