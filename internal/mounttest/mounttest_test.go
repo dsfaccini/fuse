@@ -298,8 +298,9 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 	}
 }
 
-// mountFailureTests call Mount but fail before anything is mounted. A test
-// that reaches an FSKit mount cannot be listed.
+// mountFailureTests call Mount but fail before anything is mounted. Listing a
+// test does not exempt an FSKit test from its gate: it must still start with
+// SkipUnlessFSKitProbeEnabled.
 var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
 	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
