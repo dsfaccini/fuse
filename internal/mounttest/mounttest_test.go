@@ -165,6 +165,14 @@ func TestMountReturnsTypedFSKitErrors(t *testing.T) { mountFSKitTransport("", ni
 			wantErrs: 1,
 		},
 		{
+			name: "allowlisted test behind the FSKit probe gate",
+			src: `package p
+func TestMountReturnsTypedFSKitErrors(t *testing.T) {
+	mounttest.SkipUnlessFSKitProbeEnabled(t)
+	mountFSKitTransport("", nil, nil)
+}`,
+		},
+		{
 			name: "mount behind the FSKit probe gate",
 			src: `package p
 func TestMount(t *testing.T) {
@@ -420,11 +428,8 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 			continue
 		}
 		fskit := references(fn.Body, reachingFSKit)
-		if _, ok := mountFailureTests[name]; ok {
-			if fskit {
-				errs = append(errs, fmt.Errorf("%s: %s reaches an FSKit mount, which mountFailureTests cannot exempt; call mounttest.SkipUnlessFSKitProbeEnabled as its first statement",
-					fset.Position(fn.Pos()), name))
-			}
+		// mountFailureTests cannot exempt an FSKit mount from its gate.
+		if _, ok := mountFailureTests[name]; ok && !fskit {
 			continue
 		}
 		switch {
