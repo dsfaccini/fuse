@@ -215,7 +215,7 @@ func kernelEntry() []byte {
 // The protocol cases cover the ops of artifact-fs's file system, in the order
 // of fuseutil.FileSystem.
 func protocolCases() []protocolCase {
-	readIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Offset: 10, Size: 4096})
+	readIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Offset: 10, Size: 1 << 16})
 	dirent := fuseutil.Dirent{Offset: 1, Inode: 5, Name: "file", Type: fuseutil.DT_File}
 	direntPlus := fuseutil.DirentPlus{Dirent: dirent, Entry: entry}
 	direntPlusBytes := make([]byte, 4096)
@@ -431,7 +431,7 @@ func protocolCases() []protocolCase {
 			name:    "readdir",
 			request: request(fusekernel.OpReaddir, child, readIn),
 			serve: func(t *testing.T, op any) error {
-				if o := checkOp(t, op, &fuseops.ReadDirOp{Inode: child, Handle: handle, Offset: 10, Dst: make([]byte, 4096), OpContext: reqContext}); o != nil {
+				if o := checkOp(t, op, &fuseops.ReadDirOp{Inode: child, Handle: handle, Offset: 10, Dst: make([]byte, 1<<16), OpContext: reqContext}); o != nil {
 					o.BytesRead = fuseutil.WriteDirent(o.Dst, dirent)
 				}
 				return nil
@@ -445,7 +445,7 @@ func protocolCases() []protocolCase {
 			name:    "readdir error",
 			request: request(fusekernel.OpReaddir, child, readIn),
 			serve: func(t *testing.T, op any) error {
-				if o := checkOp(t, op, &fuseops.ReadDirOp{Inode: child, Handle: handle, Offset: 10, Dst: make([]byte, 4096), OpContext: reqContext}); o != nil {
+				if o := checkOp(t, op, &fuseops.ReadDirOp{Inode: child, Handle: handle, Offset: 10, Dst: make([]byte, 1<<16), OpContext: reqContext}); o != nil {
 					o.BytesRead = fuseutil.WriteDirent(o.Dst, dirent)
 				}
 				return syscall.EIO
@@ -458,7 +458,7 @@ func protocolCases() []protocolCase {
 			request: request(fusekernel.OpReaddirplus, child, readIn),
 			serve: func(t *testing.T, op any) error {
 				if o := checkOp(t, op, &fuseops.ReadDirPlusOp{ReadDirOp: fuseops.ReadDirOp{
-					Inode: child, Handle: handle, Offset: 10, Dst: make([]byte, 4096), OpContext: reqContext,
+					Inode: child, Handle: handle, Offset: 10, Dst: make([]byte, 1<<16), OpContext: reqContext,
 				}}); o != nil {
 					o.BytesRead = fuseutil.WriteDirentPlus(o.Dst, direntPlus)
 				}
@@ -489,7 +489,7 @@ func protocolCases() []protocolCase {
 			name:    "read into Dst",
 			request: request(fusekernel.OpRead, child, readIn),
 			serve: func(t *testing.T, op any) error {
-				if o := checkOp(t, op, &fuseops.ReadFileOp{Inode: child, Handle: handle, Offset: 10, Size: 4096, Dst: make([]byte, 4096), OpContext: reqContext}); o != nil {
+				if o := checkOp(t, op, &fuseops.ReadFileOp{Inode: child, Handle: handle, Offset: 10, Size: 1 << 16, Dst: make([]byte, 1<<16), OpContext: reqContext}); o != nil {
 					o.BytesRead = copy(o.Dst, "hello")
 				}
 				return nil
@@ -500,7 +500,7 @@ func protocolCases() []protocolCase {
 			name:    "read as Data",
 			request: request(fusekernel.OpRead, child, readIn),
 			serve: func(t *testing.T, op any) error {
-				if o := checkOp(t, op, &fuseops.ReadFileOp{Inode: child, Handle: handle, Offset: 10, Size: 4096, Dst: make([]byte, 4096), OpContext: reqContext}); o != nil {
+				if o := checkOp(t, op, &fuseops.ReadFileOp{Inode: child, Handle: handle, Offset: 10, Size: 1 << 16, Dst: make([]byte, 1<<16), OpContext: reqContext}); o != nil {
 					o.Data = [][]byte{[]byte("hello"), []byte(" world")}
 					o.BytesRead = 11
 				}
