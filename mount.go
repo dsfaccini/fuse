@@ -37,6 +37,11 @@ type Server interface {
 // supplied Server to serve connection requests. It blocks until the file
 // system is successfully mounted. It validates config before it mounts
 // anything.
+//
+// On Linux, Mount answers the mount's first FUSE_POLL before it returns, so
+// the process can open files in its own mount through package os without
+// deadlocking. It reserves inode ID math.MaxUint64 for that: requests for it
+// never reach the server.
 func Mount(
 	dir string,
 	server Server,
@@ -107,6 +112,11 @@ func Mount(
 	// Wait for the mount process to complete.
 	if err := <-ready; err != nil {
 		return nil, fmt.Errorf("mount (background): %w", err)
+	}
+
+	// Without the hack, the mount works as it did, so a failure is only logged.
+	if err := runPollHack(dir, connection); err != nil && cfg.ErrorLogger != nil {
+		cfg.ErrorLogger.Printf("poll hack: %v; opening this mount through package os may deadlock", err)
 	}
 
 	return mfs, nil

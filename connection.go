@@ -24,6 +24,7 @@ import (
 	"path"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -84,6 +85,13 @@ type Connection struct {
 
 	// Size of the buffer to allocate for each InMessage.
 	inMessageBufSize int
+
+	// pollHackRunning is true while Mount runs the poll hack. See poll_hack.go.
+	pollHackRunning atomic.Bool
+
+	// pollHackEntryKnown is true once the kernel has looked up the poll hack's
+	// entry. Only ReadOp touches it.
+	pollHackEntryKnown bool
 }
 
 // State that is maintained for each in-flight op. This is stuffed into the
@@ -471,6 +479,11 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		// Special case: handle interrupt requests inline.
 		if interruptOp, ok := op.(*interruptOp); ok {
 			c.handleInterrupt(interruptOp.FuseID)
+			continue
+		}
+
+		// Special case: answer the poll hack's requests inline.
+		if c.answerPollHack(inMsg, outMsg, op) {
 			continue
 		}
 

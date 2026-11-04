@@ -24,7 +24,7 @@ import (
 
 // InodeID is a 64-bit number used to uniquely identify a file or directory in
 // the file system. File systems may mint inode IDs with any value except for
-// RootInodeID.
+// RootInodeID and, on Linux, math.MaxUint64, which fuse.Mount reserves.
 //
 // This corresponds to struct inode::i_no in the VFS layer.
 // (https://tinyurl.com/23sr9svd)
