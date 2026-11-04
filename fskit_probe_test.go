@@ -52,24 +52,29 @@ const fskitProbeMounts = 5
 // Each result is one log line: "FSKIT_PROBE " and a JSON object with item,
 // mount, result and details. A result the run does not settle is "unknown"
 // and does not fail the test. Only the macfuse#1231 case fails on a measured
-// result: it records that FSKit padded a short READ reply, and fails once
-// macFUSE stops padding. A failed or skipped mount, measurements that stop
-// early, and a mount left behind also fail the test.
+// result: it passes while the read of a short READ reply returns the reported
+// size, and fails once the read returns only the reply or fails with EIO. A
+// failed mount, measurements that stop early, a server panic and a mount left
+// behind also fail the test, and so does a second run in one process, such as
+// -count=2.
 //
 // The probe runs only on David's go-ahead in his own words, because macFUSE's
 // FSKit extension switches itself off after a series of mounts
 // (https://github.com/macfuse/macfuse/issues/1232) and a stalled FSKit mount
-// clears only on reboot. AGENTS.md has the command. It refuses to start while
-// mount(8) lists an FSKit volume.
+// clears only on reboot. AGENTS.md has the command. The probe refuses to start
+// while a macFUSE volume or a probe mount point is mounted. It starts no
+// further mount after a failed mount, or while an earlier one is still
+// mounted.
 //
 // No mount outlives the probe. Each mount point is a fresh directory, and its
 // cleanup is registered before MFMount is called, so it runs after a failure, a
 // t.Fatal or a panic in the test goroutine. Cleanup unmounts with unmount(2),
 // then diskutil unmount, then the forced forms of both, and fails the test
 // with the recovery command if the volume stays mounted. Every wait on the
-// volume is bounded. SIGINT, SIGTERM and the approach of the go test deadline
-// stop the measurements early so that cleanup still runs. After the last
-// mount the probe checks mount(8) again for each of its mount points.
+// volume is bounded. SIGINT, SIGTERM, SIGHUP and the approach of the go test
+// deadline stop the measurements early so that cleanup still runs. SIGPIPE is
+// ignored, so a closed output pipe cannot end the run. After the last mount,
+// the probe checks the mount table again for each of its mount points.
 func TestFSKitProbe(t *testing.T) {
 	mounttest.SkipUnlessFSKitProbeEnabled(t)
 	runFSKitProbe(t)

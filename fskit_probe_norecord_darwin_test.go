@@ -16,15 +16,20 @@
 
 package fuse
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // probeRecorder records nothing without the fuse_record build tag. The
 // recording format is in fskit_probe_record_darwin_test.go.
 type probeRecorder struct{}
+
+func checkProbeRecording(*testing.T) {}
 
 func newProbeRecorder(t *testing.T, mount string) *probeRecorder {
 	t.Logf("recording off for %s; build with -tags fuse_record to record", mount)
 	return nil
 }
 
-func (*probeRecorder) frame(byte, ...[]byte) {}
+func (*probeRecorder) frame(byte, time.Time, ...[]byte) {}

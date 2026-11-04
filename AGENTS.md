@@ -79,13 +79,17 @@ covers the change.
   ```
   FUSE_RUN_FSKIT_PROBE=1 GOWORK=off go test -tags fuse_record -run '^TestFSKitProbe$' -v -count=1 -timeout 30m .
   ```
-- Each result is a log line that starts with `FSKIT_PROBE `, then JSON.
+- Each result is a log line that contains `FSKIT_PROBE ` and then JSON.
+  `grep -o 'FSKIT_PROBE .*'` extracts them.
 - `-tags fuse_record` writes each mount's message stream to
   `testdata/fskit/<mount>.frames`. `fskit_probe_record_darwin_test.go` defines
   the format.
-- After the run, `mount | grep -i fskit` must print nothing. A killed test
-  process can leave a volume behind. Remove it with
-  `diskutil unmount force <dir>`.
+- After the run, `mount | grep -E 'macfuse|fskit-probe'` must print nothing.
+- `mount | grep -i fskit` also lists Apple's FSKit volumes, such as
+  CoreDevice's DeviceFS. They are expected. Never unmount them.
+- A killed test process can leave a probe volume behind. Remove it with
+  `diskutil unmount force <dir>`, only for a mount point whose name starts with
+  `fskit-probe-`.
 - When you change the number of mounts, change `fskitProbeMounts` and the doc
   comment together. The probe fails before its first mount when its plan and
   `fskitProbeMounts` disagree.

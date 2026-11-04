@@ -150,6 +150,24 @@ func TestProbe(t *testing.T) { mountFSKitTransport("", nil, nil) }`,
 			wantErrs: 1,
 		},
 		{
+			name: "FSKit transport behind the mount-test gate",
+			src: `package p
+func TestProbe(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+	mountFSKitTransport("", nil, nil)
+}`,
+			wantErrs: 1,
+		},
+		{
+			name: "mount behind the FSKit probe gate",
+			src: `package p
+func TestMount(t *testing.T) {
+	mounttest.SkipUnlessFSKitProbeEnabled(t)
+	fuse.Mount("", nil, nil)
+}`,
+			wantErrs: 1,
+		},
+		{
 			name: "direct SetUp",
 			src: `package p
 func TestHelloSetUpDirect(t *testing.T) { (&samples.SampleTest{}).SetUp(nil) }`,
@@ -277,20 +295,20 @@ var mountFailureTests = map[string]string{
 // SetUp on samples.SampleTest and samples.SubprocessTest.
 var mountCallees = []string{"Mount", "mountFSKitTransport", "RunTests", "SetUp"}
 
+// fskitMountCallees mount through FSKit. Only the FSKit probe's gate may guard
+// them, so that FUSE_RUN_MOUNT_TESTS never starts an FSKit mount.
+var fskitMountCallees = []string{"mountFSKitTransport"}
+
 // ungatedMounts checks the test files of one directory. A function or
 // package-level variable reaches a mount when its body names a mount callee or
 // another one that reaches a mount. A test, benchmark or fuzz target that
-// reaches a mount must call SkipUnlessEnabled, or the FSKit probe's
-// SkipUnlessFSKitProbeEnabled, first. An example cannot skip, so
+// reaches a mount must call SkipUnlessEnabled first, or
+// SkipUnlessFSKitProbeEnabled when it reaches an FSKit mount. An example cannot skip, so
 // an example that reaches a mount must have no output comment, which keeps go
 // test from running it. No init and no package-level initializer may call a
 // function that mounts, because both run before any gate. ungatedMounts returns one error per
 // violation and the number of entry points that reach a mount.
 func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
-	reaching := map[string]bool{}
-	for _, name := range mountCallees {
-		reaching[name] = true
-	}
 	var decls []*ast.FuncDecl
 	var initializers []ast.Expr
 	values := map[string][]ast.Node{}
@@ -324,17 +342,26 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 			}
 		}
 	}
-	for changed := true; changed; {
-		changed = false
-		for name, nodes := range values {
-			for _, node := range nodes {
-				if !reaching[name] && references(node, reaching) {
-					reaching[name] = true
-					changed = true
+	reach := func(callees []string) map[string]bool {
+		reaching := map[string]bool{}
+		for _, name := range callees {
+			reaching[name] = true
+		}
+		for changed := true; changed; {
+			changed = false
+			for name, nodes := range values {
+				for _, node := range nodes {
+					if !reaching[name] && references(node, reaching) {
+						reaching[name] = true
+						changed = true
+					}
 				}
 			}
 		}
+		return reaching
 	}
+	reaching := reach(mountCallees)
+	reachingFSKit := reach(fskitMountCallees)
 
 	// calling holds the functions that mount when called. A function literal
 	// inside a body does not run when the body runs.
@@ -390,9 +417,13 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 		switch {
 		case isEntry(name, "Test"), isEntry(name, "Benchmark"), isEntry(name, "Fuzz"):
 			checked++
-			if !gated(fn.Body) {
-				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.SkipUnlessEnabled, or SkipUnlessFSKitProbeEnabled for the FSKit probe, as its first statement",
-					fset.Position(fn.Pos()), name))
+			gate := "SkipUnlessEnabled"
+			if references(fn.Body, reachingFSKit) {
+				gate = "SkipUnlessFSKitProbeEnabled"
+			}
+			if !gated(fn.Body, gate) {
+				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.%s as its first statement",
+					fset.Position(fn.Pos()), name, gate))
 			}
 		case isEntry(name, "Example"):
 			checked++
@@ -447,7 +478,8 @@ func callsOutsideFuncLit(node ast.Node, names map[string]bool) bool {
 	return found
 }
 
-func gated(body *ast.BlockStmt) bool {
+// gated reports whether body starts with a call to mounttest's gate function.
+func gated(body *ast.BlockStmt, gate string) bool {
 	if len(body.List) == 0 {
 		return false
 	}
@@ -464,8 +496,7 @@ func gated(body *ast.BlockStmt) bool {
 		return false
 	}
 	pkg, ok := sel.X.(*ast.Ident)
-	return ok && pkg.Name == "mounttest" &&
-		(sel.Sel.Name == "SkipUnlessEnabled" || sel.Sel.Name == "SkipUnlessFSKitProbeEnabled")
+	return ok && pkg.Name == "mounttest" && sel.Sel.Name == gate
 }
 
 func calleeName(call *ast.CallExpr) string {

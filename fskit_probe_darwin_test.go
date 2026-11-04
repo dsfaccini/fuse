@@ -53,19 +53,30 @@ const (
 	// probeMountLimit bounds the measurements on one mount.
 	probeMountLimit = 3 * time.Minute
 	// probeCleanupReserve is left before the go test deadline, which kills
-	// the process without running cleanup.
-	probeCleanupReserve = 3 * time.Minute
+	// the process without running cleanup. It covers the longest measurement
+	// step (about 65s), the teardown of one stuck mount (about 70s) and the
+	// final check of that mount point (about 60s). No mount starts while an
+	// earlier one is still mounted, so at most one mount can be stuck.
+	probeCleanupReserve = 4 * time.Minute
 	// probeDaemonTimeout matches the timeout mount's daemon_timeout option.
 	probeDaemonTimeout = 3 * time.Second
 	// probeScratch holds any message FSKit sends, so that a WRITE larger than
 	// the Connection's buffer does not end the mount.
 	probeScratch = 8 << 20
+	// probeDirPrefix starts the name of every probe mount point.
+	probeDirPrefix = "fskit-probe-"
+	// probeFiller is the byte the server fills every READ reply with.
+	probeFiller = 'p'
 
 	frameFromFSKit  = 'K'
 	frameFromServer = 'S'
 )
 
 var errProbeTimeout = errors.New("timed out")
+
+// fskitProbeStarted fails a second run in one process, such as -count=2,
+// which would mount again.
+var fskitProbeStarted atomic.Bool
 
 // probeResult is one machine-readable result line.
 type probeResult struct {
@@ -86,17 +97,22 @@ func reportProbe(t *testing.T, r probeResult) {
 }
 
 type fskitProbe struct {
-	t    *testing.T
-	ctx  context.Context
-	dirs []string
+	t           *testing.T
+	ctx         context.Context
+	dirs        []string
+	mountFailed bool
 
 	// Findings that the results across mounts compare, by mount name.
+	rootAccess map[string]error
 	openNoPerm map[string]error
 	maxWrite   map[string]int64
 	volumes    map[string]unix.Statfs_t
 }
 
 func runFSKitProbe(t *testing.T) {
+	if fskitProbeStarted.Swap(true) {
+		t.Fatal("TestFSKitProbe already ran in this process; run it with -count=1")
+	}
 	plan := []struct {
 		name      string
 		configure func(*MountConfig)
@@ -115,11 +131,15 @@ func runFSKitProbe(t *testing.T) {
 	if len(plan) != fskitProbeMounts {
 		t.Fatalf("the probe plans %d mounts, but fskitProbeMounts and the docs say %d", len(plan), fskitProbeMounts)
 	}
-	if lines, err := fskitMountLines(); err != nil || len(lines) > 0 {
-		t.Fatalf("mount(8) lists FSKit volumes %q (error: %v); the probe mounts nothing while another FSKit volume is mounted", lines, err)
+	if volumes, err := probeConflicts(); err != nil || len(volumes) > 0 {
+		t.Fatalf("macFUSE or probe volumes are mounted: %q (mount table error: %v); the probe mounts nothing while one is", volumes, err)
 	}
+	checkProbeRecording(t)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// go test pipes a verbose test's output, so a closed pipe must not end
+	// the run before cleanup.
+	signal.Ignore(syscall.SIGPIPE)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	t.Cleanup(stop)
 	if deadline, ok := t.Deadline(); ok {
 		var cancel context.CancelFunc
@@ -129,6 +149,7 @@ func runFSKitProbe(t *testing.T) {
 	p := &fskitProbe{
 		t:          t,
 		ctx:        ctx,
+		rootAccess: map[string]error{},
 		openNoPerm: map[string]error{},
 		maxWrite:   map[string]int64{},
 		volumes:    map[string]unix.Statfs_t{},
@@ -136,17 +157,38 @@ func runFSKitProbe(t *testing.T) {
 	t.Cleanup(p.checkNoMountLeft)
 
 	for _, step := range plan {
+		if err := p.readyForMount(); err != nil {
+			t.Errorf("no mount from %s on: %v", step.name, err)
+			break
+		}
 		t.Run(step.name, func(t *testing.T) {
-			if err := ctx.Err(); err != nil {
-				t.Fatalf("mount skipped: %v", err)
-			}
 			if m := p.mountProbe(t, step.name, step.configure); m != nil {
 				step.measure(m)
-				m.reportReplyBuffers()
 			}
 		})
 	}
 	p.reportAcrossMounts()
+}
+
+// readyForMount returns why the next mount must not start: the probe was
+// stopped, an earlier mount failed, or a macFUSE or probe volume is mounted.
+// Every extra mount attempt counts toward the series that switches macFUSE's
+// FSKit extension off.
+func (p *fskitProbe) readyForMount() error {
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
+	if p.mountFailed {
+		return errors.New("an earlier mount failed")
+	}
+	volumes, err := probeConflicts()
+	if err != nil {
+		return err
+	}
+	if len(volumes) > 0 {
+		return fmt.Errorf("still mounted: %q", volumes)
+	}
+	return nil
 }
 
 // checkNoMountLeft runs after every mount's own cleanup. MFMount can attach a
@@ -163,15 +205,16 @@ func (p *fskitProbe) checkNoMountLeft() {
 		}
 		os.Remove(dir)
 	}
-	lines, err := fskitMountLines()
+	volumes, err := probeConflicts()
 	result := "none"
-	if len(left) > 0 {
-		result = strings.Join(left, ",")
-		p.t.Errorf("the FSKit probe left %q mounted; run diskutil unmount force on each", left)
+	if len(left) > 0 || len(volumes) > 0 || err != nil {
+		result = "mounted"
+		p.t.Errorf("after the FSKit probe, macFUSE or probe volumes are mounted: %q (mount table error: %v); unmount each probe mount point with diskutil unmount force", volumes, err)
 	}
 	reportProbe(p.t, probeResult{Item: "mounts_left", Mount: "all", Result: result, Details: map[string]string{
-		"mount_fskit_lines": strings.Join(lines, " | "),
-		"mount_error":       errName(err),
+		"probe_mount_points": strings.Join(left, ","),
+		"macfuse_or_probe":   strings.Join(volumes, ","),
+		"mount_table_error":  errName(err),
 	}})
 }
 
@@ -199,10 +242,11 @@ func (p *fskitProbe) reportAcrossMounts() {
 	})
 
 	const initLimit, optionLimit = 128 << 10, 256 << 10
-	largest, limited := p.maxWrite["base"], p.maxWrite["options"]
+	largest, baseOK := p.maxWrite["base"]
+	limited, limitedOK := p.maxWrite["options"]
 	result = "unknown"
 	switch {
-	case largest == 0 || limited == 0:
+	case !baseOK || !limitedOK:
 	case largest <= initLimit:
 		// FSKit's own WRITE size fits under both limits, so it tells nothing.
 	case limited <= initLimit:
@@ -219,22 +263,19 @@ func (p *fskitProbe) reportAcrossMounts() {
 		"mount_option":          fmt.Sprint(optionLimit),
 	})
 
-	// A volume without MNT_LOCAL is a network volume to macOS.
-	plain, plainOK := p.volumes["base"]
-	local, localOK := p.volumes["local"]
+	// A process without the Network Volumes permission gets EPERM on a
+	// network volume. Equal access on both mounts settles nothing.
+	plainErr, plainOK := p.rootAccess["base"]
+	localErr, localOK := p.rootAccess["local"]
 	result = "unknown"
-	switch {
-	case !plainOK || !localOK:
-	case plain.Flags&unix.MNT_LOCAL != 0:
-		// The volume is local without the option.
-	case local.Flags&unix.MNT_LOCAL != 0:
+	if plainOK && localOK && errors.Is(plainErr, syscall.EPERM) && localErr == nil {
 		result = "yes"
-	default:
-		result = "no"
 	}
 	report("local_option_drops_network_volume", "base,local", result, map[string]string{
-		"base_flags":  fmt.Sprintf("%#x", plain.Flags),
-		"local_flags": fmt.Sprintf("%#x", local.Flags),
+		"base_access":  errName(plainErr),
+		"local_access": errName(localErr),
+		"base_flags":   fmt.Sprintf("%#x", p.volumes["base"].Flags),
+		"local_flags":  fmt.Sprintf("%#x", p.volumes["local"].Flags),
 	})
 }
 
@@ -250,15 +291,19 @@ type probeMount struct {
 	log     *probeLog
 	server  *probeServer
 	holds   map[string]*heldRead
+	rec     *probeRecorder
 	pt      *probeTransport
 	conn    *Connection
 	mfs     *MountedFileSystem
 }
 
 // mountProbe mounts the probe's file system with artifact-fs's mount config,
-// changed by configure. It reports a failed mount, fails t and returns nil.
+// changed by configure. When the mount fails, it reports the failure, fails t,
+// stops later mounts and returns nil.
 func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*MountConfig)) *probeMount {
-	dir, err := os.MkdirTemp("", "fskit-probe-"+name+"-")
+	// Every way out before the mount succeeds stops later mounts.
+	p.mountFailed = true
+	dir, err := os.MkdirTemp("", probeDirPrefix+name+"-")
 	if err == nil {
 		dir, err = filepath.EvalSymlinks(dir)
 	}
@@ -278,12 +323,15 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 		holds:  map[string]*heldRead{},
 	}
 	m.server = m.newServer()
+	// The recording closes in a cleanup that runs after teardown, so it keeps
+	// the unmount traffic.
+	m.rec = newProbeRecorder(t, name)
 	// Registered before MFMount, so it runs on every path out of the test.
 	t.Cleanup(m.teardown)
 
 	cfg := MountConfig{
 		OpContext:               context.Background(),
-		FSName:                  "fskit-probe-" + name,
+		FSName:                  probeDirPrefix + name,
 		Subtype:                 "fskit-probe",
 		DisableWritebackCaching: true,
 		FuseImpl:                FUSEImplMacFUSE,
@@ -308,6 +356,7 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 		t.Errorf("mount %s: %v", name, err)
 		return nil
 	}
+	p.mountFailed = false
 	m.report("mount", "mounted", map[string]string{
 		"options": strings.Join(options, ","),
 		"ms":      fmt.Sprint(time.Since(start).Milliseconds()),
@@ -338,7 +387,6 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 	if err != nil {
 		return err
 	}
-	rec := newProbeRecorder(m.t, m.name)
 
 	fusekernel.IsPlatformFuseT = false
 	ready := make(chan error, 1)
@@ -355,7 +403,7 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 		getReplyBuffer: getReplyBuffer,
 		scratch:        make([]byte, buffer.GetPageSize()+probeScratch),
 		log:            m.log,
-		rec:            rec,
+		rec:            m.rec,
 	}
 
 	type mountReturn struct {
@@ -390,6 +438,17 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 			return fmt.Errorf("newConnection: %w", err)
 		}
 	case <-time.After(probeMountWait):
+		// MFMount closes the channel itself when it fails, and MFMount.h
+		// calls a second close a programming error. So close the channel only
+		// once MFMount reports success. That ends the blocked INIT read, and
+		// teardown unmounts the volume.
+		select {
+		case r := <-returned:
+			if r.err == nil {
+				m.pt.closeChannel()
+			}
+		case <-time.After(probeMountWait):
+		}
 		return fmt.Errorf("no INIT request within %v", probeMountWait)
 	}
 
@@ -414,8 +473,8 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 	return nil
 }
 
-// teardown releases held READs and unmounts whatever the measurements left
-// mounted.
+// teardown releases held READs, unmounts whatever the measurements left
+// mounted, and reports what the server and the transport saw.
 func (m *probeMount) teardown() {
 	m.cancel()
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
@@ -424,7 +483,9 @@ func (m *probeMount) teardown() {
 	}
 	if m.mfs != nil {
 		m.join(probeWait)
+		m.reportServer()
 	}
+	m.reportReplyBuffers()
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
 		m.t.Errorf("the FSKit probe left %s mounted (mount table error: %v); run: diskutil unmount force %s", m.dir, err, m.dir)
 		return
@@ -457,8 +518,8 @@ func (m *probeMount) measureBase() {
 		m.measureLookupAttributes,
 		m.measureInterrupt,
 		m.measure1231,
-		func() { m.measurePaddingTiming("shrink", 6144) },
-		func() { m.measurePaddingTiming("grow", 12288) },
+		func() { m.measurePaddingTiming("shrink", 5000) },
+		func() { m.measurePaddingTiming("grow", 5100) },
 		m.measurePermissions,
 		m.measureWriteSizes,
 		m.unmountAndJoin,
@@ -510,10 +571,10 @@ func (m *probeMount) join(d time.Duration) string {
 	return err.Error()
 }
 
-// measureRootAccess stats the mount point. A process without the Network
-// Volumes permission gets EPERM on a network volume.
+// measureRootAccess stats the mount point.
 func (m *probeMount) measureRootAccess() {
 	_, err := statSize(m.dir)
+	m.p.rootAccess[m.name] = err
 	m.report("root_access", errName(err), nil)
 }
 
@@ -548,26 +609,37 @@ func (m *probeMount) measureTTL(item, op string) {
 	})
 }
 
-// measureNegativeEntry stats a name whose LOOKUP answers no child with an
-// hour's entry TTL, twice, and a name whose LOOKUP fails with ENOENT, twice.
+// measureNegativeEntry stats a name whose LOOKUP answers no child with a 2s
+// entry TTL twice, and again after the TTL. A name whose LOOKUP fails with
+// ENOENT, stated twice, is the control.
 func (m *probeMount) measureNegativeEntry() {
-	_, err1 := m.stat("negative")
-	_, err2 := m.stat("negative")
-	m.stat("missing")
-	m.stat("missing")
-	lookups := m.log.count("LOOKUP", "negative")
+	var firstErr error
+	stat := func(name string) int {
+		if _, err := m.stat(name); !errors.Is(err, syscall.ENOENT) && firstErr == nil {
+			firstErr = fmt.Errorf("stat %s: %v", name, errName(err))
+		}
+		return m.log.count("LOOKUP", name)
+	}
+	negative1, negative2 := stat("negative"), stat("negative")
+	control1, control2 := stat("missing"), stat("missing")
+	m.sleep(3 * time.Second)
+	negative3 := stat("negative")
 
 	result := "no"
 	switch {
-	case !errors.Is(err1, syscall.ENOENT) || !errors.Is(err2, syscall.ENOENT):
+	case firstErr != nil:
 		result = "unknown"
-	case lookups == 1:
+	case control2 == control1:
+		result = "enoent_cached_too"
+	case negative2 == negative1 && negative3 > negative2:
 		result = "yes"
+	case negative2 == negative1:
+		result = "never_expires"
 	}
 	m.report("negative_entry", result, map[string]string{
-		"lookups":        fmt.Sprint(lookups),
-		"stat_errors":    errName(err1) + "," + errName(err2),
-		"enoent_lookups": fmt.Sprint(m.log.count("LOOKUP", "missing")),
+		"lookups":        fmt.Sprintf("%d,%d,%d", negative1, negative2, negative3),
+		"enoent_lookups": fmt.Sprintf("%d,%d", control1, control2),
+		"error":          errName(firstErr),
 	})
 }
 
@@ -635,32 +707,48 @@ func (m *probeMount) measureInterrupt() {
 	})
 }
 
-// measure1231 reproduces macfuse#1231: a READ reply shorter than the size the
-// file system reported. It fails once FSKit stops padding the reply.
+// measure1231 reproduces macfuse#1231: the server reports 8192 bytes and
+// answers READ with 100 bytes and no error. The test fails once the read
+// returns only those 100 bytes, or fails with EIO.
 func (m *probeMount) measure1231() {
 	const name, reported, sent = "short_read", 8192, 100
+	mark := m.log.mark()
 	got, err := m.readOnce(name, reported)
+	replies := m.log.readReplies(mark, name)
+	// An error reply comes from the library, not the server. An empty reply
+	// is one macFUSE fails with EIO by design.
+	libraryError := slices.ContainsFunc(replies, func(e probeEvent) bool { return e.status != 0 })
+	emptyReply := slices.ContainsFunc(replies, func(e probeEvent) bool { return e.size <= int64(buffer.OutMessageHeaderSize) })
 	details := map[string]string{
-		"reported_size": fmt.Sprint(reported),
-		"reply_bytes":   fmt.Sprint(sent),
-		"read_bytes":    fmt.Sprint(got),
-		"error":         errName(err),
+		"reported_size":  fmt.Sprint(reported),
+		"reply_bytes":    fmt.Sprint(sent),
+		"read_bytes":     fmt.Sprint(got),
+		"error":          errName(err),
+		"read_replies":   fmt.Sprint(len(replies)),
+		"library_errors": yesNo(libraryError),
+		"empty_replies":  yesNo(emptyReply),
 	}
+	fixed := "FSKit no longer returns the reported size for a %d-byte READ reply, so macfuse#1231 looks fixed (%s): make this case expect the fix, and revisit the workarounds for it"
 	switch {
+	case len(replies) == 0 || libraryError || emptyReply || errors.Is(err, errProbeTimeout):
+		m.report("macfuse_1231", "unknown", details)
+	case errors.Is(err, syscall.EIO):
+		m.report("macfuse_1231", "fails_read", details)
+		m.t.Errorf(fixed, sent, "the read fails with EIO")
 	case err != nil || got < sent:
 		m.report("macfuse_1231", "unknown", details)
 	case got == sent:
 		m.report("macfuse_1231", "not_padded", details)
-		m.t.Errorf("FSKit returned a %d-byte READ reply unpadded, so macfuse#1231 looks fixed: make this case expect no padding, and revisit the workarounds for it", sent)
+		m.t.Errorf(fixed, sent, "the read returns only the reply")
 	default:
 		m.report("macfuse_1231", "padded", details)
 	}
 }
 
-// measurePaddingTiming holds a READ, answers a GETATTR that reports a new
-// size, then answers the READ short. The read returns the size FSKit held
-// when it sent the READ, the size it held when the reply arrived, or only the
-// reply.
+// measurePaddingTiming holds the first READ of a file, answers a GETATTR that
+// reports a new size, and answers the READ with 1024 bytes once a stat returns
+// the new size. Later READs of the file get 0 bytes. It reports how many bytes
+// the read returned, against the size at the READ and the size in the GETATTR.
 func (m *probeMount) measurePaddingTiming(name string, after uint64) {
 	const answered = 1024
 	n, h := m.server.names[name], m.holds[name]
@@ -681,13 +769,14 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) {
 	defer within(probeWait, f.Close)
 
 	type readResult struct {
-		n   int
-		err error
+		data []byte
+		err  error
 	}
 	read := make(chan readResult, 1)
 	go func() {
-		k, err := f.Read(make([]byte, 64<<10))
-		read <- readResult{k, err}
+		buf := make([]byte, 64<<10)
+		k, err := f.Read(buf)
+		read <- readResult{buf[:k], err}
 	}()
 	request, ok := m.awaitRead(h)
 	if !ok {
@@ -697,12 +786,7 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) {
 	}
 	mark := m.log.mark()
 	n.setSize(after)
-	stat := make(chan string, 1)
-	go func() {
-		size, err := m.stat(name)
-		stat <- fmt.Sprintf("%d,%s", size, errName(err))
-	}()
-	_, getattr := m.log.waitFor(m.ctx, probeWait, mark, isOp("GETATTR_SENT", name))
+	size, statErr := m.stat(name)
 	h.answer(answered)
 	var r readResult
 	select {
@@ -710,21 +794,32 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) {
 	case <-time.After(2 * probeWait):
 		r.err = errProbeTimeout
 	}
+
+	var fillerPastReply int
+	if len(r.data) > answered {
+		fillerPastReply = bytes.Count(r.data[answered:], []byte{probeFiller})
+	}
 	details["read_request_bytes"] = fmt.Sprint(request.size)
-	details["getattr_while_read_pending"] = yesNo(getattr)
-	details["read_bytes"] = fmt.Sprint(r.n)
+	details["stat_while_read_held"] = fmt.Sprintf("%d,%s", size, errName(statErr))
+	details["getattrs_while_read_held"] = fmt.Sprint(len(m.log.matching(mark, isOp("GETATTR_SENT", name))))
+	details["reads_after_held"] = fmt.Sprint(m.log.count("READ", name) - 1)
+	details["read_bytes"] = fmt.Sprint(len(r.data))
 	details["read_error"] = errName(r.err)
-	details["stat"] = <-stat
+	details["filler_bytes_past_reply"] = fmt.Sprint(fillerPastReply)
 
 	sendTime, arrival := min(request.size, int64(before)), min(request.size, int64(after))
 	result := "unknown"
 	switch {
-	case !getattr || r.err != nil || sendTime == arrival:
-	case r.n == answered:
+	case statErr != nil || size != int64(after) || r.err != nil:
+		// FSKit did not show the new size while the READ was held.
+	case len(r.data) == answered:
 		result = "not_padded"
-	case int64(r.n) == sendTime:
+	case fillerPastReply > 0 || sendTime == arrival:
+		// The bytes past the reply could be server data, or the READ's size
+		// cannot tell the two sizes apart.
+	case int64(len(r.data)) == sendTime:
 		result = "send_time"
-	case int64(r.n) == arrival:
+	case int64(len(r.data)) == arrival:
 		result = "arrival_time"
 	}
 	m.report(item, result, details)
@@ -756,8 +851,9 @@ func (m *probeMount) measurePermissions() {
 	})
 }
 
-// measureWriteSizes writes 4 MiB with one write(2) and records the WRITE
-// sizes FSKit sends.
+// measureWriteSizes writes 4 MiB with one write(2), syncs, and records the
+// WRITE sizes FSKit sends. The largest size counts only when the WRITEs carry
+// every byte written.
 func (m *probeMount) measureWriteSizes() {
 	const name, size = "write", 4 << 20
 	f, err := openFile(m.path(name), os.O_WRONLY)
@@ -766,12 +862,15 @@ func (m *probeMount) measureWriteSizes() {
 			_, err := f.Write(make([]byte, size))
 			return err
 		})
+		if syncErr := within(4*probeWait, f.Sync); err == nil {
+			err = syncErr
+		}
 		if closeErr := within(4*probeWait, f.Close); err == nil {
 			err = closeErr
 		}
 	}
 	var writes, oversized int
-	var largest int64
+	var largest, carried int64
 	for _, e := range m.log.matching(0, isOp("", name)) {
 		switch e.op {
 		case "WRITE":
@@ -782,12 +881,19 @@ func (m *probeMount) measureWriteSizes() {
 			continue
 		}
 		largest = max(largest, e.size)
+		carried += e.size
 	}
-	m.p.maxWrite[m.name] = largest
-	m.report("write_sizes", fmt.Sprint(largest), map[string]string{
+	result := "unknown"
+	if carried >= size {
+		result = fmt.Sprint(largest)
+		m.p.maxWrite[m.name] = largest
+	}
+	m.report("write_sizes", result, map[string]string{
+		"largest":        fmt.Sprint(largest),
 		"writes":         fmt.Sprint(writes),
 		"oversized":      fmt.Sprint(oversized),
-		"write_bytes":    fmt.Sprint(size),
+		"carried_bytes":  fmt.Sprint(carried),
+		"written_bytes":  fmt.Sprint(size),
 		"init_max_write": fmt.Sprint(m.conn.cfg.MaxWrite),
 		"error":          errName(err),
 	})
@@ -857,12 +963,10 @@ func (m *probeMount) healthy(name string) bool {
 // closeChannel calls MFChannelClose on the live mount.
 func (m *probeMount) closeChannel() {
 	mark := m.log.mark()
-	m.pt.closedChannel.Store(true)
-	native := m.pt.native
-	closed, _, errno := purego.SyscallN(native.api.channelClose, native.channel)
+	closed, errno := m.pt.closeChannel()
 	closeResult := "ok"
-	if byte(closed) == 0 {
-		closeResult = errName(callErrno(errno))
+	if !closed {
+		closeResult = errName(errno)
 	}
 	_, woke := m.log.waitFor(m.ctx, probeWait, mark, channelEnded)
 	unmounted := waitUnmounted(m.dir, probeWait)
@@ -990,14 +1094,39 @@ func (m *probeMount) unmountAndJoin() {
 	})
 }
 
+// reportServer reports how serving ended, and fails t when the server
+// panicked.
+func (m *probeMount) reportServer() {
+	panics := m.log.matching(0, isOp("SERVE_PANIC", ""))
+	replyErrors := m.log.matching(0, isOp("REPLY_ERROR", ""))
+	end := "running"
+	if ends := m.log.matching(0, isOp("SERVE_END", "")); len(ends) > 0 {
+		end = ends[0].name
+	}
+	result := "ok"
+	if len(panics) > 0 {
+		result = "panicked"
+		m.t.Errorf("the probe's server panicked: %s", panics[0].name)
+	}
+	m.report("server", result, map[string]string{
+		"panics":        fmt.Sprint(len(panics)),
+		"reply_errors":  fmt.Sprint(len(replyErrors)),
+		"serving_ended": end,
+	})
+}
+
 // reportReplyBuffers reports the reply buffers FSKit attached to READ
 // requests.
 func (m *probeMount) reportReplyBuffers() {
-	var reads, attached, belowSize int
+	var reads, attached, failed, belowSize int
 	var smallest, largest int64 = -1, 0
 	for _, e := range m.log.matching(0, isOp("READ_REQUEST", "")) {
 		reads++
-		if e.capacity <= 0 {
+		switch {
+		case e.capacity < 0:
+			failed++
+			continue
+		case e.capacity == 0:
 			continue
 		}
 		attached++
@@ -1011,18 +1140,18 @@ func (m *probeMount) reportReplyBuffers() {
 	}
 	result := "no"
 	switch {
-	case reads == 0:
+	case reads == 0 || failed > 0:
 		result = "unknown"
 	case attached > 0:
 		result = "yes"
 	}
 	m.report("read_reply_buffer", result, map[string]string{
-		"reads":                   fmt.Sprint(reads),
-		"with_buffer":             fmt.Sprint(attached),
-		"min_capacity":            fmt.Sprint(smallest),
-		"max_capacity":            fmt.Sprint(largest),
-		"below_read_size":         fmt.Sprint(belowSize),
-		"get_reply_buffer_errors": fmt.Sprint(len(m.log.matching(0, isOp("REPLY_BUFFER_ERROR", "")))),
+		"reads":           fmt.Sprint(reads),
+		"with_buffer":     fmt.Sprint(attached),
+		"lookup_failures": fmt.Sprint(failed),
+		"min_capacity":    fmt.Sprint(smallest),
+		"max_capacity":    fmt.Sprint(largest),
+		"below_read_size": fmt.Sprint(belowSize),
 	})
 }
 
@@ -1053,15 +1182,17 @@ func (m *probeMount) newServer() *probeServer {
 	file("entry_ttl_2s", 2*time.Second, hour, 1)
 	file("attr_ttl_0", hour, 0, 1)
 	file("attr_ttl_2s", hour, 2*time.Second, 1)
-	file("negative", hour, hour, 0).negative = true
+	file("negative", 2*time.Second, hour, 0).negative = true
 	file("lookup_attrs", 0, hour, 100)
 	file("short_read", hour, hour, 8192).read = func(_ context.Context, op *fuseops.ReadFileOp) error {
 		serveFiller(op, 100)
 		return nil
 	}
 	m.hold(file("interrupt", hour, hour, 4096), true)
-	m.hold(file("shrink", hour, 0, 12288), false)
-	m.hold(file("grow", hour, 0, 6144), false)
+	// Both sizes of each padding case fit in one READ of the first size
+	// rounded up to 512 bytes.
+	m.hold(file("shrink", hour, 0, 5100), false)
+	m.hold(file("grow", hour, 0, 5000), false)
 	file("noperm", hour, hour, 1).mode = 0
 	file("write", hour, 0, 0)
 	file("notify_entry", hour, hour, 1)
@@ -1072,7 +1203,8 @@ func (m *probeMount) newServer() *probeServer {
 }
 
 // heldRead holds the first READ of a node until the probe answers it with a
-// byte count. Later READs of the node get filler up to its GETATTR size.
+// byte count. Later READs of the node get 0 bytes, so that every byte a
+// reader gets came from the held READ's reply or from FSKit.
 type heldRead struct {
 	taken   atomic.Bool
 	arrived chan probeEvent
@@ -1086,7 +1218,7 @@ func (m *probeMount) hold(n *probeNode, honorInterrupt bool) {
 	m.holds[n.name] = h
 	n.read = func(ctx context.Context, op *fuseops.ReadFileOp) error {
 		if h.taken.Swap(true) {
-			serveFiller(op, int64(n.getattrSize.Load()))
+			serveBytes(op, 0)
 			return nil
 		}
 		h.arrived <- probeEvent{offset: op.Offset, size: op.Size}
@@ -1200,12 +1332,22 @@ func (s *probeServer) ServeOps(c *Connection) {
 
 func (s *probeServer) serve(c *Connection, ctx context.Context, op interface{}) {
 	defer s.ops.Done()
+	replying := false
 	defer func() {
-		if r := recover(); r != nil {
-			s.log.add(probeEvent{op: "SERVE_PANIC", name: fmt.Sprint(r)})
+		r := recover()
+		if r == nil {
+			return
+		}
+		s.log.add(probeEvent{op: "SERVE_PANIC", name: fmt.Sprint(r)})
+		if !replying {
+			// An unanswered request would block its caller until unmount.
+			defer func() { recover() }()
+			c.Reply(ctx, syscall.EIO)
 		}
 	}()
-	if err := c.Reply(ctx, s.handle(ctx, op)); err != nil {
+	err := s.handle(ctx, op)
+	replying = true
+	if err := c.Reply(ctx, err); err != nil {
 		s.log.add(probeEvent{op: "REPLY_ERROR", name: err.Error()})
 	}
 	if o, ok := op.(*fuseops.GetInodeAttributesOp); ok {
@@ -1303,7 +1445,7 @@ func (s *probeServer) attributes(n *probeNode, size uint64) fuseops.InodeAttribu
 
 // serveBytes answers op with n filler bytes, at most the READ's size.
 func serveBytes(op *fuseops.ReadFileOp, n int64) {
-	payload := bytes.Repeat([]byte{'p'}, int(max(0, min(n, op.Size))))
+	payload := bytes.Repeat([]byte{probeFiller}, int(max(0, min(n, op.Size))))
 	if op.Dst != nil {
 		op.BytesRead = copy(op.Dst, payload)
 		return
@@ -1389,7 +1531,7 @@ func (pt *probeTransport) ReadMessage(p []byte) (int, error) {
 			return 0, err
 		}
 		msg := pt.scratch[:n]
-		pt.rec.frame(frameFromFSKit, msg)
+		pt.rec.frame(frameFromFSKit, time.Now(), msg)
 		if n < fusekernel.InHeaderSize {
 			return copy(p, msg), nil
 		}
@@ -1414,11 +1556,9 @@ func (pt *probeTransport) ReadMessage(p []byte) (int, error) {
 // inspect logs what the probe measures about one request.
 func (pt *probeTransport) inspect(msg []byte, replyCapacity int64) {
 	opcode := binary.NativeEndian.Uint32(msg[4:8])
+	unique := binary.NativeEndian.Uint64(msg[8:16])
 	name := pt.log.names[binary.NativeEndian.Uint64(msg[16:24])]
 	body := msg[fusekernel.InHeaderSize:]
-	if replyCapacity < 0 {
-		pt.log.add(probeEvent{op: "REPLY_BUFFER_ERROR", name: name})
-	}
 	switch opcode {
 	case fusekernel.OpInit:
 		if len(body) >= fusekernel.InitInSize {
@@ -1437,7 +1577,7 @@ func (pt *probeTransport) inspect(msg []byte, replyCapacity int64) {
 		// fuse_read_in: fh, offset, size.
 		if len(body) >= 20 {
 			size := int64(binary.NativeEndian.Uint32(body[16:20]))
-			pt.log.add(probeEvent{op: "READ_REQUEST", name: name, size: size, capacity: replyCapacity})
+			pt.log.add(probeEvent{op: "READ_REQUEST", name: name, unique: unique, size: size, capacity: replyCapacity})
 		}
 	}
 }
@@ -1448,16 +1588,42 @@ func (pt *probeTransport) WriteMessage(msg []byte) error {
 
 func (pt *probeTransport) WritevMessage(parts [][]byte) error {
 	pt.replied.Store(true)
+	var header []byte
+	for _, part := range parts {
+		header = append(header, part[:min(len(part), buffer.OutMessageHeaderSize-len(header))]...)
+	}
+	at := time.Now()
 	if err := pt.native.WritevMessage(parts); err != nil {
 		return err
 	}
-	pt.rec.frame(frameFromServer, parts...)
+	pt.rec.frame(frameFromServer, at, parts...)
+	if len(header) >= buffer.OutMessageHeaderSize {
+		// fuse_out_header: len, error, unique.
+		pt.log.add(probeEvent{
+			op:     "SEND",
+			unique: binary.NativeEndian.Uint64(header[8:16]),
+			status: int32(binary.NativeEndian.Uint32(header[4:8])),
+			size:   int64(binary.NativeEndian.Uint32(header[0:4])),
+		})
+	}
 	return nil
+}
+
+// closeChannel calls MFChannelClose once, and keeps Close from calling it
+// again.
+func (pt *probeTransport) closeChannel() (bool, syscall.Errno) {
+	if pt.closedChannel.Swap(true) {
+		return false, syscall.EALREADY
+	}
+	closed, _, errno := purego.SyscallN(pt.native.api.channelClose, pt.native.channel)
+	return byte(closed) != 0, callErrno(errno)
 }
 
 func (pt *probeTransport) Close() error {
 	if pt.closedChannel.Load() {
-		// MFChannelClose must not run twice on one channel.
+		// MFChannelClose must not run twice on one channel. MFMount's result
+		// would mark the mount as succeeded, so wait for it first.
+		pt.native.mountDone.Wait()
 		pt.native.setMountResult(false)
 	}
 	return pt.native.Close()
@@ -1478,6 +1644,8 @@ func errorReply(unique uint64, errno syscall.Errno) []byte {
 type probeEvent struct {
 	op       string
 	name     string
+	unique   uint64
+	status   int32
 	offset   int64
 	size     int64
 	capacity int64
@@ -1526,6 +1694,23 @@ func (l *probeLog) matching(mark int, match func(probeEvent) bool) []probeEvent 
 
 func (l *probeLog) count(op, name string) int {
 	return len(l.matching(0, isOp(op, name)))
+}
+
+// readReplies returns the replies sent, after mark, to READ requests for
+// name.
+func (l *probeLog) readReplies(mark int, name string) []probeEvent {
+	pending := map[uint64]bool{}
+	var replies []probeEvent
+	for _, e := range l.matching(mark, isOp("", "")) {
+		switch {
+		case e.op == "READ_REQUEST" && e.name == name:
+			pending[e.unique] = true
+		case e.op == "SEND" && pending[e.unique]:
+			delete(pending, e.unique)
+			replies = append(replies, e)
+		}
+	}
+	return replies
 }
 
 // waitFor waits up to d for an event after mark that match accepts.
@@ -1660,23 +1845,50 @@ func openFile(path string, flag int) (*os.File, error) {
 	return f, nil
 }
 
-// mountedVolume finds the volume mounted at dir in the mount table, without
-// touching the volume.
-func mountedVolume(dir string) (unix.Statfs_t, bool, error) {
+// mountTable reads the mounted volumes without touching any of them.
+func mountTable() ([]unix.Statfs_t, error) {
 	n, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
 	if err != nil {
-		return unix.Statfs_t{}, false, err
+		return nil, err
 	}
 	stats := make([]unix.Statfs_t, n+16)
 	if n, err = unix.Getfsstat(stats, unix.MNT_NOWAIT); err != nil {
-		return unix.Statfs_t{}, false, err
+		return nil, err
 	}
-	for _, st := range stats[:n] {
+	return stats[:n], nil
+}
+
+// mountedVolume finds the volume mounted at dir.
+func mountedVolume(dir string) (unix.Statfs_t, bool, error) {
+	stats, err := mountTable()
+	for _, st := range stats {
 		if unix.ByteSliceToString(st.Mntonname[:]) == dir {
 			return st, true, nil
 		}
 	}
-	return unix.Statfs_t{}, false, nil
+	return unix.Statfs_t{}, false, err
+}
+
+// isProbeConflict reports whether st is a macFUSE volume or a volume at a
+// probe mount point. Both macFUSE FSKit modules have a "macfuse" short name,
+// which the mount table shows as the type. Apple's FSKit volumes, such as
+// CoreDevice's DeviceFS, do not match.
+func isProbeConflict(st unix.Statfs_t) bool {
+	return strings.HasPrefix(unix.ByteSliceToString(st.Fstypename[:]), "macfuse") ||
+		strings.HasPrefix(filepath.Base(unix.ByteSliceToString(st.Mntonname[:])), probeDirPrefix)
+}
+
+// probeConflicts lists the mounted volumes that isProbeConflict matches.
+func probeConflicts() ([]string, error) {
+	stats, err := mountTable()
+	var found []string
+	for _, st := range stats {
+		if isProbeConflict(st) {
+			found = append(found, fmt.Sprintf("%s (%s)",
+				unix.ByteSliceToString(st.Mntonname[:]), unix.ByteSliceToString(st.Fstypename[:])))
+		}
+	}
+	return found, err
 }
 
 func waitUnmounted(dir string, d time.Duration) bool {
@@ -1725,21 +1937,6 @@ func diskutil(args ...string) error {
 	return nil
 }
 
-// fskitMountLines returns the lines of mount(8) that mention FSKit, which is
-// the check to run by hand after the probe.
-func fskitMountLines() ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), probeWait)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "/sbin/mount").Output()
-	var lines []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(strings.ToLower(line), "fskit") {
-			lines = append(lines, line)
-		}
-	}
-	return lines, err
-}
-
 // errName names err by its errno when it has one.
 func errName(err error) string {
 	if err == nil {
@@ -1766,4 +1963,29 @@ func yesNo(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func TestFSKitProbeConflictsMatchOnlyMacFUSEAndProbeVolumes(t *testing.T) {
+	volume := func(fstype, from, on string) unix.Statfs_t {
+		var st unix.Statfs_t
+		copy(st.Fstypename[:], fstype)
+		copy(st.Mntfromname[:], from)
+		copy(st.Mntonname[:], on)
+		return st
+	}
+	for _, test := range []struct {
+		name string
+		st   unix.Statfs_t
+		want bool
+	}{
+		{"CoreDevice DeviceFS", volume("devicefs", "devices", "/Users/u/Library/Developer/CoreDevice/DeviceFS"), false},
+		{"APFS root", volume("apfs", "/dev/disk3s1s1", "/"), false},
+		{"macFUSE FSKit", volume("macfuse", "artifact-fs:repo", "/Users/u/repo"), true},
+		{"macFUSE FSKit local", volume("macfuse-local", "artifact-fs:repo", "/Users/u/repo"), true},
+		{"probe mount point", volume("unknown", "x", "/private/var/folders/x/T/"+probeDirPrefix+"base-123"), true},
+	} {
+		if got := isProbeConflict(test.st); got != test.want {
+			t.Errorf("isProbeConflict(%s) = %v, want %v", test.name, got, test.want)
+		}
+	}
 }
