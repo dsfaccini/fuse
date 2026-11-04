@@ -177,17 +177,21 @@ func runFSKitProbe(t *testing.T) {
 	}
 	t.Cleanup(p.checkNoMountLeft)
 
+	last := "none"
 	for _, step := range plan {
-		if err := p.readyForMount(); err != nil {
-			reportProbe(t, probeResult{Item: "run_stopped", Mount: step.name, Result: err.Error()})
-			t.Errorf("no mount from %s on: %v", step.name, err)
+		if reasons := p.blockers(); len(reasons) > 0 {
+			t.Errorf("no mount from %s on: %s", step.name, strings.Join(reasons, "; "))
 			break
 		}
+		last = step.name
 		t.Run(step.name, func(t *testing.T) {
 			if m := p.mountProbe(t, step.name, step.configure); m != nil {
 				step.measure(m)
 			}
 		})
+	}
+	if reasons := p.blockers(); len(reasons) > 0 {
+		reportProbe(t, probeResult{Item: "run_stopped", Mount: last, Result: strings.Join(reasons, "; ")})
 	}
 	p.reportAcrossMounts()
 }
@@ -231,29 +235,27 @@ func mfmountVersion() string {
 	return strings.TrimSpace(string(version))
 }
 
-// readyForMount returns why the next mount must not start: the probe was
-// stopped, an earlier mount failed or looked wedged, or a macFUSE or probe
-// volume is mounted.
-// Every extra mount attempt counts toward the series that switches macFUSE's
-// FSKit extension off.
-func (p *fskitProbe) readyForMount() error {
+// blockers returns every reason the next mount must not start: the probe was
+// stopped, a mount failed or looked wedged, or a macFUSE or probe volume is
+// mounted. Every extra mount attempt counts toward the series that switches
+// macFUSE's FSKit extension off.
+func (p *fskitProbe) blockers() []string {
+	var reasons []string
 	if err := p.ctx.Err(); err != nil {
-		return err
+		reasons = append(reasons, "the probe stopped: "+err.Error())
 	}
 	if p.mountFailed {
-		return errors.New("an earlier mount failed")
+		reasons = append(reasons, "a mount failed")
 	}
-	if len(p.stopReasons) > 0 {
-		return errors.New(strings.Join(p.stopReasons, "; "))
-	}
+	reasons = append(reasons, p.stopReasons...)
 	volumes, err := probeConflicts()
 	if err != nil {
-		return err
+		reasons = append(reasons, "reading the mount table: "+err.Error())
 	}
 	if len(volumes) > 0 {
-		return fmt.Errorf("still mounted: %q", volumes)
+		reasons = append(reasons, fmt.Sprintf("still mounted: %q", volumes))
 	}
-	return nil
+	return reasons
 }
 
 // checkNoMountLeft runs after every mount's own cleanup. MFMount can attach a
@@ -362,6 +364,9 @@ type probeMount struct {
 	pt      *probeTransport
 	conn    *Connection
 	mfs     *MountedFileSystem
+	// lateMFS delivers the MountedFileSystem of a Connection whose INIT came
+	// after startFSKit stopped waiting for it.
+	lateMFS chan *MountedFileSystem
 }
 
 // mountProbe mounts the probe's file system with artifact-fs's mount config,
@@ -406,6 +411,13 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 	}
 	if configure != nil {
 		configure(&cfg)
+	}
+	// Mount validates and fills in the config before it mounts.
+	cfg, err = cfg.normalize()
+	if err != nil {
+		m.report("mount", "failed", map[string]string{"error": err.Error()})
+		t.Errorf("mount %s: config: %v", name, err)
+		return nil
 	}
 	m.options = cfg.toMap()
 	delete(m.options, "backend")
@@ -485,15 +497,18 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 		returned <- mountReturn{err, attached, m.pt.replied.Load()}
 	}()
 
-	connected := make(chan error, 1)
+	type connection struct {
+		conn *Connection
+		err  error
+	}
+	connected := make(chan connection, 1)
 	go func() {
 		conn, err := newConnection(cfg, nil, nil, nil, m.pt)
-		m.conn = conn
-		connected <- err
+		connected <- connection{conn, err}
 	}()
 	select {
-	case err := <-connected:
-		if err != nil {
+	case c := <-connected:
+		if err := c.err; err != nil {
 			// As in Mount, MFMount's result explains a failed INIT best.
 			select {
 			case r := <-returned:
@@ -504,20 +519,24 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 			}
 			return fmt.Errorf("newConnection: %w", err)
 		}
+		m.conn = c.conn
 	case <-time.After(probeMountWait):
 		// MFMount.h forbids closing the channel for the lifetime of the
 		// mount, and MFMount closes it itself when it fails. Teardown
 		// unmounts first, which ends the blocked INIT read, and closes the
-		// channel only once the volume is gone.
+		// channel only once the volume is gone. A late INIT gets a
+		// Connection whose requests nobody would answer, so serve it, also
+		// while teardown unmounts.
+		m.lateMFS = make(chan *MountedFileSystem, 1)
+		go func() {
+			if c := <-connected; c.err == nil {
+				m.lateMFS <- m.serve(c.conn)
+			}
+		}()
 		return fmt.Errorf("no INIT request within %v", probeMountWait)
 	}
 
-	m.mfs = &MountedFileSystem{dir: m.dir, joinStatusAvailable: make(chan struct{})}
-	go func() {
-		m.server.ServeOps(m.conn)
-		m.mfs.joinStatus = m.conn.close()
-		close(m.mfs.joinStatusAvailable)
-	}()
+	m.mfs = m.serve(m.conn)
 
 	select {
 	case r := <-returned:
@@ -531,6 +550,17 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 		return fmt.Errorf("MFMount did not return within %v", probeMountWait)
 	}
 	return nil
+}
+
+// serve serves conn the way Mount does.
+func (m *probeMount) serve(conn *Connection) *MountedFileSystem {
+	mfs := &MountedFileSystem{dir: m.dir, joinStatusAvailable: make(chan struct{})}
+	go func() {
+		m.server.ServeOps(conn)
+		mfs.joinStatus = conn.close()
+		close(mfs.joinStatusAvailable)
+	}()
+	return mfs
 }
 
 // teardown releases held READs, unmounts whatever the measurements left
@@ -551,6 +581,12 @@ func (m *probeMount) teardown() {
 		var attempts []string
 		attempts, gone = m.unmount()
 		m.report("teardown_unmount", yesNo(gone), map[string]string{"attempts": strings.Join(attempts, ",")})
+	}
+	if m.lateMFS != nil {
+		select {
+		case m.mfs = <-m.lateMFS:
+		default:
+		}
 	}
 	if gone && mfmountReturned && m.pt != nil && m.mfs == nil && m.pt.mountSucceeded() {
 		// MFMount succeeded after the INIT request timed out. MFMount.h
@@ -857,7 +893,11 @@ func (m *probeMount) measureInterrupt() {
 		m.report("interrupt_sent", "unknown", map[string]string{"error": errName(err)})
 		return
 	}
-	defer m.stopReader(reader)
+	defer func() {
+		// Answer first, so a reader blocked in the held READ can exit.
+		h.answer(4096)
+		m.stopReader(reader)
+	}()
 	if _, ok := m.awaitRead(h); !ok {
 		m.report("interrupt_sent", "unknown", map[string]string{"error": "no READ arrived"})
 		return
@@ -991,6 +1031,8 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 	details["reads_after_held"] = fmt.Sprint(laterReads)
 	details["read_bytes"] = fmt.Sprint(len(r.data))
 	details["read_error"] = errName(r.err)
+	// The READ is answered now, so a stat that stays stuck means a wedge.
+	m.stat(name)
 
 	sendTime, arrival := min(request.size, int64(before)), min(request.size, int64(after))
 	result := "unknown"
@@ -1270,7 +1312,11 @@ func (m *probeMount) measureSignalledSlowRead() {
 		m.report(item, "unknown", map[string]string{"error": errName(err)})
 		return
 	}
-	defer m.stopReader(reader)
+	defer func() {
+		// Answer first, so a reader blocked in the held READ can exit.
+		h.answer(4096)
+		m.stopReader(reader)
+	}()
 	if _, ok := m.awaitRead(h); !ok {
 		m.report(item, "unknown", map[string]string{"error": "no READ arrived"})
 		return
