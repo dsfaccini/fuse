@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"reflect"
 	"syscall"
 	"time"
 	"unsafe"
@@ -145,9 +144,13 @@ func convertInMessage(
 			return nil, errors.New("Corrupt OpBatchForget")
 		}
 
+		type entry fusekernel.BatchForgetEntryIn
+		if uintptr(in.Count) > inMsg.Len()/unsafe.Sizeof(entry{}) {
+			return nil, errors.New("Corrupt OpBatchForget")
+		}
+
 		entries := make([]fuseops.BatchForgetEntry, 0, in.Count)
 		for i := uint32(0); i < in.Count; i++ {
-			type entry fusekernel.BatchForgetEntryIn
 			ein := (*entry)(inMsg.Consume(unsafe.Sizeof(entry{})))
 			if ein == nil {
 				return nil, errors.New("Corrupt OpBatchForget")
@@ -256,7 +259,7 @@ func convertInMessage(
 			return nil, errors.New("Corrupt OpSymlink")
 		}
 		i := bytes.IndexByte(names, '\x00')
-		if i < 0 {
+		if i == len(names)-1 {
 			return nil, errors.New("Corrupt OpSymlink")
 		}
 		newName, target := names[0:i], names[i+1:len(names)-1]
@@ -301,7 +304,7 @@ func convertInMessage(
 			return nil, errors.New("Corrupt OpRename")
 		}
 		i := bytes.IndexByte(names, '\x00')
-		if i < 0 {
+		if i == len(names)-1 {
 			return nil, errors.New("Corrupt OpRename")
 		}
 		oldName, newName := names[:i], names[i+1:len(names)-1]
@@ -418,16 +421,9 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		p := outMsg.Grow(readSize)
-		if p == nil {
-			return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
+		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+			return nil, err
 		}
-
-		sh := (*reflect.SliceHeader)(unsafe.Pointer(&to.Dst))
-		sh.Data = uintptr(p)
-		sh.Len = readSize
-		sh.Cap = readSize
 
 	case fusekernel.OpReaddirplus:
 		in := (*fusekernel.ReadIn)(inMsg.Consume(fusekernel.ReadInSize(protocol)))
@@ -449,16 +445,8 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		p := outMsg.Grow(readSize)
-		if p == nil {
-			return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
-		}
-
-		if readSize > 0 {
-			to.Dst = unsafe.Slice((*byte)(p), readSize)
-		} else {
-			to.Dst = nil
+		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+			return nil, err
 		}
 
 	case fusekernel.OpRelease:
@@ -507,7 +495,7 @@ func convertInMessage(
 		o = &fuseops.WriteFileOp{
 			Inode:  fuseops.InodeID(inMsg.Header().Nodeid),
 			Handle: fuseops.HandleID(in.Fh),
-			Data:   buf,
+			Data:   buf[:in.Size],
 			Offset: int64(in.Offset),
 			OpContext: fuseops.OpContext{
 				FuseID: inMsg.Header().Unique,
@@ -669,19 +657,8 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		if readSize > 0 {
-			p := outMsg.Grow(readSize)
-			if p == nil {
-				return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
-			}
-
-			sh := (*reflect.SliceHeader)(unsafe.Pointer(&to.Dst))
-			sh.Data = uintptr(p)
-			sh.Len = readSize
-			sh.Cap = readSize
-		} else {
-			to.Dst = nil
+		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+			return nil, err
 		}
 
 	case fusekernel.OpListxattr:
@@ -701,16 +678,8 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		if readSize != 0 {
-			p := outMsg.Grow(readSize)
-			if p == nil {
-				return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
-			}
-			sh := (*reflect.SliceHeader)(unsafe.Pointer(&to.Dst))
-			sh.Data = uintptr(p)
-			sh.Len = readSize
-			sh.Cap = readSize
+		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+			return nil, err
 		}
 	case fusekernel.OpSetxattr:
 		type input fusekernel.SetxattrIn
@@ -770,6 +739,19 @@ func convertInMessage(
 	}
 
 	return o, nil
+}
+
+// growDst grows outMsg by the reply size a request names, and returns the new
+// segment for the file system to fill. A size of 0 means no destination. A
+// size above MaxPages pages is EINVAL.
+func growDst(config *MountConfig, outMsg *buffer.OutMessage, size uint32) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if limit := uint64(config.MaxPages) * uint64(buffer.GetPageSize()); uint64(size) > limit {
+		return nil, fmt.Errorf("reply size %d exceeds %d bytes: %w", size, limit, syscall.EINVAL)
+	}
+	return unsafe.Slice((*byte)(outMsg.Grow(int(size))), size), nil
 }
 
 ////////////////////////////////////////////////////////////////////////

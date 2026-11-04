@@ -41,7 +41,8 @@ func (mfs *MountedFileSystem) Dir() string {
 // in-flight ops).
 //
 // The return value will be non-nil if anything unexpected happened while
-// serving. May be called multiple times.
+// serving, including the error that was fatal to the connection. May be
+// called multiple times.
 func (mfs *MountedFileSystem) Join(ctx context.Context) error {
 	select {
 	case <-mfs.joinStatusAvailable:

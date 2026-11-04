@@ -22,6 +22,8 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
+  It serves the way `Mount` does and returns what `Join` returns.
 
 ## Validate a change
 
@@ -33,6 +35,11 @@ Run these locally, in this order. None of them mounts.
    GOARCH=amd64`, `GOOS=linux GOARCH=arm64` and `GOOS=darwin`. The two disabled
    analyzers report findings older than the fork.
 4. `go test ./...`. Add `-race` when the change touches concurrency.
+
+When you change `convertInMessage`, also run
+`go test -run '^$' -fuzz FuzzConvertInMessage -fuzztime 60s .`. Fix each
+crash it finds. Keep the input file it writes under
+`testdata/fuzz/FuzzConvertInMessage/`: `go test` replays that corpus.
 
 CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 `master`:

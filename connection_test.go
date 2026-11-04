@@ -17,6 +17,7 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -25,9 +26,11 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/buffer"
+	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
 // A nil *os.PathError panics when errors.As or errors.Is unwraps it.
@@ -312,5 +315,216 @@ func TestReplyDebugLogsOpError(t *testing.T) {
 				t.Errorf("debug log = %q, want it to end with %q", debugged.String(), tt.want)
 			}
 		})
+	}
+}
+
+// newTestConnection returns a connection over transport, configured the way
+// Init leaves it.
+func newTestConnection(transport connectionTransport) *Connection {
+	c := &Connection{
+		cfg:         MountConfig{OpContext: context.Background()},
+		transport:   transport,
+		protocol:    fusekernel.Protocol{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor},
+		cancelFuncs: make(map[uint64]func()),
+	}
+	if err := c.sanitizeMaxPagesAndWrite(); err != nil {
+		panic(err)
+	}
+	c.inMessageBufSize = buffer.GetPageSize() + int(c.cfg.MaxWrite)
+	return c
+}
+
+// testMessage frames the body parts as one kernel request.
+func testMessage(opcode uint32, unique uint64, body ...[]byte) []byte {
+	header := fusekernel.InHeader{Opcode: opcode, Unique: unique}
+	message := append([]byte(nil), structBytes(&header)...)
+	for _, part := range body {
+		message = append(message, part...)
+	}
+	binary.NativeEndian.PutUint32(message[0:4], uint32(len(message)))
+	return message
+}
+
+// structBytes views a kernel struct as the bytes on the wire.
+func structBytes[T any](v *T) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(v)), unsafe.Sizeof(*v))
+}
+
+func replyHeader(reply []byte) fusekernel.OutHeader {
+	var h fusekernel.OutHeader
+	copy(structBytes(&h), reply)
+	return h
+}
+
+func maxReplySize(c *Connection) uint32 {
+	return uint32(c.cfg.MaxPages) * uint32(buffer.GetPageSize())
+}
+
+func TestReadOpAnswersBodyThatFailsToDecode(t *testing.T) {
+	c := newTestConnection(nil)
+	oversized := fusekernel.ReadIn{Size: maxReplySize(c) + 1}
+	var oversizedXattr fusekernel.GetxattrIn
+	oversizedXattr.Size = maxReplySize(c) + 1
+	oversizedList := fusekernel.ListxattrIn{Size: maxReplySize(c) + 1}
+	renameIn := fusekernel.RenameIn{Newdir: 1}
+	tests := []struct {
+		name   string
+		opcode uint32
+		body   []byte
+		// Zero means no reply.
+		want syscall.Errno
+	}{
+		{"lookup without NUL", fusekernel.OpLookup, []byte("a"), syscall.EIO},
+		{"symlink with one name", fusekernel.OpSymlink, []byte("\x00"), syscall.EIO},
+		{"rename with one name", fusekernel.OpRename, append(structBytes(&renameIn), "abc\x00"...), syscall.EIO},
+		{"readdir above MaxPages", fusekernel.OpReaddir, structBytes(&oversized), syscall.EINVAL},
+		{"readdirplus above MaxPages", fusekernel.OpReaddirplus, structBytes(&oversized), syscall.EINVAL},
+		{"getxattr above MaxPages", fusekernel.OpGetxattr, append(structBytes(&oversizedXattr), "user.a\x00"...), syscall.EINVAL},
+		{"listxattr above MaxPages", fusekernel.OpListxattr, structBytes(&oversizedList), syscall.EINVAL},
+		{"forget", fusekernel.OpForget, nil, 0},
+		{"batch forget", fusekernel.OpBatchForget, nil, 0},
+		{"interrupt", fusekernel.OpInterrupt, nil, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &testTransport{messages: [][]byte{
+				testMessage(tt.opcode, 5, tt.body),
+				testMessage(fusekernel.OpGetattr, 6),
+			}}
+			c := newTestConnection(transport)
+			inMsg := buffer.NewInMessage(c.inMessageBufSize)
+			c.putInMessage(inMsg)
+			outMsg := new(buffer.OutMessage)
+			c.putOutMessage(outMsg)
+
+			ctx, op, err := c.ReadOp()
+			if err != nil {
+				t.Fatalf("ReadOp: %v", err)
+			}
+			if getattr, ok := op.(*fuseops.GetInodeAttributesOp); !ok || getattr.OpContext.FuseID != 6 {
+				t.Fatalf("ReadOp = %#v, want the GETATTR that follows", op)
+			}
+			state := ctx.Value(contextKey).(opState)
+			if state.inMsg != inMsg || state.outMsg != outMsg {
+				t.Errorf("the next request did not reuse the corrupt request's messages")
+			}
+
+			if tt.want == 0 {
+				if len(transport.writes) != 0 {
+					t.Errorf("replies = %x, want none", transport.writes)
+				}
+				return
+			}
+			if len(transport.writes) != 1 {
+				t.Fatalf("replies = %d, want 1", len(transport.writes))
+			}
+			want := fusekernel.OutHeader{Len: uint32(buffer.OutMessageHeaderSize), Error: -int32(tt.want), Unique: 5}
+			if got := replyHeader(transport.writes[0]); got != want || len(transport.writes[0]) != buffer.OutMessageHeaderSize {
+				t.Errorf("reply = %+v (%d bytes), want %+v", got, len(transport.writes[0]), want)
+			}
+		})
+	}
+}
+
+// Init needs the INIT request, so reading on past a corrupt one would wait
+// for a request the kernel never sends.
+func TestInitFailsOnInitThatFailsToDecode(t *testing.T) {
+	valid := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
+	transport := &testTransport{messages: [][]byte{
+		testMessage(fusekernel.OpInit, 1),
+		testMessage(fusekernel.OpInit, 2, structBytes(&valid)),
+	}}
+	c := &Connection{
+		cfg:         MountConfig{OpContext: context.Background()},
+		transport:   transport,
+		cancelFuncs: make(map[uint64]func()),
+	}
+	if err := c.Init(); err == nil {
+		t.Fatal("Init succeeded, want an error")
+	}
+	if transport.reads != 1 {
+		t.Errorf("reads = %d, want 1", transport.reads)
+	}
+	if len(transport.writes) != 1 || replyHeader(transport.writes[0]).Error != -int32(syscall.EIO) {
+		t.Errorf("replies = %x, want one EIO", transport.writes)
+	}
+}
+
+func TestReadOpErrorIsFatal(t *testing.T) {
+	transportErr := errors.New("transport broke")
+	wrongLen := testMessage(fusekernel.OpGetattr, 5)
+	binary.NativeEndian.PutUint32(wrongLen[0:4], uint32(len(wrongLen)+1))
+	tests := []struct {
+		name     string
+		messages [][]byte
+		readErr  error
+		// The number of ops ReadOp returns before the error.
+		ops int
+	}{
+		{"short message", [][]byte{make([]byte, 10)}, nil, 0},
+		{"header length mismatch", [][]byte{wrongLen}, nil, 0},
+		{"transport error", nil, transportErr, 0},
+		{"duplicate request ID", [][]byte{testMessage(fusekernel.OpGetattr, 5), testMessage(fusekernel.OpGetattr, 5)}, nil, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &testTransport{messages: tt.messages, readErr: tt.readErr}
+			c := newTestConnection(transport)
+			for range tt.ops {
+				if _, _, err := c.ReadOp(); err != nil {
+					t.Fatalf("ReadOp: %v", err)
+				}
+			}
+
+			_, _, err := c.ReadOp()
+			if err == nil || err == io.EOF {
+				t.Fatalf("ReadOp = %v, want a fatal error", err)
+			}
+			if tt.readErr != nil && !errors.Is(err, tt.readErr) {
+				t.Errorf("ReadOp = %v, want it to wrap %v", err, tt.readErr)
+			}
+			reads := transport.reads
+			if _, _, again := c.ReadOp(); again != err {
+				t.Errorf("second ReadOp = %v, want %v", again, err)
+			}
+			if transport.reads != reads {
+				t.Errorf("second ReadOp read %d more messages, want 0", transport.reads-reads)
+			}
+			if len(transport.writes) != 0 {
+				t.Errorf("replies = %x, want none", transport.writes)
+			}
+			if got := c.fatalError(); got != err {
+				t.Errorf("fatalError = %v, want %v", got, err)
+			}
+		})
+	}
+}
+
+func TestReplyToUnknownRequestIsFatal(t *testing.T) {
+	transport := &testTransport{messages: [][]byte{
+		testMessage(fusekernel.OpGetattr, 5),
+		testMessage(fusekernel.OpGetattr, 6),
+	}}
+	c := newTestConnection(transport)
+	ctx, _, err := c.ReadOp()
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if err := c.Reply(ctx, syscall.ENOSYS); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+
+	err = c.Reply(ctx, syscall.ENOSYS)
+	if err == nil {
+		t.Fatal("second Reply succeeded, want an error")
+	}
+	if len(transport.writes) != 1 {
+		t.Errorf("replies = %d, want 1", len(transport.writes))
+	}
+	if _, _, readErr := c.ReadOp(); readErr != err {
+		t.Errorf("ReadOp = %v, want %v", readErr, err)
+	}
+	if transport.reads != 1 {
+		t.Errorf("reads = %d, want 1", transport.reads)
 	}
 }
