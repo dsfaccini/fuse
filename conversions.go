@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"syscall"
 	"time"
@@ -421,7 +422,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, maxReplySize(config)); err != nil {
 			return nil, err
 		}
 
@@ -445,7 +446,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, maxReplySize(config)); err != nil {
 			return nil, err
 		}
 
@@ -488,7 +489,7 @@ func convertInMessage(
 		}
 
 		buf := inMsg.ConsumeBytes(inMsg.Len())
-		if len(buf) < int(in.Size) {
+		if uint64(len(buf)) < uint64(in.Size) {
 			return nil, errors.New("Corrupt OpWrite")
 		}
 
@@ -657,7 +658,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrSizeMax)); err != nil {
 			return nil, err
 		}
 
@@ -678,7 +679,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(config, outMsg, in.Size); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrSizeMax)); err != nil {
 			return nil, err
 		}
 	case fusekernel.OpSetxattr:
@@ -741,14 +742,24 @@ func convertInMessage(
 	return o, nil
 }
 
+// xattrSizeMax is Linux's XATTR_SIZE_MAX and XATTR_LIST_MAX. The kernel does
+// not bound xattr replies by max_pages, so their cap never drops below this.
+const xattrSizeMax = 64 << 10
+
+// maxReplySize returns the largest reply, in bytes, that config's MaxPages
+// allows.
+func maxReplySize(config *MountConfig) uint64 {
+	return min(uint64(config.MaxPages)*uint64(buffer.GetPageSize()), math.MaxInt)
+}
+
 // growDst grows outMsg by the reply size a request names, and returns the new
 // segment for the file system to fill. A size of 0 means no destination. A
-// size above MaxPages pages is EINVAL.
-func growDst(config *MountConfig, outMsg *buffer.OutMessage, size uint32) ([]byte, error) {
+// size above limit is EINVAL.
+func growDst(outMsg *buffer.OutMessage, size uint32, limit uint64) ([]byte, error) {
 	if size == 0 {
 		return nil, nil
 	}
-	if limit := uint64(config.MaxPages) * uint64(buffer.GetPageSize()); uint64(size) > limit {
+	if uint64(size) > limit {
 		return nil, fmt.Errorf("reply size %d exceeds %d bytes: %w", size, limit, syscall.EINVAL)
 	}
 	return unsafe.Slice((*byte)(outMsg.Grow(int(size))), size), nil

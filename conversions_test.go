@@ -64,7 +64,7 @@ func FuzzConvertInMessage(f *testing.F) {
 		}
 		c.protocol.Minor = minor
 		_, outMsg, _ := convertTestMessage(t, c, message)
-		if limit := buffer.OutMessageHeaderSize + int(maxReplySize(c)); outMsg.Len() > limit {
+		if limit := buffer.OutMessageHeaderSize + int(max(maxReplySize(&c.cfg), xattrSizeMax)); outMsg.Len() > limit {
 			t.Errorf("reply grew to %d bytes, want at most %d", outMsg.Len(), limit)
 		}
 	})

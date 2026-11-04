@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strings"
 	"syscall"
@@ -354,16 +355,25 @@ func replyHeader(reply []byte) fusekernel.OutHeader {
 	return h
 }
 
-func maxReplySize(c *Connection) uint32 {
-	return uint32(c.cfg.MaxPages) * uint32(buffer.GetPageSize())
+// drainFreelists empties the connection's freelists and returns what they
+// held.
+func drainFreelists(c *Connection) (in []*buffer.InMessage, out []*buffer.OutMessage) {
+	for p := c.inMessages.Get(); p != nil; p = c.inMessages.Get() {
+		in = append(in, (*buffer.InMessage)(p))
+	}
+	for p := c.outMessages.Get(); p != nil; p = c.outMessages.Get() {
+		out = append(out, (*buffer.OutMessage)(p))
+	}
+	return in, out
 }
 
 func TestReadOpAnswersBodyThatFailsToDecode(t *testing.T) {
-	c := newTestConnection(nil)
-	oversized := fusekernel.ReadIn{Size: maxReplySize(c) + 1}
+	limit := uint32(maxReplySize(&newTestConnection(nil).cfg))
+	oversized := fusekernel.ReadIn{Size: limit + 1}
 	var oversizedXattr fusekernel.GetxattrIn
-	oversizedXattr.Size = maxReplySize(c) + 1
-	oversizedList := fusekernel.ListxattrIn{Size: maxReplySize(c) + 1}
+	oversizedXattr.Size = limit + 1
+	oversizedList := fusekernel.ListxattrIn{Size: limit + 1}
+	write := fusekernel.WriteIn{Size: math.MaxUint32}
 	renameIn := fusekernel.RenameIn{Newdir: 1}
 	tests := []struct {
 		name   string
@@ -375,6 +385,8 @@ func TestReadOpAnswersBodyThatFailsToDecode(t *testing.T) {
 		{"lookup without NUL", fusekernel.OpLookup, []byte("a"), syscall.EIO},
 		{"symlink with one name", fusekernel.OpSymlink, []byte("\x00"), syscall.EIO},
 		{"rename with one name", fusekernel.OpRename, append(structBytes(&renameIn), "abc\x00"...), syscall.EIO},
+		// Size does not fit a 32-bit int.
+		{"write shorter than a huge size", fusekernel.OpWrite, append(structBytes(&write), "abc"...), syscall.EIO},
 		{"readdir above MaxPages", fusekernel.OpReaddir, structBytes(&oversized), syscall.EINVAL},
 		{"readdirplus above MaxPages", fusekernel.OpReaddirplus, structBytes(&oversized), syscall.EINVAL},
 		{"getxattr above MaxPages", fusekernel.OpGetxattr, append(structBytes(&oversizedXattr), "user.a\x00"...), syscall.EINVAL},
@@ -495,15 +507,18 @@ func TestReadOpErrorIsFatal(t *testing.T) {
 }
 
 func TestReplyToUnknownRequestIsFatal(t *testing.T) {
+	read := fusekernel.ReadIn{Size: 1}
 	transport := &testTransport{messages: [][]byte{
-		testMessage(fusekernel.OpGetattr, 5),
+		testMessage(fusekernel.OpRead, 5, structBytes(&read)),
 		testMessage(fusekernel.OpGetattr, 6),
 	}}
 	c := newTestConnection(transport)
-	ctx, _, err := c.ReadOp()
+	ctx, op, err := c.ReadOp()
 	if err != nil {
 		t.Fatalf("ReadOp: %v", err)
 	}
+	callbacks := 0
+	op.(*fuseops.ReadFileOp).Callback = func() { callbacks++ }
 	if err := c.Reply(ctx, syscall.ENOSYS); err != nil {
 		t.Fatalf("Reply: %v", err)
 	}
@@ -515,10 +530,188 @@ func TestReplyToUnknownRequestIsFatal(t *testing.T) {
 	if len(transport.writes) != 1 {
 		t.Errorf("replies = %d, want 1", len(transport.writes))
 	}
+	if callbacks != 1 {
+		t.Errorf("Callback ran %d times, want 1", callbacks)
+	}
+	// The first Reply recycled the messages. Recycling them again would hand
+	// one buffer to two requests.
+	if in, out := drainFreelists(c); len(in) != 1 || len(out) != 1 {
+		t.Errorf("freelists hold %d in and %d out messages, want 1 and 1", len(in), len(out))
+	}
 	if _, _, readErr := c.ReadOp(); readErr != err {
 		t.Errorf("ReadOp = %v, want %v", readErr, err)
 	}
 	if transport.reads != 1 {
 		t.Errorf("reads = %d, want 1", transport.reads)
+	}
+}
+
+func TestSecondReplyAfterMessagesAreReused(t *testing.T) {
+	transport := &testTransport{messages: [][]byte{
+		testMessage(fusekernel.OpGetattr, 5),
+		testMessage(fusekernel.OpGetattr, 6),
+	}}
+	c := newTestConnection(transport)
+	ctx5, _, err := c.ReadOp()
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if err := c.Reply(ctx5, syscall.ENOSYS); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	ctx6, _, err := c.ReadOp()
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if ctx5.Value(contextKey).(opState).inMsg != ctx6.Value(contextKey).(opState).inMsg {
+		t.Fatal("request 6 did not reuse request 5's InMessage")
+	}
+
+	if err := c.Reply(ctx5, syscall.ENOSYS); err == nil {
+		t.Error("second Reply to request 5 succeeded, want an error")
+	}
+	if len(transport.writes) != 1 {
+		t.Errorf("replies = %d, want 1", len(transport.writes))
+	}
+	if in, out := drainFreelists(c); len(in) != 0 || len(out) != 0 {
+		t.Errorf("freelists hold request 6's messages: %d in, %d out", len(in), len(out))
+	}
+}
+
+// blockingTransport blocks each read until the test sends it a message.
+type blockingTransport struct {
+	reading  chan struct{}
+	messages chan []byte
+}
+
+func (t *blockingTransport) ReadMessage(dst []byte) (int, error) {
+	t.reading <- struct{}{}
+	return copy(dst, <-t.messages), nil
+}
+
+func (t *blockingTransport) WriteMessage([]byte) error    { return nil }
+func (t *blockingTransport) WritevMessage([][]byte) error { return nil }
+func (t *blockingTransport) Close() error                 { return nil }
+
+func TestReadOpStopsAfterFatalErrorDuringRead(t *testing.T) {
+	transport := &blockingTransport{reading: make(chan struct{}, 1), messages: make(chan []byte, 1)}
+	c := newTestConnection(transport)
+	transport.messages <- testMessage(fusekernel.OpGetattr, 5)
+	ctx, _, err := c.ReadOp()
+	<-transport.reading
+	if err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if err := c.Reply(ctx, syscall.ENOSYS); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+
+	type result struct {
+		op  interface{}
+		err error
+	}
+	done := make(chan result)
+	go func() {
+		_, op, err := c.ReadOp()
+		done <- result{op, err}
+	}()
+	<-transport.reading
+	fatal := c.Reply(ctx, syscall.ENOSYS)
+	if fatal == nil {
+		t.Fatal("second Reply succeeded, want an error")
+	}
+	transport.messages <- testMessage(fusekernel.OpGetattr, 7)
+	if r := <-done; r.op != nil || r.err != fatal {
+		t.Errorf("ReadOp = %T, %v; want nil, %v", r.op, r.err, fatal)
+	}
+}
+
+func TestReadOpRecyclesInterrupt(t *testing.T) {
+	interrupt := fusekernel.InterruptIn{Unique: 99}
+	c := newTestConnection(&testTransport{messages: [][]byte{testMessage(fusekernel.OpInterrupt, 5, structBytes(&interrupt))}})
+	inMsg := buffer.NewInMessage(c.inMessageBufSize)
+	c.putInMessage(inMsg)
+	outMsg := new(buffer.OutMessage)
+	c.putOutMessage(outMsg)
+
+	if _, _, err := c.ReadOp(); err != io.EOF {
+		t.Fatalf("ReadOp = %v, want io.EOF", err)
+	}
+	in, out := drainFreelists(c)
+	if len(in) != 1 || in[0] != inMsg || len(out) != 1 || out[0] != outMsg {
+		t.Errorf("freelists hold %d in and %d out messages, want the interrupt's two", len(in), len(out))
+	}
+}
+
+// A failed answer to a body that fails to decode is logged, as Reply logs one.
+func TestReadOpRejectWriteErrorIsNotFatal(t *testing.T) {
+	tests := []struct {
+		name     string
+		writeErr error
+		wantLog  bool
+	}{
+		{"EIO", syscall.EIO, true},
+		{"ENOENT", syscall.ENOENT, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			c := newTestConnection(&testTransport{
+				messages: [][]byte{testMessage(fusekernel.OpLookup, 5, []byte("a")), testMessage(fusekernel.OpGetattr, 6)},
+				writeErr: tt.writeErr,
+			})
+			c.errorLogger = log.New(&logged, "", 0)
+
+			if _, op, err := c.ReadOp(); err != nil {
+				t.Fatalf("ReadOp = %v, want the GETATTR", err)
+			} else if _, ok := op.(*fuseops.GetInodeAttributesOp); !ok {
+				t.Fatalf("ReadOp = %T, want the GETATTR", op)
+			}
+			if got := strings.Contains(logged.String(), "writeMessage"); got != tt.wantLog {
+				t.Errorf("logged %q, want a writeMessage log: %v", logged.String(), tt.wantLog)
+			}
+		})
+	}
+}
+
+// Linux does not bound xattr replies by max_pages.
+func TestReadOpCapsXattrAtXattrSizeMax(t *testing.T) {
+	pageSize := uint32(buffer.GetPageSize())
+	limit := max(pageSize, xattrSizeMax)
+	readdir := func(size uint32) []byte {
+		in := fusekernel.ReadIn{Size: size}
+		return structBytes(&in)
+	}
+	getxattr := func(size uint32) []byte {
+		var in fusekernel.GetxattrIn
+		in.Size = size
+		return append(structBytes(&in), "user.a\x00"...)
+	}
+	listxattr := func(size uint32) []byte {
+		in := fusekernel.ListxattrIn{Size: size}
+		return structBytes(&in)
+	}
+	tests := []struct {
+		name    string
+		opcode  uint32
+		body    []byte
+		wantErr bool
+	}{
+		{"readdir of one page", fusekernel.OpReaddir, readdir(pageSize), false},
+		{"readdir above one page", fusekernel.OpReaddir, readdir(pageSize + 1), true},
+		{"getxattr at the cap", fusekernel.OpGetxattr, getxattr(limit), false},
+		{"getxattr above the cap", fusekernel.OpGetxattr, getxattr(limit + 1), true},
+		{"listxattr at the cap", fusekernel.OpListxattr, listxattr(limit), false},
+		{"listxattr above the cap", fusekernel.OpListxattr, listxattr(limit + 1), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestConnection(nil)
+			c.cfg.MaxPages = 1
+			_, _, err := convertTestMessage(t, c, testMessage(tt.opcode, 1, tt.body))
+			if gotErr := errors.Is(err, syscall.EINVAL); gotErr != tt.wantErr || (err != nil && !gotErr) {
+				t.Errorf("convertInMessage = %v, want EINVAL: %v", err, tt.wantErr)
+			}
+		})
 	}
 }

@@ -99,6 +99,11 @@ type opState struct {
 	outMsg *buffer.OutMessage
 	op     interface{}
 	wlog   *WireLogRecord
+
+	// The request's header fields, copied because inMsg returns to the freelist
+	// when the op is answered.
+	fuseID uint64
+	opCode uint32
 }
 
 // Return the current wirelog record from the context if the MountConfig
@@ -476,11 +481,12 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 // the kernel has closed the connection.
 //
 // When a request's body fails to decode, ReadOp answers the request itself and
-// reads on. The answer is EINVAL for a reply size above MaxPages pages, and EIO
-// otherwise. Any other error is fatal to the connection, and ReadOp returns it
-// from then on. Fatal errors are a failed read, a malformed message, a request
-// ID already in flight, a Reply to an unknown request ID, and an INIT that
-// fails to decode.
+// reads on. The answer is EINVAL for a reply size above the cap, and EIO
+// otherwise. The cap is MaxPages pages, and at least 64 KiB for xattrs. Any
+// other error is fatal to the connection, and ReadOp returns it from then on.
+// Fatal errors are a failed read, a malformed message, a request ID already in
+// flight, a Reply to an unknown request ID, and an INIT that fails to decode.
+// A fatal error does not unmount the file system.
 //
 // If err == nil, the user is responsible for later calling c.Reply with the
 // returned context.
@@ -505,6 +511,12 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 			return nil, nil, c.recordFatal(fmt.Errorf("readMessage: %w", err))
 		}
 
+		// A Reply may have recorded a fatal error during the read.
+		if err := c.fatalError(); err != nil {
+			c.putInMessage(inMsg)
+			return nil, nil, err
+		}
+
 		// Convert the message to an op.
 		outMsg := c.getOutMessage()
 		op, err = convertInMessage(&c.cfg, inMsg, outMsg, c.protocol)
@@ -527,6 +539,8 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		// Special case: handle interrupt requests inline.
 		if interruptOp, ok := op.(*interruptOp); ok {
 			c.handleInterrupt(interruptOp.FuseID)
+			c.putInMessage(inMsg)
+			c.putOutMessage(outMsg)
 			continue
 		}
 
@@ -542,7 +556,8 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		if c.wireLogger != nil {
 			wlog = NewWireLogRecord()
 		}
-		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog})
+		h := inMsg.Header()
+		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog, h.Unique, h.Opcode})
 
 		// Return the op to the user.
 		return ctx, op, nil
@@ -643,11 +658,11 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	op := state.op
 	inMsg := state.inMsg
 	outMsg := state.outMsg
-	fuseID := inMsg.Header().Unique
+	fuseID := state.fuseID
 
 	// Clean up state for this op. An unknown ID means the op was already
 	// answered, so its messages may belong to another op by now.
-	if err := c.finishOp(inMsg.Header().Opcode, fuseID); err != nil {
+	if err := c.finishOp(state.opCode, fuseID); err != nil {
 		c.recordFatal(err)
 		return err
 	}
@@ -684,7 +699,7 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	}
 
 	// Send the reply to the kernel, if one is required.
-	noResponse := c.kernelResponse(outMsg, inMsg.Header().Unique, op, opErr)
+	noResponse := c.kernelResponse(outMsg, fuseID, op, opErr)
 
 	if !noResponse {
 		err := c.writeOutMessage(outMsg)
