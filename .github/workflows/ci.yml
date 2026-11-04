@@ -56,6 +56,10 @@ jobs:
         GOARCH=arm64 go vet -composites=false -unsafeptr=false ./...
     - name: Test
       run: go test -race -count=1 ./...
+    # A 32-bit int catches wire lengths that overflow it. The race detector
+    # does not support 386.
+    - name: Test (386)
+      run: GOARCH=386 go test -count=1 ./...
 
   # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
   macos:

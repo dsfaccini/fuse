@@ -49,6 +49,9 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 
 - `gofmt`.
 - `linux` and `macos`: build, vet and `go test -race -count=1 ./...`.
+- `linux` also runs `GOARCH=386 go test -count=1 ./...`. A 32-bit `int` catches
+  wire lengths that overflow it. Go has no darwin/386 port, so leave that step
+  to CI on a Mac.
 - `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
   That test loads the installed MFMount framework. It fails when
   `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
