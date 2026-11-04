@@ -9,6 +9,13 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Every mounting test calls `mounttest.SkipUnlessEnabled` first, so plain
   `go test ./...` mounts nothing. The mounting tests run only with
   `FUSE_RUN_MOUNT_TESTS=1`.
+- The FSKit probe calls `mounttest.SkipUnlessFSKitProbeEnabled` instead. See
+  "The FSKit probe".
+- Gate every test that mounts through FSKit with
+  `mounttest.SkipUnlessFSKitProbeEnabled`. A test that calls
+  `MountWithFakeMFMount` takes no gate, because the fake MFMount never reaches
+  FSKit. The scanner checks the FSKit gate only for calls to
+  `mountFSKitTransport`, not for `Mount` with the `fskit` backend.
 - `TestMountingTestsAreGated` in `internal/mounttest` enforces the gate. Its
   failure names the fix.
 - That test matches names without type checking, so it can miss a mount
@@ -24,6 +31,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   fails the writes `Reply` makes.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
+- To test how an op is decoded and answered, add a case to `protocolCases` in
+  `protocol_test.go`. Each case runs over a fake kernel transport on every OS,
+  and through `Mount` and the fake MFMount on darwin.
 - To test `Mount`'s config validation without a mount, pass a mount point that
   does not exist. `Mount` validates the config before it checks the mount
   point. A regression then fails with ENOENT instead of mounting.
@@ -50,8 +60,8 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - `gofmt`.
 - `linux` and `macos`: build, vet and `go test -race -count=1 ./...`.
 - `linux` also runs `GOARCH=386 go test -count=1 ./...`. A 32-bit `int` catches
-  wire lengths that overflow it. Go has no darwin/386 port, so leave that step
-  to CI on a Mac.
+  wire lengths that overflow it. Go has no darwin/386 port. On a Mac, leave
+  that step to CI.
 - `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
   That test loads the installed MFMount framework. It fails when
   `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
@@ -75,6 +85,49 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 Ship every change to `mount_fskit*.go` with a test that exercises the changed
 code without mounting. CI never mounts through FSKit, so only such a test
 covers the change.
+
+- Use the fake MFMount in `mount_fskit_fake_darwin_test.go`. Its functions are
+  purego callbacks, so the transport makes its real purego calls.
+- `newFakeMFMount` activates a fake for one test. Its cleanup fails the test
+  unless the channel and every message are released exactly once.
+- Test transport methods on the transport that `fakeMFMount.transport` returns.
+- For behavior that only `Mount` reaches, call `MountWithFakeMFMount`. Set
+  `fakeMFMount.mount` to script what MFMount does and returns.
+- Call `Mount` with a fake through `MountWithFakeMFMount` only. The gate
+  scanner exempts that name in the repo root and flags any other path to
+  `Mount`.
+- Queue requests with `fakeMFMount.kernel.Send` and read replies with
+  `NextReply`. A request is a list of body buffers. FSKit sends a WRITE's
+  payload in a buffer of its own.
+
+## The FSKit probe
+
+- `TestFSKitProbe` measures how macFUSE's FSKit backend treats the FUSE
+  protocol. One run makes at most 5 FSKit mounts. Its doc comment lists the
+  mounts and what each measures.
+- Its gate is `FUSE_RUN_FSKIT_PROBE=1`. `FUSE_RUN_MOUNT_TESTS` does not run it.
+- Run it only on David's go-ahead in his own words. A click on an option you
+  wrote is not a go-ahead. macFUSE's FSKit extension switches itself off after
+  a series of mounts (https://github.com/macfuse/macfuse/issues/1232), and a
+  stalled FSKit mount clears only on reboot.
+- Run it on darwin, outside any sandbox:
+  ```
+  FUSE_RUN_FSKIT_PROBE=1 GOWORK=off go test -tags fuse_record -run '^TestFSKitProbe$' -v -count=1 -timeout 30m .
+  ```
+- Each result is a log line that contains `FSKIT_PROBE ` and then JSON.
+  `grep -o 'FSKIT_PROBE .*'` extracts them.
+- `-tags fuse_record` writes each mount's message stream to
+  `testdata/fskit/<mount>.frames`. `fskit_probe_record_darwin_test.go` defines
+  the format.
+- After the run, `mount | grep -E 'macfuse|fskit-probe'` must print nothing.
+- `mount | grep -i fskit` also lists Apple's FSKit volumes, such as
+  CoreDevice's DeviceFS. They are expected. Never unmount them.
+- A killed test process can leave a probe volume behind. Remove it with
+  `diskutil unmount force <dir>`, only for a mount point whose name starts with
+  `fskit-probe-`.
+- When you change the number of mounts, change `fskitProbeMounts` and the doc
+  comment together. The probe fails before its first mount when its plan and
+  `fskitProbeMounts` disagree.
 
 ## Keep this file current
 

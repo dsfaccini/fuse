@@ -56,6 +56,10 @@ type fskitAPI struct {
 	release                uintptr
 }
 
+// fskitAPILoader loads the MFMount functions at mount time. Tests replace it
+// to mount through a fake MFMount.
+var fskitAPILoader = loadFSKitAPI
+
 func loadFSKitAPI(path string) (*fskitAPI, error) {
 	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
 	if err != nil {
@@ -114,7 +118,7 @@ func mountFSKitTransport(
 		return nil, fmt.Errorf("FSKit mount point: %w", err)
 	}
 
-	api, err := loadFSKitAPI(fskitFrameworkPath)
+	api, err := fskitAPILoader(fskitFrameworkPath)
 	if err != nil {
 		return nil, err
 	}
@@ -122,18 +126,7 @@ func mountFSKitTransport(
 	if channel == 0 {
 		return nil, fmt.Errorf("MFChannelCreate failed")
 	}
-	t := &fskitTransport{
-		api:     api,
-		channel: channel,
-		closeNative: func() error {
-			closed, _, errno := purego.SyscallN(api.channelClose, channel)
-			if byte(closed) == 0 {
-				return fmt.Errorf("MFChannelClose: %w", callErrno(errno))
-			}
-			return nil
-		},
-		releaseNative: func() { purego.SyscallN(api.release, channel) },
-	}
+	t := newFSKitTransport(api, channel)
 
 	t.mountDone.Add(1)
 	go func() {
@@ -156,6 +149,21 @@ func mountFSKitTransport(
 	}()
 
 	return t, nil
+}
+
+func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
+	return &fskitTransport{
+		api:     api,
+		channel: channel,
+		closeNative: func() error {
+			closed, _, errno := purego.SyscallN(api.channelClose, channel)
+			if byte(closed) == 0 {
+				return fmt.Errorf("MFChannelClose: %w", callErrno(errno))
+			}
+			return nil
+		},
+		releaseNative: func() { purego.SyscallN(api.release, channel) },
+	}
 }
 
 // fskitMountOptions returns the option string MFMount receives for cfg.
