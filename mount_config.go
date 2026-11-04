@@ -412,6 +412,11 @@ func (c *MountConfig) normalize() (MountConfig, error) {
 	if err := cfg.sanitizeMaxPagesAndWrite(); err != nil {
 		return MountConfig{}, err
 	}
+	// toMap passes VolumeName only on darwin. Check it on every OS so that one
+	// rule holds.
+	if err := checkMountOption("volname", cfg.VolumeName); err != nil {
+		return MountConfig{}, err
+	}
 	for k, v := range cfg.toMap() {
 		if err := checkMountOption(k, v); err != nil {
 			return MountConfig{}, err
