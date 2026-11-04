@@ -86,8 +86,12 @@ func TestMountingTestsAreGated(t *testing.T) {
 	}
 
 	checked := 0
-	for _, files := range filesByDir {
-		errs, n := ungatedMounts(fset, files)
+	for dir, files := range filesByDir {
+		rel, err := filepath.Rel(root, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		errs, n := ungatedMounts(fset, filepath.ToSlash(rel), files)
 		checked += n
 		for _, err := range errs {
 			t.Error(err)
@@ -100,7 +104,10 @@ func TestMountingTestsAreGated(t *testing.T) {
 
 func TestUngatedMountsFindsIndirectMounts(t *testing.T) {
 	for _, test := range []struct {
-		name     string
+		name string
+		// dir is the directory of src, relative to the module root. Empty
+		// means samples/p.
+		dir      string
 		src      string
 		wantErrs int
 	}{
@@ -283,6 +290,21 @@ func init() { subtests = append(subtests, mountSub) }`,
 			src: `package p
 func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 		},
+		{
+			name: "fake MFMount",
+			dir:  ".",
+			src: `package p
+func MountWithFakeMFMount(t *testing.T) { fuse.Mount("", nil, nil) }
+func serveFake(t *testing.T) { MountWithFakeMFMount(t) }
+func TestFakeMount(t *testing.T) { serveFake(t) }`,
+		},
+		{
+			name: "fake MFMount outside the module root",
+			src: `package p
+func MountWithFakeMFMount(t *testing.T) { fuse.Mount("", nil, nil) }
+func TestFakeMount(t *testing.T) { MountWithFakeMFMount(t) }`,
+			wantErrs: 1,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fset := token.NewFileSet()
@@ -290,7 +312,11 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 			if err != nil {
 				t.Fatal(err)
 			}
-			errs, _ := ungatedMounts(fset, []*ast.File{file})
+			dir := test.dir
+			if dir == "" {
+				dir = "samples/p"
+			}
+			errs, _ := ungatedMounts(fset, dir, []*ast.File{file})
 			if len(errs) != test.wantErrs {
 				t.Errorf("ungatedMounts errors = %v, want %d", errs, test.wantErrs)
 			}
@@ -307,6 +333,13 @@ var mountFailureTests = map[string]string{
 	"TestMountRejectsInvalidConfigBeforeMounting": "config validation fails",
 }
 
+// fakeMounts call Mount through the fake MFMount, which mounts nothing. Each
+// maps to the directory that defines it, relative to the module root. A fake
+// mount and its callers there do not reach a mount.
+var fakeMounts = map[string]string{
+	"MountWithFakeMFMount": ".",
+}
+
 // mountCallees mount when called: Mount directly, mountFSKitTransport under
 // the FSKit probe, ogletest's RunTests through suites that mount in SetUp, and
 // SetUp on samples.SampleTest and samples.SubprocessTest.
@@ -316,16 +349,16 @@ var mountCallees = []string{"Mount", "mountFSKitTransport", "RunTests", "SetUp"}
 // them, so that FUSE_RUN_MOUNT_TESTS never starts an FSKit mount.
 var fskitMountCallees = []string{"mountFSKitTransport"}
 
-// ungatedMounts checks the test files of one directory. A function or
-// package-level variable reaches a mount when its body names a mount callee or
-// another one that reaches a mount. A test, benchmark or fuzz target that
-// reaches a mount must call SkipUnlessEnabled first, or
-// SkipUnlessFSKitProbeEnabled when it reaches an FSKit mount. An example cannot skip, so
-// an example that reaches a mount must have no output comment, which keeps go
+// ungatedMounts checks the test files of dir, relative to the module root. A
+// function or package-level variable reaches a mount when its body names a
+// mount callee or another one that reaches a mount, unless fakeMounts maps it
+// to dir. A test, benchmark or fuzz target that reaches a mount must call
+// SkipUnlessEnabled first, or SkipUnlessFSKitProbeEnabled when it reaches an
+// FSKit mount. An example cannot skip, so an example that reaches a mount must have no output comment, which keeps go
 // test from running it. No init and no package-level initializer may call a
 // function that mounts, because both run before any gate. ungatedMounts returns one error per
 // violation and the number of entry points that reach a mount.
-func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
+func ungatedMounts(fset *token.FileSet, dir string, files []*ast.File) ([]error, int) {
 	var decls []*ast.FuncDecl
 	var initializers []ast.Expr
 	values := map[string][]ast.Node{}
@@ -367,6 +400,9 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 		for changed := true; changed; {
 			changed = false
 			for name, nodes := range values {
+				if fakeMounts[name] == dir {
+					continue
+				}
 				for _, node := range nodes {
 					if !reaching[name] && references(node, reaching) {
 						reaching[name] = true
@@ -389,6 +425,9 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 	for changed := true; changed; {
 		changed = false
 		for _, fn := range decls {
+			if fakeMounts[fn.Name.Name] == dir {
+				continue
+			}
 			if !calling[fn.Name.Name] && callsOutsideFuncLit(fn.Body, calling) {
 				calling[fn.Name.Name] = true
 				changed = true
