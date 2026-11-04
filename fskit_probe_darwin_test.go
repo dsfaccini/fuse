@@ -53,10 +53,11 @@ const (
 	// probeMountLimit bounds the measurements on one mount.
 	probeMountLimit = 5 * time.Minute
 	// probeCleanupReserve is left before the go test deadline, which kills
-	// the process without running cleanup. The worst case is about 220s: the
+	// the process without running cleanup. The worst case is about 225s: the
 	// longest step, a WRITE or an unmount (about 65s), the teardown of one
-	// stuck mount (about 95s: 30s for MFMount, 60s of unmount attempts, 5s for
-	// Join) and the final check of that mount point (about 60s). No mount
+	// stuck mount (about 100s: 30s for MFMount, 60s of unmount attempts, 5s
+	// for a late MFChannelClose, 5s for Join) and the final check of that
+	// mount point (about 60s). No mount
 	// starts while an earlier one is still mounted, so at most one mount can
 	// be stuck.
 	probeCleanupReserve = 5 * time.Minute
@@ -112,9 +113,9 @@ type fskitProbe struct {
 	ctx         context.Context
 	dirs        []string
 	mountFailed bool
-	// stopReason, when set, says why a mount looked wedged. No further mount
-	// starts, because a stalled FSKit mount clears only on reboot.
-	stopReason string
+	// stopReasons say why a mount looked wedged. No further mount starts,
+	// because a stalled FSKit mount clears only on reboot.
+	stopReasons []string
 
 	// Findings that the results across mounts compare, by mount name.
 	rootAccess map[string]error
@@ -242,8 +243,8 @@ func (p *fskitProbe) readyForMount() error {
 	if p.mountFailed {
 		return errors.New("an earlier mount failed")
 	}
-	if p.stopReason != "" {
-		return errors.New(p.stopReason)
+	if len(p.stopReasons) > 0 {
+		return errors.New(strings.Join(p.stopReasons, "; "))
 	}
 	volumes, err := probeConflicts()
 	if err != nil {
@@ -504,17 +505,10 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 			return fmt.Errorf("newConnection: %w", err)
 		}
 	case <-time.After(probeMountWait):
-		// MFMount closes the channel itself when it fails, and MFMount.h
-		// calls a second close a programming error. So close the channel only
-		// once MFMount reports success. That ends the blocked INIT read, and
-		// teardown unmounts the volume.
-		select {
-		case r := <-returned:
-			if r.err == nil {
-				m.pt.closeChannel()
-			}
-		case <-time.After(probeMountWait):
-		}
+		// MFMount.h forbids closing the channel for the lifetime of the
+		// mount, and MFMount closes it itself when it fails. Teardown
+		// unmounts first, which ends the blocked INIT read, and closes the
+		// channel only once the volume is gone.
 		return fmt.Errorf("no INIT request within %v", probeMountWait)
 	}
 
@@ -543,7 +537,7 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 // mounted, and reports what the server and the transport saw.
 func (m *probeMount) teardown() {
 	if err := m.ctx.Err(); err != nil {
-		m.p.stop(fmt.Sprintf("the measurements on %s stopped early: %v", m.name, err))
+		m.stop(fmt.Sprintf("the measurements on %s stopped early: %v", m.name, err))
 	}
 	m.cancel()
 	// MFMount can still attach the volume until it returns, so wait for it
@@ -551,24 +545,31 @@ func (m *probeMount) teardown() {
 	mfmountReturned := true
 	if m.pt != nil {
 		mfmountReturned = waitGroupWithin(&m.pt.native.mountDone, probeMountWait)
-		if mfmountReturned && m.mfs == nil && m.pt.mountSucceeded() {
-			// The INIT request never came, and MFMount succeeded late.
-			// Closing the channel ends the blocked INIT read.
-			m.pt.closeChannel()
-		}
 	}
+	gone := true
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
-		attempts, gone := m.unmount()
+		var attempts []string
+		attempts, gone = m.unmount()
 		m.report("teardown_unmount", yesNo(gone), map[string]string{"attempts": strings.Join(attempts, ",")})
 	}
+	if gone && mfmountReturned && m.pt != nil && m.mfs == nil && m.pt.mountSucceeded() {
+		// MFMount succeeded after the INIT request timed out. MFMount.h
+		// allows closing the channel only once the volume is unmounted. The
+		// unmount should already have ended the blocked INIT read; if it did
+		// not, Close has not started, and this close ends it.
+		if _, err := m.pt.closeChannel(); errors.Is(err, errProbeTimeout) {
+			m.stop(fmt.Sprintf("MFChannelClose on %s did not return within %v", m.name, probeWait))
+		}
+	}
 	if m.mfs != nil {
-		m.join(probeWait)
+		if join := m.join(probeWait); join == "pending" && gone {
+			m.stop(fmt.Sprintf("Join on %s was still pending after the volume left the mount table", m.name))
+		}
 		m.reportServer()
 	}
 	m.reportReplyBuffers()
 	if !mfmountReturned {
-		m.p.stop(fmt.Sprintf("MFMount did not return for %s", m.name))
-		m.t.Errorf("MFMount did not return for %s; check it with mount | grep -E 'macfuse|fskit-probe'", m.dir)
+		m.stop(fmt.Sprintf("MFMount did not return for %s; check it with mount | grep -E 'macfuse|fskit-probe'", m.dir))
 		return
 	}
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
@@ -584,18 +585,27 @@ func (m *probeMount) unmount() ([]string, bool) {
 	attempts, gone := unmountVolume(m.dir)
 	switch {
 	case !gone:
-		m.p.stop(fmt.Sprintf("%s stayed mounted after %s", m.name, strings.Join(attempts, ",")))
+		m.stop(fmt.Sprintf("%s stayed mounted after %s", m.name, strings.Join(attempts, ",")))
 	case len(attempts) > 2:
-		m.p.stop(fmt.Sprintf("%s needed a forced unmount: %s", m.name, strings.Join(attempts, ",")))
+		m.stop(fmt.Sprintf("%s needed a forced unmount: %s", m.name, strings.Join(attempts, ",")))
 	}
 	return attempts, gone
 }
 
-// stop records the first reason to start no further mount.
-func (p *fskitProbe) stop(reason string) {
-	if p.stopReason == "" {
-		p.stopReason = reason
+// stop records why no further mount may start, and fails the test.
+func (m *probeMount) stop(reason string) {
+	m.p.stopReasons = append(m.p.stopReasons, reason)
+	m.t.Errorf("no further mount: %s", reason)
+}
+
+// within bounds a call into the volume or the channel. A call that hits the
+// bound means the mount may be wedged, so it stops further mounts.
+func (m *probeMount) within(what string, d time.Duration, f func() error) error {
+	err := within(d, f)
+	if errors.Is(err, errProbeTimeout) {
+		m.stop(fmt.Sprintf("%s on %s did not return within %v", what, m.name, d))
 	}
+	return err
 }
 
 // waitGroupWithin waits up to d for wg.
@@ -663,7 +673,49 @@ func (m *probeMount) path(name string) string {
 }
 
 func (m *probeMount) stat(name string) (int64, error) {
-	return statSize(m.path(name))
+	return m.statPath(m.path(name))
+}
+
+func (m *probeMount) statPath(path string) (int64, error) {
+	size, err := statSize(path)
+	if errors.Is(err, errProbeTimeout) {
+		m.stop(fmt.Sprintf("stat on %s did not return within %v", m.name, probeWait))
+	}
+	return size, err
+}
+
+// statSize stats path, bounded. Use probeMount.statPath unless the probe
+// itself holds a request the stat may wait behind.
+func statSize(path string) (int64, error) {
+	var size int64
+	err := within(probeWait, func() error {
+		info, err := os.Stat(path)
+		if err == nil {
+			size = info.Size()
+		}
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return size, nil
+}
+
+func (m *probeMount) open(path string, flag int) (*os.File, error) {
+	var f *os.File
+	err := m.within("open", probeWait, func() (err error) {
+		f, err = os.OpenFile(path, flag, 0)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// close closes f, bounded.
+func (m *probeMount) close(f *os.File) error {
+	return m.within("close", probeWait, f.Close)
 }
 
 func (m *probeMount) sleep(d time.Duration) {
@@ -689,7 +741,7 @@ func (m *probeMount) join(d time.Duration) string {
 
 // measureRootAccess stats the mount point.
 func (m *probeMount) measureRootAccess() {
-	_, err := statSize(m.dir)
+	_, err := m.statPath(m.dir)
 	m.p.rootAccess[m.name] = err
 	m.report("root_access", errName(err), nil)
 }
@@ -805,7 +857,7 @@ func (m *probeMount) measureInterrupt() {
 		m.report("interrupt_sent", "unknown", map[string]string{"error": errName(err)})
 		return
 	}
-	defer reader.stop()
+	defer m.stopReader(reader)
 	if _, ok := m.awaitRead(h); !ok {
 		m.report("interrupt_sent", "unknown", map[string]string{"error": "no READ arrived"})
 		return
@@ -881,13 +933,13 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 		"size_in_getattr": fmt.Sprint(after),
 		"reply_bytes":     fmt.Sprint(answered),
 	}
-	f, err := openFile(m.path(name), os.O_RDONLY)
+	f, err := m.open(m.path(name), os.O_RDONLY)
 	if err != nil {
 		details["error"] = errName(err)
 		m.report(item, "unknown", details)
 		return "unknown"
 	}
-	defer within(probeWait, f.Close)
+	defer m.close(f)
 
 	type readResult struct {
 		data []byte
@@ -908,12 +960,14 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 	mark := m.log.mark()
 	n.setSize(after)
 	// FSKit keeps its own attribute cache, so poll until a stat shows the new
-	// size.
+	// size. FSKit may queue the stat behind the READ the probe holds, so a
+	// stat that hits its bound here does not stop further mounts. The read
+	// must still return once answered.
 	var size int64
 	var statErr error
 	stats := 0
 	for deadline := time.Now().Add(probePollLimit); ; {
-		size, statErr = m.stat(name)
+		size, statErr = statSize(m.path(name))
 		stats++
 		if (statErr == nil && size == int64(after)) || time.Now().After(deadline) || m.ctx.Err() != nil {
 			break
@@ -926,6 +980,7 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 	case r = <-read:
 	case <-time.After(2 * probeWait):
 		r.err = errProbeTimeout
+		m.stop(fmt.Sprintf("the read of %s on %s did not return after its answer", name, m.name))
 	}
 
 	laterReads := m.log.count("READ", name) - 1
@@ -959,9 +1014,10 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 }
 
 // measurePaddingTimings runs the padding timing with a shrink and with a
-// growth. The shrink run decides what a reader gets when a GETATTR reports a
-// shrink while an earlier READ is pending, the window that the short-read
-// guard in https://github.com/dsfaccini/fuse/pull/5 does not cover.
+// growth. The shrink run decides what a reader gets when a GETATTR reply that
+// shrinks the file reaches FSKit while a READ it sent earlier is unanswered.
+// That ordering decides the open short-read guard in
+// https://github.com/dsfaccini/fuse/pull/5.
 func (m *probeMount) measurePaddingTimings() {
 	shrink := m.measurePaddingTiming("shrink", 5000)
 	grow := m.measurePaddingTiming("grow", 5100)
@@ -975,9 +1031,9 @@ func (m *probeMount) measurePaddingTimings() {
 // measurePermissions opens a mode 0 file the probe's user owns.
 func (m *probeMount) measurePermissions() {
 	mark := m.log.mark()
-	f, err := openFile(m.path("noperm"), os.O_RDONLY)
+	f, err := m.open(m.path("noperm"), os.O_RDONLY)
 	if err == nil {
-		within(probeWait, f.Close)
+		m.close(f)
 	}
 	result := "allowed"
 	switch {
@@ -1002,16 +1058,16 @@ func (m *probeMount) measurePermissions() {
 // WRITE sizes FSKit sends and whether they carried every byte written.
 func (m *probeMount) measureWriteSizes() {
 	const name, size = "write", 4 << 20
-	f, err := openFile(m.path(name), os.O_WRONLY)
+	f, err := m.open(m.path(name), os.O_WRONLY)
 	if err == nil {
-		err = within(4*probeWait, func() error {
+		err = m.within("write", 4*probeWait, func() error {
 			_, err := f.Write(make([]byte, size))
 			return err
 		})
-		if syncErr := within(4*probeWait, f.Sync); err == nil {
+		if syncErr := m.within("fsync", 4*probeWait, f.Sync); err == nil {
 			err = syncErr
 		}
-		if closeErr := within(4*probeWait, f.Close); err == nil {
+		if closeErr := m.within("close", 4*probeWait, f.Close); err == nil {
 			err = closeErr
 		}
 	}
@@ -1054,7 +1110,7 @@ func (m *probeMount) measureNotify() {
 	m.stat(entry)
 	m.stat(entry)
 	cached := m.log.count("LOOKUP", entry)
-	sendErr := within(probeWait, func() error {
+	sendErr := m.within("entry notification", probeWait, func() error {
 		return serviceEntryInval(m.conn, fuseops.RootInodeID, entry)
 	})
 	m.stat(entry)
@@ -1074,7 +1130,7 @@ func (m *probeMount) measureNotify() {
 	m.stat(inode)
 	second := m.log.countOps(inode, "GETATTR", "LOOKUP")
 	// A negative offset invalidates only the attributes.
-	sendErr = within(probeWait, func() error {
+	sendErr = m.within("inode notification", probeWait, func() error {
 		return serviceInodeInvalidation(m.conn, m.server.names[inode].id, -1, 0)
 	})
 	m.stat(inode)
@@ -1111,14 +1167,17 @@ func (m *probeMount) healthy(name string) bool {
 // closeChannel calls MFChannelClose on the live mount.
 func (m *probeMount) closeChannel() {
 	mark := m.log.mark()
-	closed, errno := m.pt.closeChannel()
+	closed, err := m.pt.closeChannel()
 	closeResult := "ok"
 	if !closed {
-		closeResult = errName(errno)
+		closeResult = errName(err)
+	}
+	if errors.Is(err, errProbeTimeout) {
+		m.stop(fmt.Sprintf("MFChannelClose on %s did not return within %v", m.name, probeWait))
 	}
 	_, woke := m.log.waitFor(m.ctx, probeWait, mark, channelEnded)
 	unmounted := waitUnmounted(m.dir, probeWait)
-	_, accessErr := statSize(m.dir)
+	_, accessErr := m.statPath(m.dir)
 	result := "volume_stays_mounted"
 	if unmounted {
 		result = "unmounts"
@@ -1141,12 +1200,12 @@ func (m *probeMount) measureSlowRead() {
 		m.report(item, "unknown", map[string]string{"error": "the signalled case ended the channel"})
 		return
 	}
-	f, err := openFile(m.path(name), os.O_RDONLY)
+	f, err := m.open(m.path(name), os.O_RDONLY)
 	if err != nil {
 		m.report(item, "unknown", map[string]string{"error": errName(err)})
 		return
 	}
-	defer within(probeWait, f.Close)
+	defer m.close(f)
 	read := make(chan error, 1)
 	go func() {
 		_, err := f.Read(make([]byte, 4096))
@@ -1171,6 +1230,13 @@ func (m *probeMount) measureSlowRead() {
 	// The read can return just before the transport logs the channel's end.
 	_, ended := m.log.waitFor(m.ctx, probeWait, mark, channelEnded)
 	h.answer(4096)
+	if !returned {
+		select {
+		case <-read:
+		case <-time.After(probeWait):
+			m.stop(fmt.Sprintf("the read of %s on %s did not return after its answer", name, m.name))
+		}
+	}
 
 	result := "unknown"
 	switch {
@@ -1204,7 +1270,7 @@ func (m *probeMount) measureSignalledSlowRead() {
 		m.report(item, "unknown", map[string]string{"error": errName(err)})
 		return
 	}
-	defer reader.stop()
+	defer m.stopReader(reader)
 	if _, ok := m.awaitRead(h); !ok {
 		m.report(item, "unknown", map[string]string{"error": "no READ arrived"})
 		return
@@ -1238,7 +1304,11 @@ func (m *probeMount) measureSignalledSlowRead() {
 // unmountAndJoin unmounts the way a user does and reports what Join returns.
 func (m *probeMount) unmountAndJoin() {
 	attempts, gone := m.unmount()
-	m.report("join_after_unmount", m.join(probeWait), map[string]string{
+	join := m.join(probeWait)
+	if join == "pending" && gone {
+		m.stop(fmt.Sprintf("Join on %s was still pending after the volume left the mount table", m.name))
+	}
+	m.report("join_after_unmount", join, map[string]string{
 		"attempts":  strings.Join(attempts, ","),
 		"unmounted": yesNo(gone),
 	})
@@ -1411,7 +1481,7 @@ func (m *probeMount) awaitRead(h *heldRead) (probeEvent, bool) {
 // readOnce opens name and reads it with one read(2) of size bytes.
 func (m *probeMount) readOnce(name string, size int) (int, error) {
 	var n int
-	err := within(probeWait, func() error {
+	err := m.within("read", probeWait, func() error {
 		f, err := os.Open(m.path(name))
 		if err != nil {
 			return err
@@ -1771,20 +1841,35 @@ func (pt *probeTransport) WritevMessage(parts [][]byte) error {
 }
 
 // closeChannel calls MFChannelClose unless the probe already did or Close has
-// started. Close waits for the call, and then skips its own MFChannelClose.
-func (pt *probeTransport) closeChannel() (bool, syscall.Errno) {
+// started, and waits up to probeWait for it. The call counts as one of the
+// native transport's operations, so Close releases the channel only after the
+// call returns, and Close skips its own MFChannelClose.
+func (pt *probeTransport) closeChannel() (bool, error) {
 	pt.closeMu.Lock()
 	defer pt.closeMu.Unlock()
 	native := pt.native
 	native.mu.Lock()
 	released := native.closed
-	native.mu.Unlock()
 	if pt.closedChannel || pt.closing || released {
+		native.mu.Unlock()
 		return false, syscall.EALREADY
 	}
+	native.operations.Add(1)
+	native.mu.Unlock()
 	pt.closedChannel = true
-	closed, _, errno := purego.SyscallN(native.api.channelClose, native.channel)
-	return byte(closed) != 0, callErrno(errno)
+	var closed, errno uintptr
+	err := within(probeWait, func() error {
+		defer native.operations.Done()
+		closed, _, errno = purego.SyscallN(native.api.channelClose, native.channel)
+		return nil
+	})
+	switch {
+	case err != nil:
+		return false, err
+	case byte(closed) == 0:
+		return false, callErrno(errno)
+	}
+	return true, nil
 }
 
 // mountSucceeded reports MFMount's result once it has returned.
@@ -1988,10 +2073,15 @@ func (r *probeReader) wait(d time.Duration) string {
 	}
 }
 
-func (r *probeReader) stop() {
-	if r.wait(0) == "running" {
-		r.cmd.Process.Kill()
-		r.wait(probeWait)
+// stopReader kills the reader if it still runs. A reader that survives the
+// kill is stuck in the volume, so it stops further mounts.
+func (m *probeMount) stopReader(r *probeReader) {
+	if r.wait(0) != "running" {
+		return
+	}
+	r.cmd.Process.Kill()
+	if r.wait(probeWait) == "running" {
+		m.stop(fmt.Sprintf("cat on %s survived SIGKILL", m.name))
 	}
 }
 
@@ -2010,33 +2100,6 @@ func within(d time.Duration, f func() error) error {
 	case <-timer.C:
 		return errProbeTimeout
 	}
-}
-
-func statSize(path string) (int64, error) {
-	var size int64
-	err := within(probeWait, func() error {
-		info, err := os.Stat(path)
-		if err == nil {
-			size = info.Size()
-		}
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
-	return size, nil
-}
-
-func openFile(path string, flag int) (*os.File, error) {
-	var f *os.File
-	err := within(probeWait, func() (err error) {
-		f, err = os.OpenFile(path, flag, 0)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
 }
 
 // mountTable reads the mounted volumes without touching any of them.

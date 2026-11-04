@@ -35,9 +35,10 @@ const fskitProbeMounts = 5
 //     0 file, write sizes, and Join after a clean unmount. macOS can keep an
 //     entry past its TTL (https://github.com/macfuse/macfuse/issues/1207), so
 //     the LOOKUP attributes case may report unknown. The shrink run of the
-//     padding timing decides what a reader gets when a GETATTR reports a
-//     shrink while an earlier READ is pending, the window that the short-read
-//     guard in https://github.com/dsfaccini/fuse/pull/5 does not cover.
+//     padding timing decides what a reader gets when a GETATTR reply that
+//     shrinks the file reaches FSKit while a READ it sent earlier is
+//     unanswered. That ordering decides the open short-read guard in
+//     https://github.com/dsfaccini/fuse/pull/5.
 //  2. local, base plus the local option. Access to the mount point, and Join
 //     after a clean unmount.
 //  3. options, base with DisableDefaultPermissions, MaxWrite 128 KiB and the
@@ -70,10 +71,12 @@ const fskitProbeMounts = 5
 // (https://github.com/macfuse/macfuse/issues/1232) and a stalled FSKit mount
 // clears only on reboot. AGENTS.md has the command. The probe refuses to start
 // while a macFUSE volume or a probe mount point is mounted. It starts no
-// further mount after a failed mount, after one that looked wedged (its
-// measurements hit their time limit, or it needed a forced unmount), or while
-// an earlier one is still mounted. A run can therefore make fewer than 5
-// mounts.
+// further mount after a failed mount, after one that looked wedged, or while
+// an earlier one is still mounted. A mount looks wedged when its measurements
+// hit their time limit, a call into its volume or channel hits its bound, a
+// reader survives SIGKILL, Join stays pending after the volume left the mount
+// table, MFMount never returns, or it needs a forced unmount. Each of these
+// fails the test. A run can therefore make fewer than 5 mounts.
 //
 // No mount outlives the probe. Each mount point is a fresh directory, and its
 // cleanup is registered before MFMount is called, so it runs after a failure, a
