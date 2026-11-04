@@ -28,8 +28,10 @@ import (
 
 // Optional configuration accepted by Mount.
 //
-// Mount rejects a config whose FSName, Subtype, VolumeName or Options contain a
-// comma, because the mount helpers and FSKit split options on commas.
+// On every OS and backend, Mount rejects a config whose FSName, Subtype,
+// VolumeName or Options contain a comma or a backslash. A comma separates
+// mount options, and fusermount reads a backslash in fsname and subtype as an
+// escape.
 type MountConfig struct {
 	// The context from which every op read from the connetion by the sever
 	// should inherit. If nil, context.Background() will be used.
@@ -139,8 +141,8 @@ type MountConfig struct {
 	// the value of ChildInodeEntry.EntryExpiration is ignored by the kernel, and
 	// entries will be cached for an arbitrarily long time.
 	//
-	// The FSKit backend never receives novncache, so this field has no effect
-	// there.
+	// The FSKit and FUSE-T backends never receive novncache, so this field has
+	// no effect there.
 	EnableVnodeCaching bool
 
 	// OS X only.
@@ -151,8 +153,8 @@ type MountConfig struct {
 	// file system serves them.
 	//
 	// This field omits noappledouble, so those files stay visible and Finder may
-	// create them. The FSKit backend never receives noappledouble, so this field
-	// has no effect there.
+	// create them. The FSKit and FUSE-T backends never receive noappledouble,
+	// so this field has no effect there.
 	EnableAppleDouble bool
 
 	// Linux only.
@@ -378,18 +380,9 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 	return opts
 }
 
-func escapeOptionsKey(s string) (res string) {
-	res = s
-	res = strings.Replace(res, `\`, `\\`, -1)
-	res = strings.Replace(res, `,`, `\,`, -1)
-	return res
-}
-
 func mapToOptionsString(opts map[string]string) string {
 	var components []string
 	for k, v := range opts {
-		k = escapeOptionsKey(k)
-
 		component := k
 		if v != "" {
 			component = fmt.Sprintf("%s=%s", k, v)
@@ -420,11 +413,20 @@ func (c *MountConfig) normalize() (MountConfig, error) {
 		return MountConfig{}, err
 	}
 	for k, v := range cfg.toMap() {
-		if strings.Contains(k, ",") || strings.Contains(v, ",") {
-			return MountConfig{}, fmt.Errorf("mount options cannot contain commas: %q=%q", k, v)
+		if err := checkMountOption(k, v); err != nil {
+			return MountConfig{}, err
 		}
 	}
 	return cfg, nil
+}
+
+// checkMountOption rejects an option that would end or escape early on some
+// backend.
+func checkMountOption(k, v string) error {
+	if strings.ContainsAny(k+v, `,\`) {
+		return fmt.Errorf("mount options cannot contain commas or backslashes: %q=%q", k, v)
+	}
+	return nil
 }
 
 func (c *MountConfig) sanitizeMaxPagesAndWrite() error {
