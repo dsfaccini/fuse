@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -60,6 +61,17 @@ func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
 	fskitFrameworkPath = frameworkPath
 	fskitOSProductVersion = func() (string, error) { return osVersion, nil }
 	t.Cleanup(func() { fskitFrameworkPath, fskitOSProductVersion = oldPath, oldVersion })
+}
+
+func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
+	options := fskitMountOptions(&MountConfig{Options: map[string]string{"backend": "fskit"}})
+	for _, option := range strings.Split(options, ",") {
+		name, _, _ := strings.Cut(option, "=")
+		switch name {
+		case "novncache", "noappledouble", "iosize", "backend":
+			t.Errorf("FSKit mount options %q include %s", options, name)
+		}
+	}
 }
 
 func TestLoadFSKitAPIReportsMissingFramework(t *testing.T) {

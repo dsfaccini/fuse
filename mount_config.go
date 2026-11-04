@@ -16,14 +16,22 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"runtime"
 	"strings"
+
+	"github.com/dsfaccini/fuse/internal/buffer"
 )
 
 // Optional configuration accepted by Mount.
+//
+// On every OS and backend, Mount rejects a config whose FSName, Subtype,
+// VolumeName or Options contain a comma or a backslash. A comma separates
+// mount options, and fusermount reads a backslash in fsname and subtype as an
+// escape.
 type MountConfig struct {
 	// The context from which every op read from the connetion by the sever
 	// should inherit. If nil, context.Background() will be used.
@@ -132,7 +140,22 @@ type MountConfig struct {
 	// This field disables the use of novncache, restoring entry caching. Beware:
 	// the value of ChildInodeEntry.EntryExpiration is ignored by the kernel, and
 	// entries will be cached for an arbitrarily long time.
+	//
+	// The FSKit and FUSE-T backends never receive novncache, so this field has
+	// no effect there.
 	EnableVnodeCaching bool
+
+	// OS X only.
+	//
+	// Normally on OS X we mount with the noappledouble option
+	// (https://github.com/osxfuse/osxfuse/wiki/Mount-options), which makes
+	// Apple Double files (._foo) and .DS_Store files inaccessible, even when the
+	// file system serves them.
+	//
+	// This field omits noappledouble, so those files stay visible and Finder may
+	// create them. The FSKit and FUSE-T backends never receive noappledouble,
+	// so this field has no effect there.
+	EnableAppleDouble bool
 
 	// Linux only.
 	//
@@ -326,9 +349,11 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 		opts["ro"] = ""
 	}
 
-	// Handle OS X options.
+	// Handle OS X options. The FSKit module parses neither novncache nor
+	// noappledouble.
+	fskit := c.Options["backend"] == "fskit"
 	if isDarwin {
-		if !c.EnableVnodeCaching {
+		if !fskit && !c.EnableVnodeCaching {
 			opts["novncache"] = ""
 		}
 
@@ -343,7 +368,7 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 	// network-based file systems.
 	//
 	// Cf. https://github.com/osxfuse/osxfuse/wiki/Mount-options
-	if isDarwin {
+	if isDarwin && !fskit && !c.EnableAppleDouble {
 		opts["noappledouble"] = ""
 	}
 
@@ -355,18 +380,9 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 	return opts
 }
 
-func escapeOptionsKey(s string) (res string) {
-	res = s
-	res = strings.Replace(res, `\`, `\\`, -1)
-	res = strings.Replace(res, `,`, `\,`, -1)
-	return res
-}
-
 func mapToOptionsString(opts map[string]string) string {
 	var components []string
 	for k, v := range opts {
-		k = escapeOptionsKey(k)
-
 		component := k
 		if v != "" {
 			component = fmt.Sprintf("%s=%s", k, v)
@@ -381,4 +397,65 @@ func mapToOptionsString(opts map[string]string) string {
 // Create an options string suitable for passing to the mount helper.
 func (c *MountConfig) toOptionsString() string {
 	return mapToOptionsString(c.toMap())
+}
+
+// normalize returns a copy of c with its defaults filled in, or an error when
+// the kernel or the mount helper cannot take c.
+func (c *MountConfig) normalize() (MountConfig, error) {
+	if c == nil {
+		return MountConfig{}, errors.New("MountConfig must not be nil")
+	}
+	cfg := *c
+	if cfg.OpContext == nil {
+		cfg.OpContext = context.Background()
+	}
+	if err := cfg.sanitizeMaxPagesAndWrite(); err != nil {
+		return MountConfig{}, err
+	}
+	// toMap passes VolumeName only on darwin. Check it on every OS so that one
+	// rule holds.
+	if err := checkMountOption("volname", cfg.VolumeName); err != nil {
+		return MountConfig{}, err
+	}
+	for k, v := range cfg.toMap() {
+		if err := checkMountOption(k, v); err != nil {
+			return MountConfig{}, err
+		}
+	}
+	return cfg, nil
+}
+
+// checkMountOption rejects an option that would end or escape early on some
+// backend.
+func checkMountOption(k, v string) error {
+	if strings.ContainsAny(k+v, `,\`) {
+		return fmt.Errorf("mount options cannot contain commas or backslashes: %q=%q", k, v)
+	}
+	return nil
+}
+
+func (c *MountConfig) sanitizeMaxPagesAndWrite() error {
+	pageSize := uint32(buffer.GetPageSize())
+
+	// If neither are given, set them both to the default based on MaxReadSize & MaxWriteSize.
+	if c.MaxPages == 0 && c.MaxWrite == 0 {
+		c.MaxWrite = buffer.MaxWriteSize
+		maxPayload := max(uint32(buffer.MaxReadSize), uint32(buffer.MaxWriteSize))
+		c.MaxPages = uint16(maxPayload / pageSize)
+	} else if c.MaxPages != 0 && c.MaxWrite == 0 {
+		// If only MaxPages is given, set MaxWrite based on MaxPages.
+		c.MaxWrite = uint32(c.MaxPages) * pageSize
+	} else if c.MaxPages == 0 && c.MaxWrite != 0 {
+		// If only MaxWrite is given, MaxPages defaults to max(MaxWrite, MaxReadSize).
+		maxPayload := max(c.MaxWrite, uint32(buffer.MaxReadSize))
+		c.MaxPages = uint16((maxPayload + pageSize - 1) / pageSize)
+	}
+
+	// Validate: MaxPages needs to be >= MaxWrite (in bytes)
+	if uint32(c.MaxPages)*pageSize < c.MaxWrite {
+		return fmt.Errorf("MaxPages (%d pages, %d bytes) must be at least MaxWrite (%d bytes)",
+			c.MaxPages, uint32(c.MaxPages)*pageSize, c.MaxWrite)
+	}
+
+	return nil
 }

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/dsfaccini/fuse/internal/buffer"
@@ -116,18 +115,7 @@ func openOSXFUSEDev(devPrefix string) (dev *os.File, err error) {
 }
 
 func convertMountArgs(daemonVar string, libVar string,
-	cfg *MountConfig) ([]string, []string, error) {
-
-	// The mount helper doesn't understand any escaping.
-	for k, v := range cfg.toMap() {
-		if strings.Contains(k, ",") || strings.Contains(v, ",") {
-			return nil, nil, fmt.Errorf(
-				"mount options cannot contain commas on darwin: %q=%q",
-				k,
-				v)
-		}
-	}
-
+	cfg *MountConfig) ([]string, []string) {
 	env := []string{libVar + "="}
 	if daemonVar != "" {
 		env = append(env, daemonVar+"="+os.Args[0])
@@ -142,7 +130,7 @@ func convertMountArgs(daemonVar string, libVar string,
 		"-o", "iosize=" + strconv.FormatUint(buffer.MaxWriteSize, 10),
 	}
 
-	return argv, env, nil
+	return argv, env
 }
 
 func callMount(
@@ -154,10 +142,7 @@ func callMount(
 	dev *os.File,
 	ready chan<- error) error {
 
-	argv, env, err := convertMountArgs(daemonVar, libVar, cfg)
-	if err != nil {
-		return err
-	}
+	argv, env := convertMountArgs(daemonVar, libVar, cfg)
 
 	// Call the mount helper, passing in the device file and saving output into a
 	// buffer.
@@ -202,10 +187,7 @@ func callMountCommFD(
 	dir string,
 	cfg *MountConfig) (*os.File, error) {
 
-	argv, env, err := convertMountArgs(daemonVar, libVar, cfg)
-	if err != nil {
-		return nil, err
-	}
+	argv, env := convertMountArgs(daemonVar, libVar, cfg)
 	env = append(env, "_FUSE_COMMVERS=2")
 	argv = append(argv, dir)
 

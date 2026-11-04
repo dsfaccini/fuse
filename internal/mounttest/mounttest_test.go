@@ -286,8 +286,9 @@ func init() { RegisterTestSuite(&HelloFSTest{}) }`,
 
 // mountFailureTests call Mount but fail before anything is mounted.
 var mountFailureTests = map[string]string{
-	"TestNonexistentMountPoint":        "checkMountPoint rejects the directory",
-	"TestMountReturnsTypedFSKitErrors": "the FSKit preflight fails",
+	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
+	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
+	"TestMountRejectsInvalidConfigBeforeMounting": "config validation fails",
 }
 
 // mountCallees mount when called: Mount directly, mountFSKitTransport under
@@ -422,7 +423,7 @@ func ungatedMounts(fset *token.FileSet, files []*ast.File) ([]error, int) {
 				gate = "SkipUnlessFSKitProbeEnabled"
 			}
 			if !gated(fn.Body, gate) {
-				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.%s as its first statement",
+				errs = append(errs, fmt.Errorf("%s: %s mounts; call mounttest.%s as its first statement, or list it in mountFailureTests if it fails before anything is mounted",
 					fset.Position(fn.Pos()), name, gate))
 			}
 		case isEntry(name, "Example"):
