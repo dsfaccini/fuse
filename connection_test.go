@@ -219,14 +219,12 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := &Connection{
-				cfg: MountConfig{
-					MaxPages: tc.inputPages,
-					MaxWrite: tc.inputWrite,
-				},
+			cfg := MountConfig{
+				MaxPages: tc.inputPages,
+				MaxWrite: tc.inputWrite,
 			}
 
-			err := c.sanitizeMaxPagesAndWrite()
+			err := cfg.sanitizeMaxPagesAndWrite()
 
 			if tc.wantErr {
 				if err == nil {
@@ -239,11 +237,11 @@ func TestSanitizeMaxPagesAndWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				if c.cfg.MaxPages != tc.wantPages {
-					t.Errorf("MaxPages = %d, want %d", c.cfg.MaxPages, tc.wantPages)
+				if cfg.MaxPages != tc.wantPages {
+					t.Errorf("MaxPages = %d, want %d", cfg.MaxPages, tc.wantPages)
 				}
-				if c.cfg.MaxWrite != tc.wantWrite {
-					t.Errorf("MaxWrite = %d, want %d", c.cfg.MaxWrite, tc.wantWrite)
+				if cfg.MaxWrite != tc.wantWrite {
+					t.Errorf("MaxWrite = %d, want %d", cfg.MaxWrite, tc.wantWrite)
 				}
 			}
 		})
