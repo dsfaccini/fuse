@@ -22,6 +22,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- To test `Mount`'s config validation without a mount, pass a mount point that
+  does not exist. `Mount` validates the config before it checks the mount
+  point. A regression then fails with ENOENT instead of mounting.
 
 ## Validate a change
 

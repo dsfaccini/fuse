@@ -109,7 +109,7 @@ func GetWirelog(ctx context.Context) *WireLogRecord {
 // Create a connection wrapping the supplied kernel transport. You must
 // eventually call c.close().
 //
-// The loggers may be nil.
+// cfg must come from MountConfig.normalize. The loggers may be nil.
 func newConnection(
 	cfg MountConfig,
 	debugLogger *log.Logger,
@@ -136,10 +136,6 @@ func newConnection(
 
 // Init performs the work necessary to cause the mount process to complete.
 func (c *Connection) Init() error {
-	if err := c.sanitizeMaxPagesAndWrite(); err != nil {
-		return err
-	}
-
 	c.inMessageBufSize = buffer.GetPageSize() + int(c.cfg.MaxWrite)
 
 	// Read the init op.
@@ -622,32 +618,6 @@ func (c *Connection) callbackForOp(op interface{}) func() {
 	case *fuseops.WriteFileOp:
 		return o.Callback
 	}
-	return nil
-}
-
-func (c *Connection) sanitizeMaxPagesAndWrite() error {
-	pageSize := uint32(buffer.GetPageSize())
-
-	// If neither are given, set them both to the default based on MaxReadSize & MaxWriteSize.
-	if c.cfg.MaxPages == 0 && c.cfg.MaxWrite == 0 {
-		c.cfg.MaxWrite = buffer.MaxWriteSize
-		maxPayload := max(uint32(buffer.MaxReadSize), uint32(buffer.MaxWriteSize))
-		c.cfg.MaxPages = uint16(maxPayload / pageSize)
-	} else if c.cfg.MaxPages != 0 && c.cfg.MaxWrite == 0 {
-		// If only MaxPages is given, set MaxWrite based on MaxPages.
-		c.cfg.MaxWrite = uint32(c.cfg.MaxPages) * pageSize
-	} else if c.cfg.MaxPages == 0 && c.cfg.MaxWrite != 0 {
-		// If only MaxWrite is given, MaxPages defaults to max(MaxWrite, MaxReadSize).
-		maxPayload := max(c.cfg.MaxWrite, uint32(buffer.MaxReadSize))
-		c.cfg.MaxPages = uint16((maxPayload + pageSize - 1) / pageSize)
-	}
-
-	// Validate: MaxPages needs to be >= MaxWrite (in bytes)
-	if uint32(c.cfg.MaxPages)*pageSize < c.cfg.MaxWrite {
-		return fmt.Errorf("MaxPages (%d pages, %d bytes) must be at least MaxWrite (%d bytes)",
-			c.cfg.MaxPages, uint32(c.cfg.MaxPages)*pageSize, c.cfg.MaxWrite)
-	}
-
 	return nil
 }
 
