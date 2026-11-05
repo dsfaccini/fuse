@@ -99,6 +99,41 @@ func TestShouldLogErrorMatchesWrappedErrno(t *testing.T) {
 	}
 }
 
+func TestShouldLogErrorSkipsExpectedErrnos(t *testing.T) {
+	wrap := func(errno syscall.Errno) error { return fmt.Errorf("op: %w", errno) }
+	tests := []struct {
+		name string
+		op   interface{}
+		err  error
+		want bool
+	}{
+		{"setxattr ENOSYS", &fuseops.SetXattrOp{}, wrap(syscall.ENOSYS), false},
+		{"setxattr EPERM", &fuseops.SetXattrOp{}, wrap(syscall.EPERM), true},
+		{"removexattr ENOSYS", &fuseops.RemoveXattrOp{}, wrap(syscall.ENOSYS), false},
+		{"removexattr EIO", &fuseops.RemoveXattrOp{}, wrap(syscall.EIO), true},
+		{"createlink ENOSYS", &fuseops.CreateLinkOp{}, wrap(syscall.ENOSYS), false},
+		{"createlink EPERM", &fuseops.CreateLinkOp{}, wrap(syscall.EPERM), true},
+		{"readfile EINTR", &fuseops.ReadFileOp{}, wrap(syscall.EINTR), false},
+		{"readfile EIO", &fuseops.ReadFileOp{}, wrap(syscall.EIO), true},
+		{"getattr EINTR", &fuseops.GetInodeAttributesOp{}, wrap(syscall.EINTR), false},
+		{"getattr ESTALE", &fuseops.GetInodeAttributesOp{}, wrap(syscall.ESTALE), true},
+		{"rmdir ENOTEMPTY", &fuseops.RmDirOp{}, wrap(syscall.ENOTEMPTY), false},
+		{"rmdir EPERM", &fuseops.RmDirOp{}, wrap(syscall.EPERM), true},
+		{"rename ENOTEMPTY", &fuseops.RenameOp{}, wrap(syscall.ENOTEMPTY), false},
+		{"rename EIO", &fuseops.RenameOp{}, wrap(syscall.EIO), true},
+		{"unlink ENOTEMPTY", &fuseops.UnlinkOp{}, wrap(syscall.ENOTEMPTY), true},
+		{"unlink EIO before ENOSYS", &fuseops.UnlinkOp{}, fmt.Errorf("unlink: %w (cleanup: %w)", syscall.EIO, syscall.ENOSYS), true},
+	}
+	c := &Connection{errorLogger: log.New(io.Discard, "", 0)}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := c.shouldLogError(tt.op, tt.err); got != tt.want {
+				t.Errorf("shouldLogError = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // The kernel answers a reply to an interrupted request with ENOENT.
 func TestReplyTreatsENOENTWriteAsBenign(t *testing.T) {
 	tests := []struct {

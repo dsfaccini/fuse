@@ -47,9 +47,17 @@ type MountConfig struct {
 	// chtimes, etc. will fail.
 	ReadOnly bool
 
-	// A logger to use for logging errors. All errors are logged, with the
-	// exception of a few blacklisted errors that are expected. If nil, no error
-	// logging is performed.
+	// A logger to use for logging errors. If nil, no error logging is
+	// performed.
+	//
+	// It receives every error a file system returns for an op, except those
+	// that are expected. The errno the kernel receives decides. It does not
+	// receive:
+	//
+	//   - ENOSYS or EINTR from any op.
+	//   - ENOENT from LookUpInode.
+	//   - ENOTEMPTY from RmDir or Rename.
+	//   - ENODATA or ERANGE from GetXattr or ListXattr.
 	ErrorLogger *log.Logger
 
 	// A logger to use for logging debug information. If nil, no debug logging is
