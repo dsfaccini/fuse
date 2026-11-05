@@ -15,6 +15,7 @@
 package fuse
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -27,9 +28,9 @@ import (
 // Server is an interface for any type that knows how to serve ops read from a
 // connection.
 type Server interface {
-	// Read and serve ops from the supplied connection until EOF. Do not return
-	// until all operations have been responded to. Must not be called more than
-	// once.
+	// Read and serve ops from the supplied connection until ReadOp returns an
+	// error, which is io.EOF on unmount. Do not return until all operations
+	// have been responded to. Must not be called more than once.
 	ServeOps(*Connection)
 }
 
@@ -99,11 +100,7 @@ func Mount(
 	}
 
 	// Serve the connection in the background. When done, set the join status.
-	go func() {
-		server.ServeOps(connection)
-		mfs.joinStatus = connection.close()
-		close(mfs.joinStatusAvailable)
-	}()
+	go mfs.serve(server, connection)
 
 	if cfg.DebugLogger != nil {
 		cfg.DebugLogger.Println("Waiting for mounting process to complete")
@@ -120,6 +117,14 @@ func Mount(
 	}
 
 	return mfs, nil
+}
+
+// serve runs server until ServeOps returns, then publishes the join status:
+// the connection's fatal error, if any, joined with the error from closing it.
+func (mfs *MountedFileSystem) serve(server Server, c *Connection) {
+	server.ServeOps(c)
+	mfs.joinStatus = errors.Join(c.fatalError(), c.close())
+	close(mfs.joinStatusAvailable)
 }
 
 func checkMountPoint(dir string) error {

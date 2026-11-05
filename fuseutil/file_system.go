@@ -16,7 +16,6 @@ package fuseutil
 
 import (
 	"context"
-	"io"
 	"sync"
 
 	"github.com/dsfaccini/fuse"
@@ -106,13 +105,11 @@ func (s *fileSystemServer) ServeOps(c *fuse.Connection) {
 	}()
 
 	for {
+		// ReadOp returns io.EOF on unmount. Any other error is fatal to the
+		// connection, and Join returns it.
 		ctx, op, err := c.ReadOp()
-		if err == io.EOF {
-			break
-		}
-
 		if err != nil {
-			panic(err)
+			break
 		}
 
 		s.opsInFlight.Add(1)

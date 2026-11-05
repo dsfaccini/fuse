@@ -218,6 +218,18 @@ func TestOutMessageReset(t *testing.T) {
 	}
 }
 
+func TestOutMessageGrowZero(t *testing.T) {
+	var om OutMessage
+	om.Reset()
+
+	if p := om.Grow(0); p != nil {
+		t.Errorf("Grow(0) = %p, want nil", p)
+	}
+	if got, want := om.Len(), OutMessageHeaderSize; got != want {
+		t.Errorf("om.Len() = %d, want %d", got, want)
+	}
+}
+
 func TestOutMessageGrow(t *testing.T) {
 	var om OutMessage
 	om.Reset()

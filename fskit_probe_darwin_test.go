@@ -555,11 +555,7 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 // serve serves conn the way Mount does.
 func (m *probeMount) serve(conn *Connection) *MountedFileSystem {
 	mfs := &MountedFileSystem{dir: m.dir, joinStatusAvailable: make(chan struct{})}
-	go func() {
-		m.server.ServeOps(conn)
-		mfs.joinStatus = conn.close()
-		close(mfs.joinStatusAvailable)
-	}()
+	go mfs.serve(m.server, conn)
 	return mfs
 }
 

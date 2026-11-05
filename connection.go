@@ -79,6 +79,12 @@ type Connection struct {
 	// GUARDED_BY(mu)
 	cancelFuncs map[uint64]func()
 
+	// The first error that is fatal to the connection. Once it is set, ReadOp
+	// returns it.
+	//
+	// GUARDED_BY(mu)
+	fatalErr error
+
 	// Freelists, serviced by freelists.go.
 	inMessages  freelist.Freelist // GUARDED_BY(mu)
 	outMessages freelist.Freelist // GUARDED_BY(mu)
@@ -101,6 +107,14 @@ type opState struct {
 	outMsg *buffer.OutMessage
 	op     interface{}
 	wlog   *WireLogRecord
+
+	// The request's header fields, copied because inMsg returns to the freelist
+	// when the op is answered.
+	fuseID uint64
+	opCode uint32
+
+	// Set by the op's first Reply.
+	replied *atomic.Bool
 }
 
 // Return the current wirelog record from the context if the MountConfig
@@ -289,18 +303,43 @@ func (c *Connection) debugLog(
 	c.debugLogger.Println(msg)
 }
 
+// recordFatal records err as the connection's fatal error, unless one is
+// already recorded, and returns the recorded error.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) recordFatal(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.fatalErr == nil {
+		c.fatalErr = err
+	}
+	return c.fatalErr
+}
+
+// fatalError returns the connection's fatal error, or nil if there is none.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) fatalError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.fatalErr
+}
+
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) recordCancelFunc(
 	fuseID uint64,
-	f func()) {
+	f func()) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if _, ok := c.cancelFuncs[fuseID]; ok {
-		panic(fmt.Sprintf("Already have cancel func for request %v", fuseID))
+		return fmt.Errorf("Already have cancel func for request %v", fuseID)
 	}
 
 	c.cancelFuncs[fuseID] = f
+	return nil
 }
 
 // Set up state for an op that is about to be returned to the user, given its
@@ -311,7 +350,7 @@ func (c *Connection) recordCancelFunc(
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) beginOp(
 	opCode uint32,
-	fuseID uint64) context.Context {
+	fuseID uint64) (context.Context, error) {
 	// Start with the parent context.
 	ctx := c.cfg.OpContext
 
@@ -326,10 +365,13 @@ func (c *Connection) beginOp(
 	if opCode != fusekernel.OpForget {
 		var cancel func()
 		ctx, cancel = context.WithCancel(ctx)
-		c.recordCancelFunc(fuseID, cancel)
+		if err := c.recordCancelFunc(fuseID, cancel); err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
-	return ctx
+	return ctx, nil
 }
 
 // Clean up all state associated with an op to which the user has responded,
@@ -340,7 +382,7 @@ func (c *Connection) beginOp(
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) finishOp(
 	opCode uint32,
-	fuseID uint64) {
+	fuseID uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -353,12 +395,14 @@ func (c *Connection) finishOp(
 	if opCode != fusekernel.OpForget {
 		cancel, ok := c.cancelFuncs[fuseID]
 		if !ok {
-			panic(fmt.Sprintf("Unknown request ID in finishOp: %v", fuseID))
+			return fmt.Errorf("Unknown request ID in finishOp: %v", fuseID)
 		}
 
 		cancel()
 		delete(c.cancelFuncs, fuseID)
 	}
+
+	return nil
 }
 
 // LOCKS_EXCLUDED(c.mu)
@@ -447,7 +491,18 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 // context that should be used for work related to the op. It returns io.EOF if
 // the kernel has closed the connection.
 //
-// If err != nil, the user is responsible for later calling c.Reply with the
+// When a request's body fails to decode, ReadOp answers the request itself and
+// reads on. The answer is EINVAL for a reply size above the cap, and EIO
+// otherwise. The cap is MaxPages pages. For xattrs it is at least 64 KiB, or
+// 128 KiB on darwin. On darwin, for directory reads it is at least the iosize
+// the mount passes.
+//
+// Any other error is fatal to the connection, and ReadOp returns it from then
+// on. Fatal errors are a failed read, a malformed message, a request ID
+// already in flight, a second Reply to one op, and an INIT that fails to
+// decode. A fatal error does not unmount the file system.
+//
+// If err == nil, the user is responsible for later calling c.Reply with the
 // returned context.
 //
 // This function delivers ops in exactly the order they are received from
@@ -457,9 +512,22 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 	// Keep going until we find a request we know how to convert.
 	for {
+		if err := c.fatalError(); err != nil {
+			return nil, nil, err
+		}
+
 		// Read the next message from the kernel.
 		inMsg, err := c.readMessage()
+		if err == io.EOF {
+			return nil, nil, err
+		}
 		if err != nil {
+			return nil, nil, c.recordFatal(fmt.Errorf("readMessage: %w", err))
+		}
+
+		// A Reply may have recorded a fatal error during the read.
+		if err := c.fatalError(); err != nil {
+			c.putInMessage(inMsg)
 			return nil, nil, err
 		}
 
@@ -467,8 +535,16 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		outMsg := c.getOutMessage()
 		op, err = convertInMessage(&c.cfg, inMsg, outMsg, c.protocol)
 		if err != nil {
-			c.putOutMessage(outMsg)
-			return nil, nil, fmt.Errorf("convertInMessage: %v", err)
+			err = fmt.Errorf("convertInMessage: %w", err)
+			opCode := inMsg.Header().Opcode
+			if dupErr := c.rejectMessage(inMsg, outMsg, err); dupErr != nil {
+				return nil, nil, c.recordFatal(dupErr)
+			}
+			// Init waits for this request, and the kernel sends it only once.
+			if opCode == fusekernel.OpInit {
+				return nil, nil, c.recordFatal(err)
+			}
+			continue
 		}
 
 		// Choose an ID for this operation for the purposes of logging, and log it.
@@ -479,25 +555,90 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		// Special case: handle interrupt requests inline.
 		if interruptOp, ok := op.(*interruptOp); ok {
 			c.handleInterrupt(interruptOp.FuseID)
+			c.putInMessage(inMsg)
+			c.putOutMessage(outMsg)
 			continue
 		}
 
 		// Special case: answer the poll hack's requests inline.
-		if c.answerPollHack(inMsg, outMsg, op) {
+		answered, err := c.answerPollHack(inMsg, outMsg, op)
+		if err != nil {
+			return nil, nil, c.recordFatal(err)
+		}
+		if answered {
 			continue
 		}
 
 		// Set up a context that remembers information about this op.
-		ctx := c.beginOp(inMsg.Header().Opcode, inMsg.Header().Unique)
+		ctx, err := c.beginOp(inMsg.Header().Opcode, inMsg.Header().Unique)
+		if err != nil {
+			// A reply would answer the request in flight under this ID.
+			c.putInMessage(inMsg)
+			c.putOutMessage(outMsg)
+			return nil, nil, c.recordFatal(err)
+		}
 		var wlog *WireLogRecord
 		if c.wireLogger != nil {
 			wlog = NewWireLogRecord()
 		}
-		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog})
+		h := inMsg.Header()
+		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog, h.Unique, h.Opcode, new(atomic.Bool)})
 
 		// Return the op to the user.
 		return ctx, op, nil
 	}
+}
+
+// rejectMessage answers a request whose body failed to decode with the errno
+// in err, or EIO, and recycles its messages. The kernel expects no reply to
+// FORGET, BATCH_FORGET and INTERRUPT. rejectMessage sends nothing and returns
+// an error when another request with the same ID is in flight.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) rejectMessage(
+	inMsg *buffer.InMessage,
+	outMsg *buffer.OutMessage,
+	err error) error {
+	defer func() {
+		c.putInMessage(inMsg)
+		c.putOutMessage(outMsg)
+	}()
+
+	h := inMsg.Header()
+	if c.errorLogger != nil {
+		c.errorLogger.Printf("Op 0x%08x opcode %d] -> Error: %q", h.Unique, h.Opcode, err)
+	}
+
+	switch h.Opcode {
+	case fusekernel.OpForget, fusekernel.OpBatchForget, fusekernel.OpInterrupt:
+		return nil
+	}
+
+	if err := c.checkNotInFlight(h.Unique); err != nil {
+		return err
+	}
+
+	c.kernelResponse(outMsg, h.Unique, nil, err)
+	writeErr := c.writeOutMessage(outMsg)
+	// See Reply for why ENOENT is benign.
+	if writeErr != nil && !errors.Is(writeErr, syscall.ENOENT) && c.errorLogger != nil {
+		c.errorLogger.Printf("writeMessage: %v %v", writeErr, outMsg.OutHeaderBytes())
+	}
+	return nil
+}
+
+// checkNotInFlight returns an error when the request with ID fuseID is in
+// flight, because a reply under that ID would answer it.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) checkNotInFlight(fuseID uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.cancelFuncs[fuseID]; ok {
+		return fmt.Errorf("Already have cancel func for request %v", fuseID)
+	}
+	return nil
 }
 
 // Skip errors that happen as a matter of course, since they spook users.
@@ -546,7 +687,8 @@ var writeLock sync.Mutex
 //
 // The kernel receives the first syscall.Errno in opErr's chain, or EIO when
 // the chain has none. A reply the kernel refuses with ENOENT, because the
-// request was interrupted, is not an error.
+// request was interrupted, is not an error. A second Reply to the same op is
+// fatal to the connection.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) Reply(ctx context.Context, opErr error) error {
@@ -561,7 +703,21 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	op := state.op
 	inMsg := state.inMsg
 	outMsg := state.outMsg
-	fuseID := inMsg.Header().Unique
+	fuseID := state.fuseID
+
+	// After the first Reply, the op's messages and even its request ID may
+	// belong to another request.
+	if !state.replied.CompareAndSwap(false, true) {
+		err := fmt.Errorf("Reply called twice for request %v", fuseID)
+		c.recordFatal(err)
+		return err
+	}
+
+	// Clean up state for this op.
+	if err := c.finishOp(state.opCode, fuseID); err != nil {
+		c.recordFatal(err)
+		return err
+	}
 
 	defer func() {
 		// Invoke any callbacks set by the FUSE server after the response to the kernel is
@@ -575,9 +731,6 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 		c.putInMessage(inMsg)
 		c.putOutMessage(outMsg)
 	}()
-
-	// Clean up state for this op.
-	c.finishOp(inMsg.Header().Opcode, inMsg.Header().Unique)
 
 	logError := c.shouldLogError(op, opErr)
 
@@ -598,7 +751,7 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	}
 
 	// Send the reply to the kernel, if one is required.
-	noResponse := c.kernelResponse(outMsg, inMsg.Header().Unique, op, opErr)
+	noResponse := c.kernelResponse(outMsg, fuseID, op, opErr)
 
 	if !noResponse {
 		err := c.writeOutMessage(outMsg)

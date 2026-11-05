@@ -47,29 +47,30 @@ const pollHackInode = fuseops.InodeID(math.MaxUint64)
 // answerPollHack answers op inline and recycles its messages when op belongs to
 // the poll hack's entry, and reports whether it did. It drops the entry from a
 // BATCH_FORGET that also forgets other inodes, and leaves the rest to the
-// server.
+// server. It sends nothing and returns an error when another request with the
+// same ID is in flight.
 //
 // Only ReadOp calls it.
 func (c *Connection) answerPollHack(
 	inMsg *buffer.InMessage,
 	outMsg *buffer.OutMessage,
-	op interface{}) bool {
+	op interface{}) (bool, error) {
 	if lookUp, ok := op.(*fuseops.LookUpInodeOp); ok &&
 		lookUp.Parent == fuseops.RootInodeID &&
 		lookUp.Name == pollHackName &&
 		c.pollHackRunning.Load() {
 		c.pollHackEntryKnown = true
 	} else if !c.pollHackEntryKnown {
-		return false
+		return false, nil
 	} else if forget, ok := op.(*fuseops.BatchForgetOp); ok {
 		forget.Entries = slices.DeleteFunc(forget.Entries, func(e fuseops.BatchForgetEntry) bool {
 			return e.Inode == pollHackInode
 		})
 		if len(forget.Entries) > 0 {
-			return false
+			return false, nil
 		}
 	} else if fuseops.InodeID(inMsg.Header().Nodeid) != pollHackInode {
-		return false
+		return false, nil
 	}
 
 	defer func() {
@@ -80,7 +81,10 @@ func (c *Connection) answerPollHack(
 	unique := inMsg.Header().Unique
 	opErr := pollHackReply(op)
 	if c.kernelResponse(outMsg, unique, op, opErr) {
-		return true
+		return true, nil
+	}
+	if err := c.checkNotInFlight(unique); err != nil {
+		return true, err
 	}
 	if c.debugLogger != nil {
 		c.debugLog(unique, 1, "-> poll hack: %v", opErr)
@@ -90,7 +94,7 @@ func (c *Connection) answerPollHack(
 	if err != nil && !errors.Is(err, syscall.ENOENT) && c.errorLogger != nil {
 		c.errorLogger.Printf("writeMessage: %v %v", err, outMsg.OutHeaderBytes())
 	}
-	return true
+	return true, nil
 }
 
 // pollHackReply fills in op's response for the poll hack's entry, a reserved

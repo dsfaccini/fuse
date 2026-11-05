@@ -190,3 +190,20 @@ func TestPollHackDropsEntryFromBatchForget(t *testing.T) {
 		t.Errorf("entries = %v, want %v", forget.Entries, want)
 	}
 }
+
+func TestPollHackRequestUnderInFlightIDIsFatal(t *testing.T) {
+	c, k := newPollHackConnection(t)
+	k.Send(nodeRequest(fusekernel.OpGetattr, 7, fuseops.RootInodeID)...)
+	k.Send(nodeRequest(fusekernel.OpLookup, 7, fuseops.RootInodeID, []byte(pollHackName+"\x00"))...)
+	c.pollHackRunning.Store(true)
+
+	if _, _, err := c.ReadOp(); err != nil {
+		t.Fatalf("ReadOp: %v", err)
+	}
+	if _, _, err := c.ReadOp(); err == nil {
+		t.Error("ReadOp answered a poll hack request under the ID of a request in flight")
+	}
+	if n := k.UnreadReplies(); n != 0 {
+		t.Errorf("replies = %d, want 0", n)
+	}
+}
