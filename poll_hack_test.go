@@ -16,6 +16,8 @@ package fuse
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	"reflect"
 	"syscall"
 	"testing"
@@ -200,8 +202,8 @@ func TestPollHackRequestUnderInFlightIDIsFatal(t *testing.T) {
 	if _, _, err := c.ReadOp(); err != nil {
 		t.Fatalf("ReadOp: %v", err)
 	}
-	if _, _, err := c.ReadOp(); err == nil {
-		t.Error("ReadOp answered a poll hack request under the ID of a request in flight")
+	if _, _, err := c.ReadOp(); err == nil || errors.Is(err, io.EOF) {
+		t.Errorf("ReadOp = %v, want a fatal error", err)
 	}
 	if n := k.UnreadReplies(); n != 0 {
 		t.Errorf("replies = %d, want 0", n)
