@@ -71,6 +71,9 @@ func (m *InMessage) ReadSingle(r io.Reader) (int, error) {
 	}
 
 	l := m.Header().Len
+	if l < 4 || uint64(l) > uint64(len(m.storage)) {
+		return 0, fmt.Errorf("Header says %d bytes, but the buffer holds %d", l, len(m.storage))
+	}
 	// read remaining request
 	if n, err := io.ReadFull(r, m.storage[4:l]); err != nil {
 		return n, err

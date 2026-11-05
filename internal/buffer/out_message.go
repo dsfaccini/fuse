@@ -49,8 +49,12 @@ func (m *OutMessage) OutHeader() *fusekernel.OutHeader {
 }
 
 // Grow adds a new buffer of <n> bytes to the message, returning a pointer to
-// the start of the new segment, which is guaranteed to be zeroed.
+// the start of the new segment, which is guaranteed to be zeroed. Grow(0)
+// adds nothing and returns nil.
 func (m *OutMessage) Grow(n int) unsafe.Pointer {
+	if n == 0 {
+		return nil
+	}
 	b := make([]byte, n)
 	m.Append(b)
 	p := unsafe.Pointer(&b[0])

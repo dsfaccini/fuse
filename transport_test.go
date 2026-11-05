@@ -35,10 +35,17 @@ type testTransport struct {
 	reads    int
 	writes   [][]byte
 	writeErr error
+
+	// readErr is the error a read returns once messages run out. Nil means
+	// io.EOF.
+	readErr error
 }
 
 func (t *testTransport) ReadMessage(dst []byte) (int, error) {
 	if t.reads == len(t.messages) {
+		if t.readErr != nil {
+			return 0, t.readErr
+		}
 		return 0, io.EOF
 	}
 	message := t.messages[t.reads]

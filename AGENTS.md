@@ -29,6 +29,8 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
+  It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
   `protocol_test.go`. Each case runs over a fake kernel transport on every OS,
   and through `Mount` and the fake MFMount on darwin.
@@ -47,11 +49,19 @@ Run these locally, in this order. None of them mounts.
    analyzers report findings older than the fork.
 4. `go test ./...`. Add `-race` when the change touches concurrency.
 
+When you change `convertInMessage`, also run
+`go test -run '^$' -fuzz FuzzConvertInMessage -fuzztime 60s .`. Fix each
+crash it finds. Keep the input file it writes under
+`testdata/fuzz/FuzzConvertInMessage/`: `go test` replays that corpus.
+
 CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 `master`:
 
 - `gofmt`.
 - `linux` and `macos`: build, vet and `go test -race -count=1 ./...`.
+- `linux` also runs `GOARCH=386 go test -count=1 ./...`. A 32-bit `int` catches
+  wire lengths that overflow it. Go has no darwin/386 port. On a Mac, leave
+  that step to CI.
 - `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
   That test loads the installed MFMount framework. It fails when
   `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
