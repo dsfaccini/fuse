@@ -67,6 +67,10 @@ type Connection struct {
 	errorLogger *log.Logger
 	wireLogger  io.Writer
 
+	// Serializes writes to wireLogger, which Reply makes from each op's
+	// goroutine.
+	wireLoggerMu sync.Mutex
+
 	// The kernel-facing transport and the protocol version used with it.
 	transport connectionTransport
 	protocol  fusekernel.Protocol
@@ -91,6 +95,13 @@ type Connection struct {
 
 	// Size of the buffer to allocate for each InMessage.
 	inMessageBufSize int
+
+	// pollHackRunning is true while Mount runs the poll hack. See poll_hack.go.
+	pollHackRunning atomic.Bool
+
+	// pollHackEntryKnown is true once the kernel has looked up the poll hack's
+	// entry. Only ReadOp touches it.
+	pollHackEntryKnown bool
 }
 
 // State that is maintained for each in-flight op. This is stuffed into the
@@ -440,6 +451,10 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 		//
 		//  *  ENODEV means fuse has hung up.
 		//
+		//  *  On Linux, ECONNABORTED does too. fuse_dev_do_read returns it
+		//     instead of ENODEV when a read races the connection's abort, as
+		//     an unmount does (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dev.c#L1627-L1629).
+		//
 		//  *  EINTR means we should try again. (This seems to happen often on
 		//     OS X, cf. http://golang.org/issue/11180)
 		//
@@ -447,6 +462,11 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 			switch pe.Err {
 			case syscall.ENODEV:
 				err = io.EOF
+
+			case syscall.ECONNABORTED:
+				if runtime.GOOS == "linux" {
+					err = io.EOF
+				}
 
 			case syscall.EINTR:
 				err = nil
@@ -483,6 +503,8 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 // ReadOp consumes the next op from the kernel process, returning the op and a
 // context that should be used for work related to the op. It returns io.EOF if
 // the kernel has closed the connection.
+//
+// ReadOp answers the poll hack's requests itself and reads on. See Mount.
 //
 // When a request's body fails to decode, ReadOp answers the request itself and
 // reads on. The answer is EINVAL for a reply size above the cap, and EIO
@@ -553,6 +575,15 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 			continue
 		}
 
+		// Special case: answer the poll hack's requests inline.
+		answered, err := c.answerPollHack(inMsg, outMsg, op)
+		if err != nil {
+			return nil, nil, c.recordFatal(err)
+		}
+		if answered {
+			continue
+		}
+
 		// Set up a context that remembers information about this op.
 		ctx, err := c.beginOp(inMsg.Header().Opcode, inMsg.Header().Unique)
 		if err != nil {
@@ -598,12 +629,8 @@ func (c *Connection) rejectMessage(
 		return nil
 	}
 
-	// A reply would answer the request in flight under this ID.
-	c.mu.Lock()
-	_, inFlight := c.cancelFuncs[h.Unique]
-	c.mu.Unlock()
-	if inFlight {
-		return fmt.Errorf("Already have cancel func for request %v", h.Unique)
+	if err := c.checkNotInFlight(h.Unique); err != nil {
+		return err
 	}
 
 	c.kernelResponse(outMsg, h.Unique, nil, err)
@@ -611,6 +638,20 @@ func (c *Connection) rejectMessage(
 	// See Reply for why ENOENT is benign.
 	if writeErr != nil && !errors.Is(writeErr, syscall.ENOENT) && c.errorLogger != nil {
 		c.errorLogger.Printf("writeMessage: %v %v", writeErr, outMsg.OutHeaderBytes())
+	}
+	return nil
+}
+
+// checkNotInFlight returns an error when the request with ID fuseID is in
+// flight, because a reply under that ID would answer it.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) checkNotInFlight(fuseID uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.cancelFuncs[fuseID]; ok {
+		return fmt.Errorf("Already have cancel func for request %v", fuseID)
 	}
 	return nil
 }
@@ -744,7 +785,9 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	if c.wireLogger != nil {
 		entry, err := formatWireLogEntry(op, opErr, state.wlog)
 		if err == nil {
+			c.wireLoggerMu.Lock()
 			c.wireLogger.Write(entry)
+			c.wireLoggerMu.Unlock()
 		}
 	}
 

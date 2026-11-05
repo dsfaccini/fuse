@@ -304,6 +304,11 @@ func (t *MemFSTest) Mkdir_IntermediateIsNonExistent() {
 }
 
 func (t *MemFSTest) Mkdir_PermissionDenied() {
+	// Root bypasses the permission check.
+	if os.Geteuid() == 0 {
+		return
+	}
+
 	var err error
 
 	// Create a directory within the root without write permissions.
