@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"os"
 	"path"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -40,20 +39,7 @@ type WireLogTest struct {
 	ctx context.Context
 	dir string
 	mfs *fuse.MountedFileSystem
-	buf lockedBuffer
-}
-
-// lockedBuffer serializes writes to a bytes.Buffer. Reply writes each op's wire
-// log entry from the goroutine that serves the op.
-type lockedBuffer struct {
-	mu  sync.Mutex
 	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
 }
 
 func init() { RegisterTestSuite(&WireLogTest{}) }
@@ -114,7 +100,7 @@ func (t *WireLogTest) RunWorkloadAndCheckLogs() {
 
 	// Parse the logs.
 	ops := make(map[string][]fuse.WireLogRecord)
-	decoder := json.NewDecoder(&t.buf.buf)
+	decoder := json.NewDecoder(&t.buf)
 
 	for decoder.More() {
 		var entry fuse.WireLogRecord

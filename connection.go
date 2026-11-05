@@ -67,6 +67,10 @@ type Connection struct {
 	errorLogger *log.Logger
 	wireLogger  io.Writer
 
+	// Serializes writes to wireLogger, which Reply makes from each op's
+	// goroutine.
+	wireLoggerMu sync.Mutex
+
 	// The kernel-facing transport and the protocol version used with it.
 	transport connectionTransport
 	protocol  fusekernel.Protocol
@@ -447,6 +451,10 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 		//
 		//  *  ENODEV means fuse has hung up.
 		//
+		//  *  On Linux, ECONNABORTED does too. fuse_dev_do_read returns it
+		//     instead of ENODEV when a read races the connection's abort, as
+		//     an unmount does (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dev.c#L1627-L1629).
+		//
 		//  *  EINTR means we should try again. (This seems to happen often on
 		//     OS X, cf. http://golang.org/issue/11180)
 		//
@@ -454,6 +462,11 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 			switch pe.Err {
 			case syscall.ENODEV:
 				err = io.EOF
+
+			case syscall.ECONNABORTED:
+				if runtime.GOOS == "linux" {
+					err = io.EOF
+				}
 
 			case syscall.EINTR:
 				err = nil
@@ -770,7 +783,9 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	if c.wireLogger != nil {
 		entry, err := formatWireLogEntry(op, opErr, state.wlog)
 		if err == nil {
+			c.wireLoggerMu.Lock()
 			c.wireLogger.Write(entry)
+			c.wireLoggerMu.Unlock()
 		}
 	}
 

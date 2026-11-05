@@ -57,7 +57,7 @@ type MountConfig struct {
 	DebugLogger *log.Logger
 
 	// A logger to use for logging fuse wire requests. If nil, no wire logging is
-	// performed.
+	// performed. The library serializes its writes to it.
 	WireLogger io.Writer
 
 	// Linux only. OS X always behaves as if writeback caching is disabled.
