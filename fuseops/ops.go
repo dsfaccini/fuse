@@ -280,6 +280,8 @@ type MkDirOp struct {
 	Parent InodeID
 
 	// The name of the child to create, and the mode with which to create it.
+	// Mode is os.ModeDir plus the permission and special bits, whether or not
+	// the kernel sent the directory type bit.
 	Name string
 	Mode os.FileMode
 
