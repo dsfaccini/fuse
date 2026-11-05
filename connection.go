@@ -671,7 +671,15 @@ func (c *Connection) shouldLogError(
 	}
 
 	// Judge the errno that kernelResponse sends, not any errno in the chain.
+	// MountConfig.ErrorLogger lists the errnos skipped here.
 	errno, _ := operror.Errno(err)
+
+	switch errno {
+	case syscall.ENOSYS, syscall.EINTR:
+		// ENOSYS means the file system does not implement the op. EINTR follows
+		// the kernel's interrupt.
+		return false
+	}
 
 	switch op.(type) {
 	case *fuseops.LookUpInodeOp:
@@ -681,13 +689,12 @@ func (c *Connection) shouldLogError(
 		if errno == syscall.ENOENT {
 			return false
 		}
-	case *fuseops.GetXattrOp, *fuseops.ListXattrOp:
-		if errno == syscall.ENOSYS || errno == syscall.ENODATA || errno == syscall.ERANGE {
+	case *fuseops.RmDirOp, *fuseops.RenameOp:
+		if errno == syscall.ENOTEMPTY {
 			return false
 		}
-	case *unknownOp:
-		// Don't bother the user with methods we intentionally don't support.
-		if errno == syscall.ENOSYS {
+	case *fuseops.GetXattrOp, *fuseops.ListXattrOp:
+		if errno == syscall.ENODATA || errno == syscall.ERANGE {
 			return false
 		}
 	}
