@@ -852,11 +852,12 @@ func (w *overlapWriter) Write(p []byte) (int, error) {
 
 func TestReplySerializesWireLogWrites(t *testing.T) {
 	const n = 16
-	var messages [][]byte
+	// fakeKernel, unlike testTransport, takes replies from many goroutines.
+	k := newFakeKernel()
 	for i := range n {
-		messages = append(messages, testMessage(fusekernel.OpGetattr, uint64(10+i)))
+		k.Send(testMessage(fusekernel.OpGetattr, uint64(10+i)))
 	}
-	c := newTestConnection(&testTransport{messages: messages})
+	c := newTestConnection(k)
 	w := &overlapWriter{}
 	c.wireLogger = w
 
