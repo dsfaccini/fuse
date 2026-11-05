@@ -754,15 +754,20 @@ func TestReadOpRejectWriteErrorIsNotFatal(t *testing.T) {
 	}
 }
 
-// Neither kernel bounds xattr replies by max_pages.
-func TestReadOpCapsXattrAtFloor(t *testing.T) {
+// The cap follows MaxPages, with per-OS floors for requests whose size the
+// kernel does not bound by max_pages.
+func TestReadOpCapFloors(t *testing.T) {
 	pageSize := uint32(buffer.GetPageSize())
 	// Linux's XATTR_SIZE_MAX, or the osxfuse kext's FUSE_REASONABLE_XATTRSIZE.
-	floor := uint32(64 << 10)
+	xattrFloor := uint32(64 << 10)
+	// The osxfuse kext asks for directory reads up to the mount's iosize.
+	dirFloor := uint32(0)
 	if runtime.GOOS == "darwin" {
-		floor = 128 << 10
+		xattrFloor = 128 << 10
+		dirFloor = buffer.MaxWriteSize
 	}
-	limit := max(pageSize, floor)
+	xattrLimit := max(pageSize, xattrFloor)
+	dirLimit := max(pageSize, dirFloor)
 	readdir := func(size uint32) []byte {
 		in := fusekernel.ReadIn{Size: size}
 		return structBytes(&in)
@@ -782,12 +787,14 @@ func TestReadOpCapsXattrAtFloor(t *testing.T) {
 		body    []byte
 		wantErr bool
 	}{
-		{"readdir of one page", fusekernel.OpReaddir, readdir(pageSize), false},
-		{"readdir above one page", fusekernel.OpReaddir, readdir(pageSize + 1), true},
-		{"getxattr at the cap", fusekernel.OpGetxattr, getxattr(limit), false},
-		{"getxattr above the cap", fusekernel.OpGetxattr, getxattr(limit + 1), true},
-		{"listxattr at the cap", fusekernel.OpListxattr, listxattr(limit), false},
-		{"listxattr above the cap", fusekernel.OpListxattr, listxattr(limit + 1), true},
+		{"readdir at the cap", fusekernel.OpReaddir, readdir(dirLimit), false},
+		{"readdir above the cap", fusekernel.OpReaddir, readdir(dirLimit + 1), true},
+		{"readdirplus at the cap", fusekernel.OpReaddirplus, readdir(dirLimit), false},
+		{"readdirplus above the cap", fusekernel.OpReaddirplus, readdir(dirLimit + 1), true},
+		{"getxattr at the cap", fusekernel.OpGetxattr, getxattr(xattrLimit), false},
+		{"getxattr above the cap", fusekernel.OpGetxattr, getxattr(xattrLimit + 1), true},
+		{"listxattr at the cap", fusekernel.OpListxattr, listxattr(xattrLimit), false},
+		{"listxattr above the cap", fusekernel.OpListxattr, listxattr(xattrLimit + 1), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

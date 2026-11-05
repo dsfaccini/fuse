@@ -423,7 +423,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(outMsg, in.Size, maxReplySize(config)); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), readdirCapFloor())); err != nil {
 			return nil, err
 		}
 
@@ -447,7 +447,7 @@ func convertInMessage(
 		}
 		o = to
 
-		if to.Dst, err = growDst(outMsg, in.Size, maxReplySize(config)); err != nil {
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), readdirCapFloor())); err != nil {
 			return nil, err
 		}
 
@@ -741,6 +741,16 @@ func convertInMessage(
 	}
 
 	return o, nil
+}
+
+// readdirCapFloor returns the least cap on a READDIR or READDIRPLUS reply
+// size. The osxfuse kext asks for the caller's buffer size, up to the iosize
+// the mount passes, which is buffer.MaxWriteSize whatever MaxPages is.
+func readdirCapFloor() uint64 {
+	if runtime.GOOS == "darwin" {
+		return buffer.MaxWriteSize
+	}
+	return 0
 }
 
 // xattrCapFloor returns the least cap on a GETXATTR or LISTXATTR reply size.

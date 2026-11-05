@@ -292,9 +292,12 @@ type MountConfig struct {
 	// Reply cap: a READDIR, READDIRPLUS, GETXATTR or LISTXATTR request that
 	// asks for a reply larger than MaxPages * PageSize gets EINVAL. For
 	// GETXATTR and LISTXATTR the cap is at least 64 KiB, or 128 KiB on darwin.
-	// On darwin the kernel extension asks for the size of the caller's buffer,
-	// so a GETXATTR or LISTXATTR through a buffer larger than the cap gets
-	// EINVAL. Raise MaxPages to serve larger buffers.
+	//
+	// On darwin the kernel extension asks for the size of the caller's buffer.
+	// It clamps READDIR and READDIRPLUS to the iosize the mount passes, 1 MiB,
+	// and their cap is at least that. It does not clamp GETXATTR or LISTXATTR,
+	// so one through a buffer larger than the cap gets EINVAL. Raise MaxPages
+	// to serve larger xattr buffers.
 	MaxPages uint16
 
 	// If set, this specifies the maximum size in bytes of a write request

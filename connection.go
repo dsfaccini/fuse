@@ -486,8 +486,9 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 //
 // When a request's body fails to decode, ReadOp answers the request itself and
 // reads on. The answer is EINVAL for a reply size above the cap, and EIO
-// otherwise. The cap is MaxPages pages, and for xattrs at least 64 KiB, or 128
-// KiB on darwin.
+// otherwise. The cap is MaxPages pages. For xattrs it is at least 64 KiB, or
+// 128 KiB on darwin. On darwin, for directory reads it is at least the iosize
+// the mount passes.
 //
 // Any other error is fatal to the connection, and ReadOp returns it from then
 // on. Fatal errors are a failed read, a malformed message, a request ID
