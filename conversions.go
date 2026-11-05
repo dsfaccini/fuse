@@ -185,13 +185,12 @@ func convertInMessage(
 			Parent: fuseops.InodeID(inMsg.Header().Nodeid),
 			Name:   string(name),
 
-			// On Linux, vfs_mkdir calls through to the inode with at most
-			// permissions and sticky bits set (https://tinyurl.com/3djx8498), and
-			// fuse passes that on directly (https://tinyurl.com/exezw647). In other
-			// words, the fact that this is a directory is implicit in the fact that
-			// the opcode is mkdir. But we want the correct mode to go through, so
-			// ensure that os.ModeDir is set.
-			Mode: ConvertFileMode(in.Mode) | os.ModeDir,
+			// Linux strips S_IFDIR from the mode (fuse_mkdir in
+			// https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dir.c),
+			// and ConvertFileMode reads a mode without type bits as a device.
+			// The opcode already says this is a directory, so replace the type
+			// bits.
+			Mode: ConvertFileMode(in.Mode&^syscall.S_IFMT | syscall.S_IFDIR),
 			OpContext: fuseops.OpContext{
 				FuseID: inMsg.Header().Unique,
 				Pid:    inMsg.Header().Pid,
