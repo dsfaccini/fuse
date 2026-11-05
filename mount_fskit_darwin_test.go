@@ -324,7 +324,32 @@ func TestFSKitAPILoaderRetriesAFailedLoad(t *testing.T) {
 	}
 }
 
-// Sends reuse pooled iovecs, so concurrent sends must not mix.
+// A warm transport reuses a finished send's iovecs instead of allocating.
+func TestFSKitTransportReusesSendIovecs(t *testing.T) {
+	f := newFakeMFMount(t)
+	tr := f.transport(t)
+	parts := [][]byte{[]byte("header"), []byte("payload")}
+	send := func() *syscall.Iovec {
+		t.Helper()
+		if err := tr.SendMessage(parts); err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+		f.kernel.NextReply(t)
+		select {
+		case vectors := <-tr.vectors:
+			tr.vectors <- vectors
+			return &vectors[:1][0]
+		default:
+			t.Fatal("the transport kept no iovecs after a send")
+			return nil
+		}
+	}
+	if first, second := send(), send(); first != second {
+		t.Error("the second send allocated new iovecs")
+	}
+}
+
+// Sends reuse iovecs, so concurrent sends must not mix.
 func TestFSKitTransportSendsConcurrently(t *testing.T) {
 	f := newFakeMFMount(t)
 	tr := f.transport(t)

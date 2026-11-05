@@ -79,9 +79,9 @@ func cacheFSKitAPI(load func(string) (*fskitAPI, error)) func() (*fskitAPI, erro
 	}
 }
 
-// sendVectors holds the iovec slices that sends fill, so that a send does not
-// allocate one.
-var sendVectors = sync.Pool{New: func() any { return new([]syscall.Iovec) }}
+// fskitSendVectors is how many finished sends' iovec slices a transport keeps
+// for reuse. A send that finds none kept allocates one.
+const fskitSendVectors = 16
 
 func loadFSKitAPI(path string) (*fskitAPI, error) {
 	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -110,7 +110,12 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 }
 
 type fskitTransport struct {
-	api            *fskitAPI
+	api *fskitAPI
+
+	// vectors holds iovec slices that sends have finished with, so that a warm
+	// transport sends without allocating and without a lock across the send.
+	vectors chan []syscall.Iovec
+
 	mu             sync.Mutex
 	channel        uintptr
 	closed         bool
@@ -176,6 +181,7 @@ func mountFSKitTransport(
 func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
 	return &fskitTransport{
 		api:     api,
+		vectors: make(chan []syscall.Iovec, fskitSendVectors),
 		channel: channel,
 		closeNative: func() error {
 			closed, _, errno := purego.SyscallN(api.channelClose, channel)
@@ -309,13 +315,18 @@ func (t *fskitTransport) SendMessage(parts [][]byte) error {
 	}
 
 	var total int
-	pooled := sendVectors.Get().(*[]syscall.Iovec)
-	vectors := (*pooled)[:0]
+	var vectors []syscall.Iovec
+	select {
+	case vectors = <-t.vectors:
+	default:
+	}
 	defer func() {
 		// Drop the references to parts before the slice is reused.
 		clear(vectors)
-		*pooled = vectors[:0]
-		sendVectors.Put(pooled)
+		select {
+		case t.vectors <- vectors[:0]:
+		default:
+		}
 	}()
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
