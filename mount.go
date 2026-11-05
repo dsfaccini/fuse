@@ -42,7 +42,19 @@ type Server interface {
 // On Linux, Mount answers the mount's first FUSE_POLL before it returns, so
 // the process can open files in its own mount through package os without
 // deadlocking. It reserves inode ID math.MaxUint64 for that: requests for it
-// never reach the server.
+// never reach the server. There are two exceptions:
+//
+//   - A /dev/fd/N mount point skips the hack. The process can then deadlock on
+//     its own mount, and inode ID math.MaxUint64 stays the file system's.
+//   - When the hack fails, Mount still returns the mount, and logs the error to
+//     MountConfig.ErrorLogger, or nowhere when that is nil. Opening the mount
+//     through package os can then deadlock.
+//
+// The hack checks permissions on the root. Unless
+// MountConfig.DisableDefaultPermissions is set, that sends the server a
+// GetInodeAttributes for the root, and Mount returns only after the server
+// answers it. The server must not make that answer wait on anything that
+// happens after Mount returns.
 func Mount(
 	dir string,
 	server Server,

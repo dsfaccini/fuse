@@ -83,6 +83,12 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - The connection answers that entry's requests: its lookup while `Mount` runs
   the hack, then every request for inode `math.MaxUint64`. A server never
   reads them, and the wire log never records them.
+- A `/dev/fd/N` mount point skips the hack, so the deadlock and inode
+  `math.MaxUint64` stay the file system's. A failed hack is only logged to
+  `MountConfig.ErrorLogger`, and to nowhere when that is nil.
+- Unless `MountConfig.DisableDefaultPermissions` is set, `Mount` returns only
+  after the server answers a GETATTR for the root. A test server that blocks
+  that answer hangs `Mount`.
 
 ## Find an op error's errno with `operror.Errno`
 

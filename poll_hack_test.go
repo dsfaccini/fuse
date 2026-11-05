@@ -24,6 +24,7 @@ import (
 	"unsafe"
 
 	"github.com/dsfaccini/fuse/fuseops"
+	"github.com/dsfaccini/fuse/internal/buffer"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
@@ -60,6 +61,9 @@ func batchForget(unique uint64, inodes ...uint64) [][]byte {
 	return nodeRequest(fusekernel.OpBatchForget, unique, 0, body)
 }
 
+// The hack's RELEASE and FORGET can arrive after Mount has returned: Linux
+// sends RELEASE in the background
+// (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/file.c#L396).
 func TestPollHackAnswersReservedEntry(t *testing.T) {
 	hack := uint64(pollHackInode)
 	var open fusekernel.OpenIn
@@ -67,7 +71,7 @@ func TestPollHackAnswersReservedEntry(t *testing.T) {
 	var flush fusekernel.FlushIn
 	var release fusekernel.ReleaseIn
 	var forget fusekernel.ForgetIn
-	requests := [][][]byte{
+	duringHack := [][][]byte{
 		nodeRequest(fusekernel.OpLookup, 1, fuseops.RootInodeID, []byte(pollHackName+"\x00")),
 		nodeRequest(fusekernel.OpGetattr, 2, hack),
 		nodeRequest(fusekernel.OpOpen, 3, hack, NativeBytes(&open)),
@@ -75,30 +79,43 @@ func TestPollHackAnswersReservedEntry(t *testing.T) {
 		nodeRequest(fusekernel.OpGetxattr, 5, hack, NativeBytes(&getxattr), []byte("user.x\x00")),
 		nodeRequest(fusekernel.OpAccess, 6, hack),
 		nodeRequest(fusekernel.OpFlush, 7, hack, NativeBytes(&flush)),
-		nodeRequest(fusekernel.OpRelease, 8, hack, NativeBytes(&release)),
-		nodeRequest(fusekernel.OpForget, 9, hack, NativeBytes(&forget)),
-		batchForget(10, hack),
-		nodeRequest(fusekernel.OpGetattr, 11, fuseops.RootInodeID),
+		nodeRequest(fusekernel.OpGetattr, 8, fuseops.RootInodeID),
+	}
+	afterHack := [][][]byte{
+		nodeRequest(fusekernel.OpRelease, 9, hack, NativeBytes(&release)),
+		nodeRequest(fusekernel.OpGetattr, 10, hack),
+		nodeRequest(fusekernel.OpForget, 11, hack, NativeBytes(&forget)),
+		batchForget(12, hack),
+		nodeRequest(fusekernel.OpGetattr, 13, fuseops.RootInodeID),
 	}
 	c, k := newPollHackConnection(t)
-	for _, r := range requests {
+	readRootGetattr := func(unique uint64) {
+		t.Helper()
+		_, op, err := c.ReadOp()
+		if err != nil {
+			t.Fatalf("ReadOp: %v", err)
+		}
+		if got, ok := op.(*fuseops.GetInodeAttributesOp); !ok || got.Inode != fuseops.RootInodeID || got.OpContext.FuseID != unique {
+			t.Fatalf("ReadOp = %#v, want the root's GetInodeAttributesOp %d", op, unique)
+		}
+	}
+
+	c.pollHackRunning.Store(true)
+	for _, r := range duringHack {
 		k.Send(r...)
 	}
-	c.pollHackRunning.Store(true)
-
-	_, op, err := c.ReadOp()
-	if err != nil {
-		t.Fatalf("ReadOp: %v", err)
+	readRootGetattr(8)
+	c.pollHackRunning.Store(false)
+	for _, r := range afterHack {
+		k.Send(r...)
 	}
-	if got, ok := op.(*fuseops.GetInodeAttributesOp); !ok || got.Inode != fuseops.RootInodeID {
-		t.Fatalf("ReadOp = %#v, want the root's GetInodeAttributesOp", op)
-	}
+	readRootGetattr(13)
 
 	// FORGET and BATCH_FORGET get no reply.
 	want := []struct {
 		unique uint64
 		errno  syscall.Errno
-	}{{1, 0}, {2, 0}, {3, 0}, {4, syscall.ENOSYS}, {5, syscall.ENODATA}, {6, syscall.EIO}, {7, 0}, {8, 0}}
+	}{{1, 0}, {2, 0}, {3, 0}, {4, syscall.ENOSYS}, {5, syscall.ENODATA}, {6, syscall.EIO}, {7, 0}, {9, 0}, {10, 0}}
 	if n := k.UnreadReplies(); n != len(want) {
 		t.Fatalf("replies = %d, want %d", n, len(want))
 	}
@@ -120,19 +137,40 @@ func TestPollHackAnswersReservedEntry(t *testing.T) {
 	}
 }
 
+func TestPollHackRecyclesMessages(t *testing.T) {
+	c := newTestConnection(&testTransport{messages: [][]byte{
+		nodeRequest(fusekernel.OpPoll, 5, uint64(pollHackInode))[0],
+	}})
+	c.pollHackEntryKnown = true
+	inMsg := buffer.NewInMessage(c.inMessageBufSize)
+	c.putInMessage(inMsg)
+	outMsg := new(buffer.OutMessage)
+	c.putOutMessage(outMsg)
+
+	if _, _, err := c.ReadOp(); err != io.EOF {
+		t.Fatalf("ReadOp = %v, want io.EOF", err)
+	}
+	in, out := drainFreelists(c)
+	if len(in) != 1 || in[0] != inMsg || len(out) != 1 || out[0] != outMsg {
+		t.Errorf("freelists hold %d in and %d out messages, want the poll request's two", len(in), len(out))
+	}
+}
+
 func TestPollHackLeavesOtherRequestsToServer(t *testing.T) {
 	hack := uint64(pollHackInode)
 	name := []byte(pollHackName + "\x00")
 	for _, test := range []struct {
-		name    string
-		running bool
-		request [][]byte
-		want    interface{}
+		name       string
+		running    bool
+		entryKnown bool
+		request    [][]byte
+		want       interface{}
 	}{
 		{
-			name:    "lookup after the hack",
-			request: nodeRequest(fusekernel.OpLookup, 1, fuseops.RootInodeID, name),
-			want:    &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: pollHackName},
+			name:       "lookup after the hack",
+			entryKnown: true,
+			request:    nodeRequest(fusekernel.OpLookup, 1, fuseops.RootInodeID, name),
+			want:       &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: pollHackName},
 		},
 		{
 			name:    "lookup outside the root",
@@ -150,6 +188,7 @@ func TestPollHackLeavesOtherRequestsToServer(t *testing.T) {
 			c, k := newPollHackConnection(t)
 			k.Send(test.request...)
 			c.pollHackRunning.Store(test.running)
+			c.pollHackEntryKnown = test.entryKnown
 
 			_, op, err := c.ReadOp()
 			if err != nil {

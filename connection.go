@@ -504,6 +504,8 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 // context that should be used for work related to the op. It returns io.EOF if
 // the kernel has closed the connection.
 //
+// ReadOp answers the poll hack's requests itself and reads on. See Mount.
+//
 // When a request's body fails to decode, ReadOp answers the request itself and
 // reads on. The answer is EINVAL for a reply size above the cap, and EIO
 // otherwise. The cap is MaxPages pages. For xattrs it is at least 64 KiB, or
