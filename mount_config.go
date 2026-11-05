@@ -267,7 +267,8 @@ type MountConfig struct {
 	// that data will be used for a vectored read, irrespective of this flag's value.
 	UseVectoredRead bool
 
-	// Linux only.
+	// The kernel limit applies on Linux only. The reply cap below applies on
+	// every OS.
 	//
 	// If set, this specifies the maximum number of hardware pages that the
 	// FUSE message payload can use. This will be passed to the kernel during the
@@ -287,6 +288,13 @@ type MountConfig struct {
 	//
 	// If MaxPages is set but MaxWrite is unset, MaxWrite will be limited based
 	// on MaxPages (i.e., MaxPages * PageSize).
+	//
+	// Reply cap: a READDIR, READDIRPLUS, GETXATTR or LISTXATTR request that
+	// asks for a reply larger than MaxPages * PageSize gets EINVAL. For
+	// GETXATTR and LISTXATTR the cap is at least 64 KiB, or 128 KiB on darwin.
+	// On darwin the kernel extension asks for the size of the caller's buffer,
+	// so a GETXATTR or LISTXATTR through a buffer larger than the cap gets
+	// EINVAL. Raise MaxPages to serve larger buffers.
 	MaxPages uint16
 
 	// If set, this specifies the maximum size in bytes of a write request
