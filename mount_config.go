@@ -141,8 +141,8 @@ type MountConfig struct {
 	// the value of ChildInodeEntry.EntryExpiration is ignored by the kernel, and
 	// entries will be cached for an arbitrarily long time.
 	//
-	// The FSKit and FUSE-T backends never receive novncache, so this field has
-	// no effect there.
+	// The FSKit backend never receives novncache, so this field has no effect
+	// there.
 	EnableVnodeCaching bool
 
 	// OS X only.
@@ -153,8 +153,8 @@ type MountConfig struct {
 	// file system serves them.
 	//
 	// This field omits noappledouble, so those files stay visible and Finder may
-	// create them. The FSKit and FUSE-T backends never receive noappledouble,
-	// so this field has no effect there.
+	// create them. The FSKit backend never receives noappledouble, so this
+	// field has no effect there.
 	EnableAppleDouble bool
 
 	// Linux only.
@@ -192,10 +192,8 @@ type MountConfig struct {
 	// is used.
 	VolumeName string
 
-	// OS X only.
-	//
-	// The FUSE implementation to use. One of FUSEImplFuseT (default) or
-	// FUSEImplMacFUSE.
+	// Deprecated: Mount ignores FuseImpl. On OS X it mounts through macFUSE,
+	// with the kernel extension unless Options["backend"] is "fskit".
 	FuseImpl FUSEImpl
 
 	// Additional key=value options to pass unadulterated to the underlying mount
@@ -312,10 +310,15 @@ type MountConfig struct {
 	MaxWrite uint32
 }
 
+// FUSEImpl named the OS X FUSE implementation to mount through.
+//
+// Deprecated: Mount ignores MountConfig.FuseImpl and mounts through macFUSE.
 type FUSEImpl uint8
 
 const (
-	FUSEImplFuseT = iota
+	// Deprecated: FUSE-T is not supported. Mount uses macFUSE.
+	FUSEImplFuseT FUSEImpl = iota
+	// Deprecated: macFUSE is the only OS X implementation.
 	FUSEImplMacFUSE
 )
 

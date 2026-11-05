@@ -406,7 +406,6 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 		FSName:                  probeDirPrefix + name,
 		Subtype:                 "fskit-probe",
 		DisableWritebackCaching: true,
-		FuseImpl:                FUSEImplMacFUSE,
 		Options:                 map[string]string{"backend": "fskit"},
 	}
 	if configure != nil {
@@ -467,7 +466,6 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 		return err
 	}
 
-	fusekernel.IsPlatformFuseT = false
 	ready := make(chan error, 1)
 	transport, err := mountFSKitTransport(m.dir, &cfg, ready)
 	if err != nil {
@@ -1820,7 +1818,7 @@ func (pt *probeTransport) ReadMessage(p []byte) (int, error) {
 			reply = writeReply(unique, written)
 		}
 		pt.log.add(probeEvent{op: "OVERSIZE", name: pt.log.names[binary.NativeEndian.Uint64(msg[16:24])], size: size})
-		if err := pt.WriteMessage(reply); err != nil {
+		if err := pt.SendMessage([][]byte{reply}); err != nil {
 			return 0, err
 		}
 	}
@@ -1855,18 +1853,14 @@ func (pt *probeTransport) inspect(msg []byte, replyCapacity int64) {
 	}
 }
 
-func (pt *probeTransport) WriteMessage(msg []byte) error {
-	return pt.WritevMessage([][]byte{msg})
-}
-
-func (pt *probeTransport) WritevMessage(parts [][]byte) error {
+func (pt *probeTransport) SendMessage(parts [][]byte) error {
 	pt.replied.Store(true)
 	var header []byte
 	for _, part := range parts {
 		header = append(header, part[:min(len(part), buffer.OutMessageHeaderSize-len(header))]...)
 	}
 	at := time.Now()
-	if err := pt.native.WritevMessage(parts); err != nil {
+	if err := pt.native.SendMessage(parts); err != nil {
 		return err
 	}
 	pt.rec.frame(frameFromServer, at, parts...)

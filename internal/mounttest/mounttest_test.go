@@ -331,6 +331,7 @@ var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
 	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
 	"TestMountRejectsInvalidConfigBeforeMounting": "config validation fails",
+	"TestMountUsesMacFUSEForEveryFuseImpl":        "the macFUSE mount helper is missing",
 }
 
 // fakeMounts call Mount through the fake MFMount, which mounts nothing. Each

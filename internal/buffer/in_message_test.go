@@ -15,22 +15,20 @@
 package buffer
 
 import (
-	"bytes"
 	"encoding/binary"
 	"testing"
-
-	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
-func TestInMessageReadSingleRejectsBadLength(t *testing.T) {
-	oldFuseT := fusekernel.IsPlatformFuseT
-	fusekernel.IsPlatformFuseT = true
-	t.Cleanup(func() { fusekernel.IsPlatformFuseT = oldFuseT })
+// messageReader returns its message from each read.
+type messageReader []byte
 
+func (r messageReader) ReadMessage(p []byte) (int, error) { return copy(p, r), nil }
+
+func TestInMessageInitRejectsBadLength(t *testing.T) {
 	for _, length := range []uint32{2, 1 << 30} {
 		message := make([]byte, 64)
 		binary.NativeEndian.PutUint32(message, length)
-		if err := NewInMessage(len(message)).Init(bytes.NewReader(message)); err == nil {
+		if err := NewInMessage(len(message)).Init(messageReader(message)); err == nil {
 			t.Errorf("Init with header length %d succeeded, want an error", length)
 		}
 	}

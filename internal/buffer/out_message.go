@@ -16,7 +16,6 @@ package buffer
 
 import (
 	"fmt"
-	"reflect"
 	"unsafe"
 
 	"github.com/dsfaccini/fuse/internal/fusekernel"
@@ -34,6 +33,9 @@ const OutMessageHeaderSize = int(unsafe.Sizeof(fusekernel.OutHeader{}))
 type OutMessage struct {
 	header fusekernel.OutHeader
 	Sglist [][]byte
+
+	// headerOnly backs Parts for a message that is only its header.
+	headerOnly [1][]byte
 }
 
 // Reset resets m so that it's ready to be used again. Afterward, the contents
@@ -121,11 +123,14 @@ func (m *OutMessage) Len() int {
 
 // OutHeaderBytes returns a byte slice containing the current header.
 func (m *OutMessage) OutHeaderBytes() []byte {
-	l := OutMessageHeaderSize
-	sh := reflect.SliceHeader{
-		Data: uintptr(unsafe.Pointer(&m.header)),
-		Len:  l,
-		Cap:  l,
+	return unsafe.Slice((*byte)(unsafe.Pointer(&m.header)), OutMessageHeaderSize)
+}
+
+// Parts returns the message's segments, header first, without allocating.
+func (m *OutMessage) Parts() [][]byte {
+	if m.Sglist != nil {
+		return m.Sglist
 	}
-	return *(*[]byte)(unsafe.Pointer(&sh))
+	m.headerOnly[0] = m.OutHeaderBytes()
+	return m.headerOnly[:]
 }

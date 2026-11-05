@@ -49,16 +49,18 @@ type fskitAPI struct {
 	channelCreate          uintptr
 	mount                  uintptr
 	channelCopyNextMessage uintptr
-	messageGetBodySize     uintptr
 	messageGetBodyBuffers  uintptr
 	channelSendMessage     uintptr
 	channelClose           uintptr
 	release                uintptr
 }
 
-// fskitAPILoader loads the MFMount functions at mount time. Tests replace it
-// to mount through a fake MFMount.
-var fskitAPILoader = loadFSKitAPI
+// fskitAPILoader returns the MFMount functions. The first mount loads them
+// from fskitFrameworkPath, and later mounts reuse that result. Tests replace
+// it to mount through a fake MFMount.
+var fskitAPILoader = sync.OnceValues(func() (*fskitAPI, error) {
+	return loadFSKitAPI(fskitFrameworkPath)
+})
 
 func loadFSKitAPI(path string) (*fskitAPI, error) {
 	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -73,7 +75,6 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 		{"MFChannelCreate", &api.channelCreate},
 		{"MFMount", &api.mount},
 		{"MFChannelCopyNextMessage", &api.channelCopyNextMessage},
-		{"MFMessageGetBodySize", &api.messageGetBodySize},
 		{"MFMessageGetBodyBuffers", &api.messageGetBodyBuffers},
 		{"MFChannelSendMessage", &api.channelSendMessage},
 		{"MFChannelClose", &api.channelClose},
@@ -88,7 +89,12 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 }
 
 type fskitTransport struct {
-	api            *fskitAPI
+	api *fskitAPI
+
+	// sendMu serializes sends, which share vectors.
+	sendMu  sync.Mutex
+	vectors []syscall.Iovec
+
 	mu             sync.Mutex
 	channel        uintptr
 	closed         bool
@@ -118,7 +124,7 @@ func mountFSKitTransport(
 		return nil, fmt.Errorf("FSKit mount point: %w", err)
 	}
 
-	api, err := fskitAPILoader(fskitFrameworkPath)
+	api, err := fskitAPILoader()
 	if err != nil {
 		return nil, err
 	}
@@ -255,17 +261,8 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 }
 
 func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
-	result, _, callErr := purego.SyscallN(api.messageGetBodySize, message)
-	bodySize := int(result)
-	if bodySize < 0 {
-		return 0, fmt.Errorf("MFMessageGetBodySize: %w", callErrno(callErr))
-	}
-	if bodySize > len(dst) {
-		return 0, fmt.Errorf("FUSE message has %d bytes; transport buffer holds %d", bodySize, len(dst))
-	}
-
 	var bodyBuffers *syscall.Iovec
-	result, _, callErr = purego.SyscallN(
+	result, _, callErr := purego.SyscallN(
 		api.messageGetBodyBuffers,
 		message,
 		uintptr(unsafe.Pointer(&bodyBuffers)))
@@ -277,42 +274,43 @@ func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
 		return 0, fmt.Errorf("MFMessageGetBodyBuffers returned no body buffers")
 	}
 
+	// InMessage.Init checks the header's length against the bytes copied.
 	var offset int
 	for _, body := range unsafe.Slice(bodyBuffers, count) {
 		if body.Len > uint64(len(dst)-offset) {
-			return 0, fmt.Errorf("FUSE message buffers exceed reported body size %d", bodySize)
+			return 0, fmt.Errorf("FUSE message exceeds the %d-byte transport buffer", len(dst))
 		}
 		length := int(body.Len)
 		copy(dst[offset:offset+length], unsafe.Slice(body.Base, length))
 		offset += length
 	}
-	if offset != bodySize {
-		return 0, fmt.Errorf("FUSE message buffers contain %d bytes; header reports %d", offset, bodySize)
-	}
 	return offset, nil
 }
 
-func (t *fskitTransport) WriteMessage(message []byte) error {
-	return t.WritevMessage([][]byte{message})
-}
-
-func (t *fskitTransport) WritevMessage(parts [][]byte) error {
+func (t *fskitTransport) SendMessage(parts [][]byte) error {
 	if len(parts) == 0 {
 		return fmt.Errorf("cannot send an empty FUSE message")
 	}
 
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
 	var total int
-	vectors := make([]syscall.Iovec, len(parts))
+	vectors := t.vectors[:0]
+	// Drop the references to parts once the send returns.
+	defer func() { clear(vectors) }()
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
-	for i, part := range parts {
-		total += len(part)
+	for _, part := range parts {
+		var vector syscall.Iovec
 		if len(part) != 0 {
 			pinner.Pin(&part[0])
-			vectors[i].Base = &part[0]
-			vectors[i].SetLen(len(part))
+			vector.Base = &part[0]
+			vector.SetLen(len(part))
 		}
+		vectors = append(vectors, vector)
+		total += len(part)
 	}
+	t.vectors = vectors
 
 	t.mu.Lock()
 	if t.closed {

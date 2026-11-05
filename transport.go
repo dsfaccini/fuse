@@ -15,30 +15,29 @@
 package fuse
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"syscall"
 )
 
-// connectionTransport moves complete FUSE messages between the connection
-// and its kernel-facing endpoint. ReadMessage must return one whole message
-// per call; the legacy file transport inherits this property from /dev/fuse.
+// connectionTransport moves whole FUSE messages between the connection and
+// its kernel-facing endpoint.
 type connectionTransport interface {
-	ReadMessage([]byte) (int, error)
-	WriteMessage([]byte) error
-	WritevMessage([][]byte) error
+	// ReadMessage reads one whole message into p and returns its length. It
+	// retries a read that EINTR interrupts, and returns io.EOF once the kernel
+	// has hung up.
+	ReadMessage(p []byte) (int, error)
+
+	// SendMessage sends the concatenation of parts as one whole message.
+	SendMessage(parts [][]byte) error
+
 	Close() error
 }
 
-type transportReader struct {
-	transport connectionTransport
-}
-
-func (r transportReader) Read(p []byte) (int, error) {
-	return r.transport.ReadMessage(p)
-}
-
+// fileTransport is a FUSE device: /dev/fuse on Linux, the macFUSE kernel
+// extension's device on darwin.
 type fileTransport struct {
 	file *os.File
 }
@@ -48,30 +47,55 @@ func newFileTransport(file *os.File) connectionTransport {
 }
 
 func (t *fileTransport) ReadMessage(p []byte) (int, error) {
-	return t.file.Read(p)
+	return readDevice(t.file, p)
 }
 
-func (t *fileTransport) WriteMessage(p []byte) error {
-	// Avoid the retry loop in os.File.Write.
-	n, err := syscall.Write(int(t.file.Fd()), p)
+// readDevice reads one message from a FUSE device, whose each read returns one
+// whole message.
+func readDevice(dev io.Reader, p []byte) (int, error) {
+	for {
+		n, err := dev.Read(p)
+		switch {
+		// EINTR seems to happen often on OS X, cf. http://golang.org/issue/11180.
+		case errors.Is(err, syscall.EINTR):
+			continue
+		// ENODEV means fuse has hung up.
+		case errors.Is(err, syscall.ENODEV):
+			return 0, io.EOF
+		}
+		return n, err
+	}
+}
+
+// SendMessage writes parts with one write(2), or one writev(2) when there are
+// several. The kernel takes each call as one whole message, so a short write
+// fails instead of sending the rest as a second message.
+func (t *fileTransport) SendMessage(parts [][]byte) error {
+	var n int
+	var err error
+	if len(parts) == 1 {
+		// Avoid the retry loop in os.File.Write.
+		n, err = syscall.Write(int(t.file.Fd()), parts[0])
+	} else {
+		n, err = writev(int(t.file.Fd()), parts)
+	}
 	if err != nil {
 		return err
 	}
-	if n != len(p) {
-		return fmt.Errorf("Wrote %d bytes; expected %d", n, len(p))
+
+	var total int
+	for _, part := range parts {
+		total += len(part)
+	}
+	if n != total {
+		return fmt.Errorf("Wrote %d bytes; expected %d", n, total)
 	}
 
 	return nil
-}
-
-func (t *fileTransport) WritevMessage(p [][]byte) error {
-	_, err := writev(int(t.file.Fd()), p)
-	return err
 }
 
 func (t *fileTransport) Close() error {
 	return t.file.Close()
 }
 
-var _ io.Reader = transportReader{}
 var _ connectionTransport = (*fileTransport)(nil)

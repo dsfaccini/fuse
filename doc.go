@@ -30,7 +30,7 @@
 // as tests for this package: http://godoc.org/github.com/dsfaccini/fuse/samples
 //
 // In order to use this package to mount file systems on OS X, the system must
-// have FUSE for OS X installed (see http://osxfuse.github.io/). Do note that
-// there are several OS X-specific oddities; grep through the documentation for
-// more info.
+// have macFUSE installed (see https://macfuse.github.io/). Do note that there
+// are several OS X-specific oddities; grep through the documentation for more
+// info.
 package fuse

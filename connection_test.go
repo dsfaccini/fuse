@@ -669,9 +669,8 @@ func (t *blockingTransport) ReadMessage(dst []byte) (int, error) {
 	return copy(dst, <-t.messages), nil
 }
 
-func (t *blockingTransport) WriteMessage([]byte) error    { return nil }
-func (t *blockingTransport) WritevMessage([][]byte) error { return nil }
-func (t *blockingTransport) Close() error                 { return nil }
+func (t *blockingTransport) SendMessage([][]byte) error { return nil }
+func (t *blockingTransport) Close() error               { return nil }
 
 func TestReadOpStopsAfterFatalErrorDuringRead(t *testing.T) {
 	transport := &blockingTransport{reading: make(chan struct{}, 1), messages: make(chan []byte, 1)}
