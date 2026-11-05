@@ -219,6 +219,9 @@ func (fs *cachingFS) barAttrs() fuseops.InodeAttributes {
 	}
 }
 
+// randomString returns len random lowercase letters. Raw random bytes would
+// sometimes include '/', and the kernel rejects a directory entry whose name
+// holds one with EIO.
 func randomString(len int) string {
 	bytes := make([]byte, len)
 	nn, err := rand.Read(bytes)
@@ -227,6 +230,9 @@ func randomString(len int) string {
 		return ""
 	}
 
+	for i, b := range bytes {
+		bytes[i] = 'a' + b%26
+	}
 	return string(bytes)
 }
 

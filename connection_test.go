@@ -26,8 +26,11 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -804,5 +807,82 @@ func TestReadOpCapFloors(t *testing.T) {
 				t.Errorf("convertInMessage = %v, want EINVAL: %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// fuse_dev_do_read fails with ECONNABORTED instead of ENODEV when a read races
+// the connection's abort, as an unmount does
+// (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dev.c#L1627-L1629).
+func TestReadOpTreatsECONNABORTEDAsEOFOnLinux(t *testing.T) {
+	kernel := newFakeKernel()
+	kernel.SendErrno(syscall.ECONNABORTED)
+	c := newTestConnection(kernel)
+
+	_, _, err := c.ReadOp()
+	if runtime.GOOS != "linux" {
+		if err == nil || err == io.EOF {
+			t.Errorf("ReadOp = %v, want a fatal error", err)
+		}
+		return
+	}
+	if err != io.EOF {
+		t.Errorf("ReadOp = %v, want io.EOF", err)
+	}
+	if fatal := c.fatalError(); fatal != nil {
+		t.Errorf("fatalError = %v, want nil", fatal)
+	}
+}
+
+// overlapWriter records whether two Writes ever ran at once.
+type overlapWriter struct {
+	active  atomic.Int32
+	overlap atomic.Bool
+	writes  atomic.Int32
+}
+
+func (w *overlapWriter) Write(p []byte) (int, error) {
+	if w.active.Add(1) > 1 {
+		w.overlap.Store(true)
+	}
+	time.Sleep(time.Millisecond)
+	w.active.Add(-1)
+	w.writes.Add(1)
+	return len(p), nil
+}
+
+func TestReplySerializesWireLogWrites(t *testing.T) {
+	const n = 16
+	// fakeKernel, unlike testTransport, takes replies from many goroutines.
+	k := newFakeKernel()
+	for i := range n {
+		k.Send(testMessage(fusekernel.OpGetattr, uint64(10+i)))
+	}
+	c := newTestConnection(k)
+	w := &overlapWriter{}
+	c.wireLogger = w
+
+	var ctxs []context.Context
+	for range n {
+		ctx, _, err := c.ReadOp()
+		if err != nil {
+			t.Fatalf("ReadOp: %v", err)
+		}
+		ctxs = append(ctxs, ctx)
+	}
+	var wg sync.WaitGroup
+	for _, ctx := range ctxs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Reply(ctx, nil)
+		}()
+	}
+	wg.Wait()
+
+	if w.overlap.Load() {
+		t.Error("Reply wrote two wire log entries at once")
+	}
+	if got := w.writes.Load(); got != n {
+		t.Errorf("wire log writes = %d, want %d", got, n)
 	}
 }

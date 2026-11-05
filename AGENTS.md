@@ -24,7 +24,8 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Set `FUSE_RUN_MOUNT_TESTS=1` only on a host that can mount. On Linux that
   needs `fuse3`. On darwin the tests mount through the macFUSE kernel
   extension, which needs macFUSE installed with that extension enabled.
-- No CI job sets `FUSE_RUN_MOUNT_TESTS` yet.
+- Only the `linux-mount` CI job sets `FUSE_RUN_MOUNT_TESTS=1`. To check a
+  mounting test, push and read that job.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
@@ -63,12 +64,32 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - `linux` also runs `GOARCH=386 go test -count=1 ./...`. A 32-bit `int` catches
   wire lengths that overflow it. Go has no darwin/386 port. On a Mac, leave
   that step to CI.
+- `linux-mount`: installs `fuse3` and runs
+  `go test -race -count=1 -timeout 10m ./...` with `FUSE_RUN_MOUNT_TESTS=1`,
+  twice. As the runner user, `Mount` falls back to `fusermount3`. As root
+  through `sudo`, `Mount` mounts directly.
+- `linux-mount` fails when no test that `mounttest.SkipUnlessEnabled` let run
+  passed. It finds those tests by the line the gate logs.
 - `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
   That test loads the installed MFMount framework. It fails when
   `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.
+
+## On Linux, Mount answers the poll hack's requests itself
+
+- Before `Mount` returns, it opens and polls `.fuse-poll-hack` in the mount's
+  root, so the kernel stops sending FUSE_POLL. `poll_hack.go` says why.
+- The connection answers that entry's requests: its lookup while `Mount` runs
+  the hack, then every request for inode `math.MaxUint64`. A server never
+  reads them, and the wire log never records them.
+- A `/dev/fd/N` mount point skips the hack, so the deadlock and inode
+  `math.MaxUint64` stay the file system's. A failed hack is only logged to
+  `MountConfig.ErrorLogger`, and to nowhere when that is nil.
+- Unless `MountConfig.DisableDefaultPermissions` is set, `Mount` returns only
+  after the server answers a GETATTR for the root. A test server that blocks
+  that answer hangs `Mount`.
 
 ## Find an op error's errno with `operror.Errno`
 

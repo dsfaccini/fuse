@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"syscall"
 )
 
@@ -59,8 +60,11 @@ func readDevice(dev io.Reader, p []byte) (int, error) {
 		// EINTR seems to happen often on OS X, cf. http://golang.org/issue/11180.
 		case errors.Is(err, syscall.EINTR):
 			continue
-		// ENODEV means fuse has hung up.
-		case errors.Is(err, syscall.ENODEV):
+		// ENODEV means fuse has hung up. On Linux, ECONNABORTED does too:
+		// fuse_dev_do_read returns it instead of ENODEV when a read races the
+		// connection's abort, as an unmount does (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dev.c#L1627-L1629).
+		case errors.Is(err, syscall.ENODEV),
+			runtime.GOOS == "linux" && errors.Is(err, syscall.ECONNABORTED):
 			return 0, io.EOF
 		}
 		return n, err

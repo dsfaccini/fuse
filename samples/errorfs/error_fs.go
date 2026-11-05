@@ -155,6 +155,10 @@ func (fs *errorFS) OpenFile(
 		return fmt.Errorf("Unsupported inode ID: %d", op.Inode)
 	}
 
+	// Through the page cache, Linux reports a failed read as EIO, whatever
+	// error ReadFile returns.
+	op.UseDirectIO = true
+
 	return nil
 }
 
