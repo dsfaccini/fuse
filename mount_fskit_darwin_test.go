@@ -301,7 +301,30 @@ func TestFSKitTransportSendsWholeMessages(t *testing.T) {
 	}
 }
 
-// Sends share the transport's iovecs, so concurrent sends must not mix.
+func TestFSKitAPILoaderRetriesAFailedLoad(t *testing.T) {
+	var loads int
+	want := &fskitAPI{}
+	loader := cacheFSKitAPI(func(string) (*fskitAPI, error) {
+		loads++
+		if loads == 1 {
+			return nil, ErrFSKitUnavailable
+		}
+		return want, nil
+	})
+	if _, err := loader(); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Fatalf("first load error = %v, want ErrFSKitUnavailable", err)
+	}
+	for range 2 {
+		if got, err := loader(); err != nil || got != want {
+			t.Errorf("loader() = %p, %v; want %p, nil", got, err, want)
+		}
+	}
+	if loads != 2 {
+		t.Errorf("loads = %d, want 2: one failure, then one success reused", loads)
+	}
+}
+
+// Sends reuse pooled iovecs, so concurrent sends must not mix.
 func TestFSKitTransportSendsConcurrently(t *testing.T) {
 	f := newFakeMFMount(t)
 	tr := f.transport(t)
@@ -318,11 +341,17 @@ func TestFSKitTransportSendsConcurrently(t *testing.T) {
 			}
 		})
 	}
+	// Read every reply, so that no sender blocks on a full channel and Close
+	// can finish.
 	for range senders * sends {
-		reply := f.kernel.NextReply(t)
+		reply, ok := f.kernel.nextReply()
+		if !ok {
+			t.Error("the transport sent no reply within 5s")
+			break
+		}
 		i := reply[0] - 'a'
 		if want := append(bytes.Repeat([]byte{'a' + i}, 16), bytes.Repeat([]byte{'A' + i}, 32)...); !bytes.Equal(reply, want) {
-			t.Fatalf("sent %q, want %q", reply, want)
+			t.Errorf("sent %q, want %q", reply, want)
 		}
 	}
 	wg.Wait()

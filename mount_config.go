@@ -319,15 +319,16 @@ type MountConfig struct {
 	MaxWrite uint32
 }
 
-// FUSEImpl named the OS X FUSE implementation to mount through.
+// FUSEImpl is the type of MountConfig.FuseImpl. On OS X, Mount always mounts
+// through macFUSE.
 //
-// Deprecated: Mount ignores MountConfig.FuseImpl and mounts through macFUSE.
+// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
 type FUSEImpl uint8
 
 const (
-	// Deprecated: FUSE-T is not supported. Mount uses macFUSE.
+	// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
 	FUSEImplFuseT FUSEImpl = iota
-	// Deprecated: macFUSE is the only OS X implementation.
+	// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
 	FUSEImplMacFUSE
 )
 

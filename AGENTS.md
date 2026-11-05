@@ -29,6 +29,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- `readDevice` maps device errnos, and `fskitTransport.ReadMessage` maps
+  FSKit's. `testTransport` returns its errors unmapped, so test a device errno
+  through `fakeKernel`.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in

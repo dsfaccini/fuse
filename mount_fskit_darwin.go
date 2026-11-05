@@ -55,12 +55,33 @@ type fskitAPI struct {
 	release                uintptr
 }
 
-// fskitAPILoader returns the MFMount functions. The first mount loads them
-// from fskitFrameworkPath, and later mounts reuse that result. Tests replace
-// it to mount through a fake MFMount.
-var fskitAPILoader = sync.OnceValues(func() (*fskitAPI, error) {
-	return loadFSKitAPI(fskitFrameworkPath)
-})
+// fskitAPILoader returns the MFMount functions. Tests replace it to mount
+// through a fake MFMount.
+var fskitAPILoader = cacheFSKitAPI(loadFSKitAPI)
+
+// cacheFSKitAPI returns a loader that calls load with fskitFrameworkPath until
+// a load succeeds, then returns that result. A failed load is retried, so a
+// running process can use macFUSE once it is installed.
+func cacheFSKitAPI(load func(string) (*fskitAPI, error)) func() (*fskitAPI, error) {
+	var mu sync.Mutex
+	var api *fskitAPI
+	return func() (*fskitAPI, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if api == nil {
+			loaded, err := load(fskitFrameworkPath)
+			if err != nil {
+				return nil, err
+			}
+			api = loaded
+		}
+		return api, nil
+	}
+}
+
+// sendVectors holds the iovec slices that sends fill, so that a send does not
+// allocate one.
+var sendVectors = sync.Pool{New: func() any { return new([]syscall.Iovec) }}
 
 func loadFSKitAPI(path string) (*fskitAPI, error) {
 	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -89,12 +110,7 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 }
 
 type fskitTransport struct {
-	api *fskitAPI
-
-	// sendMu serializes sends, which share vectors.
-	sendMu  sync.Mutex
-	vectors []syscall.Iovec
-
+	api            *fskitAPI
 	mu             sync.Mutex
 	channel        uintptr
 	closed         bool
@@ -292,12 +308,15 @@ func (t *fskitTransport) SendMessage(parts [][]byte) error {
 		return fmt.Errorf("cannot send an empty FUSE message")
 	}
 
-	t.sendMu.Lock()
-	defer t.sendMu.Unlock()
 	var total int
-	vectors := t.vectors[:0]
-	// Drop the references to parts once the send returns.
-	defer func() { clear(vectors) }()
+	pooled := sendVectors.Get().(*[]syscall.Iovec)
+	vectors := (*pooled)[:0]
+	defer func() {
+		// Drop the references to parts before the slice is reused.
+		clear(vectors)
+		*pooled = vectors[:0]
+		sendVectors.Put(pooled)
+	}()
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
 	for _, part := range parts {
@@ -310,7 +329,6 @@ func (t *fskitTransport) SendMessage(parts [][]byte) error {
 		vectors = append(vectors, vector)
 		total += len(part)
 	}
-	t.vectors = vectors
 
 	t.mu.Lock()
 	if t.closed {

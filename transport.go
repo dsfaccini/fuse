@@ -28,10 +28,12 @@ import (
 type connectionTransport interface {
 	// ReadMessage reads one whole message into p and returns its length. It
 	// retries a read that EINTR interrupts, and returns io.EOF once the kernel
-	// has hung up.
+	// has hung up. It does not keep p after it returns.
 	ReadMessage(p []byte) (int, error)
 
-	// SendMessage sends the concatenation of parts as one whole message.
+	// SendMessage sends the concatenation of parts as one whole message. parts
+	// is not empty. SendMessage does not keep parts, or any part, after it
+	// returns.
 	SendMessage(parts [][]byte) error
 
 	Close() error
@@ -51,8 +53,8 @@ func (t *fileTransport) ReadMessage(p []byte) (int, error) {
 	return readDevice(t.file, p)
 }
 
-// readDevice reads one message from a FUSE device, whose each read returns one
-// whole message.
+// readDevice reads one message from a FUSE device. Each read of the device
+// returns one whole message.
 func readDevice(dev io.Reader, p []byte) (int, error) {
 	for {
 		n, err := dev.Read(p)
