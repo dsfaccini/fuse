@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"os"
 	"path"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -39,7 +40,20 @@ type WireLogTest struct {
 	ctx context.Context
 	dir string
 	mfs *fuse.MountedFileSystem
+	buf lockedBuffer
+}
+
+// lockedBuffer serializes writes to a bytes.Buffer. Reply writes each op's wire
+// log entry from the goroutine that serves the op.
+type lockedBuffer struct {
+	mu  sync.Mutex
 	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
 }
 
 func init() { RegisterTestSuite(&WireLogTest{}) }
@@ -100,7 +114,7 @@ func (t *WireLogTest) RunWorkloadAndCheckLogs() {
 
 	// Parse the logs.
 	ops := make(map[string][]fuse.WireLogRecord)
-	decoder := json.NewDecoder(&t.buf)
+	decoder := json.NewDecoder(&t.buf.buf)
 
 	for decoder.More() {
 		var entry fuse.WireLogRecord
@@ -137,17 +151,23 @@ func (t *WireLogTest) RunWorkloadAndCheckLogs() {
 	ExpectEq(fileMode, lookupOp.Entry.Attributes.Mode)
 	ExpectEq("yes", entry.Extra["lookup"])
 
-	// 3. GetInodeAttributesOp
+	// 3. GetInodeAttributesOp. The kernel also asks for the root's attributes,
+	// in an order that varies.
 	entries, ok = ops["GetInodeAttributesOp"]
 	AssertTrue(ok)
-	ExpectGe(len(entries), 2)
-	entry = entries[1] // first entry is the root dir
+	var getattrOp fuseops.GetInodeAttributesOp
+	for _, e := range entries {
+		getattrOp = fuseops.GetInodeAttributesOp{}
+		loadArgs(e, &getattrOp)
+		if getattrOp.Inode == fileInode {
+			entry = e
+			break
+		}
+	}
+	AssertEq(fileInode, getattrOp.Inode)
 	ExpectEq(0, entry.Status)
 	AssertNe(nil, entry.Context)
 	AssertGt(entry.Context.FuseID, 0)
-	var getattrOp fuseops.GetInodeAttributesOp
-	loadArgs(entry, &getattrOp)
-	ExpectEq(fileInode, getattrOp.Inode)
 	ExpectEq(1, getattrOp.Attributes.Nlink)
 	ExpectEq(len(fileContents), getattrOp.Attributes.Size)
 	ExpectEq(fileMode, getattrOp.Attributes.Mode)
