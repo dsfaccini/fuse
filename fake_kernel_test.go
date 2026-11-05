@@ -31,8 +31,8 @@ import (
 // fakeKernel is the kernel end of a connection that tests drive without a
 // mount. Send queues a request as the body buffers FSKit hands over, and
 // NextReply returns the next message the connection sent. As a
-// connectionTransport it stands in for /dev/fuse; on darwin it is also the
-// channel behind the fake MFMount.
+// connectionTransport it stands in for /dev/fuse, read the way fileTransport
+// reads it; on darwin it is also the channel behind the fake MFMount.
 type fakeKernel struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -115,7 +115,11 @@ func (k *fakeKernel) NextReply(t testing.TB) []byte {
 // NextReply has not returned.
 func (k *fakeKernel) UnreadReplies() int { return len(k.replies) }
 
-func (k *fakeKernel) ReadMessage(p []byte) (int, error) {
+func (k *fakeKernel) ReadMessage(p []byte) (int, error) { return readDevice(k, p) }
+
+// Read reads the kernel the way a FUSE device does: one whole message, or an
+// errno.
+func (k *fakeKernel) Read(p []byte) (int, error) {
 	r := k.read()
 	if r.errno != 0 {
 		return 0, &os.PathError{Op: "read", Path: "/dev/fuse", Err: r.errno}
@@ -127,12 +131,7 @@ func (k *fakeKernel) ReadMessage(p []byte) (int, error) {
 	return copy(p, message), nil
 }
 
-func (k *fakeKernel) WriteMessage(message []byte) error {
-	k.replies <- bytes.Clone(message)
-	return nil
-}
-
-func (k *fakeKernel) WritevMessage(parts [][]byte) error {
+func (k *fakeKernel) SendMessage(parts [][]byte) error {
 	k.replies <- bytes.Join(parts, nil)
 	return nil
 }

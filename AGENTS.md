@@ -22,14 +22,16 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   reached through a shape it does not model, such as non-test code or another
   package. Read new mounting code by hand.
 - Set `FUSE_RUN_MOUNT_TESTS=1` only on a host that can mount. On Linux that
-  needs `fuse3`. On darwin the tests mount through FUSE-T, the default
-  `MountConfig.FuseImpl`, which needs `go-nfsv4` at `/usr/local/bin/go-nfsv4`
-  or at `$FUSE_NFSSRV_PATH`.
+  needs `fuse3`. On darwin the tests mount through the macFUSE kernel
+  extension, which needs macFUSE installed with that extension enabled.
 - Only the `linux-mount` CI job sets `FUSE_RUN_MOUNT_TESTS=1`. To check a
   mounting test, push and read that job.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- `readDevice` maps device errnos, and `fskitTransport.ReadMessage` maps
+  FSKit's. `testTransport` returns its errors unmapped, so test a device errno
+  through `fakeKernel`.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
@@ -45,9 +47,11 @@ Run these locally, in this order. None of them mounts.
 
 1. `gofmt -l .` prints nothing.
 2. `go build ./...`
-3. `go vet -composites=false -unsafeptr=false ./...` with `GOOS=linux
-   GOARCH=amd64`, `GOOS=linux GOARCH=arm64` and `GOOS=darwin`. The two disabled
-   analyzers report findings older than the fork.
+3. `go vet -composites=false ./...` with `GOOS=linux GOARCH=amd64` and
+   `GOOS=linux GOARCH=arm64`. Add `-unsafeptr=false` with `GOOS=darwin`.
+   composites reports unkeyed `fusekernel.Protocol` literals older than the
+   fork. On darwin, unsafeptr reports the purego addresses that the FSKit fake
+   and probe convert to pointers.
 4. `go test ./...`. Add `-race` when the change touches concurrency.
 
 When you change `convertInMessage`, also run

@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
-	"reflect"
 	"testing"
 	"unsafe"
 
@@ -14,13 +13,7 @@ import (
 )
 
 func toByteSlice(p unsafe.Pointer, n int) []byte {
-	sh := reflect.SliceHeader{
-		Data: uintptr(p),
-		Len:  n,
-		Cap:  n,
-	}
-
-	return *(*[]byte)(unsafe.Pointer(&sh))
+	return unsafe.Slice((*byte)(p), n)
 }
 
 // fillWithGarbage writes random data to [p, p+n).

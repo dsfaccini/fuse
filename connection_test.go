@@ -707,9 +707,8 @@ func (t *blockingTransport) ReadMessage(dst []byte) (int, error) {
 	return copy(dst, <-t.messages), nil
 }
 
-func (t *blockingTransport) WriteMessage([]byte) error    { return nil }
-func (t *blockingTransport) WritevMessage([][]byte) error { return nil }
-func (t *blockingTransport) Close() error                 { return nil }
+func (t *blockingTransport) SendMessage([][]byte) error { return nil }
+func (t *blockingTransport) Close() error               { return nil }
 
 func TestReadOpStopsAfterFatalErrorDuringRead(t *testing.T) {
 	transport := &blockingTransport{reading: make(chan struct{}, 1), messages: make(chan []byte, 1)}
@@ -850,8 +849,9 @@ func TestReadOpCapFloors(t *testing.T) {
 // the connection's abort, as an unmount does
 // (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dev.c#L1627-L1629).
 func TestReadOpTreatsECONNABORTEDAsEOFOnLinux(t *testing.T) {
-	readErr := &os.PathError{Op: "read", Path: "/dev/fuse", Err: syscall.ECONNABORTED}
-	c := newTestConnection(&testTransport{readErr: readErr})
+	kernel := newFakeKernel()
+	kernel.SendErrno(syscall.ECONNABORTED)
+	c := newTestConnection(kernel)
 
 	_, _, err := c.ReadOp()
 	if runtime.GOOS != "linux" {

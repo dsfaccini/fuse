@@ -16,8 +16,6 @@ package buffer
 
 import (
 	"fmt"
-	"io"
-	"sync"
 	"syscall"
 	"unsafe"
 
@@ -59,41 +57,16 @@ func NewInMessage(bufSize int) *InMessage {
 	}
 }
 
-var readLock sync.Mutex
-
-func (m *InMessage) ReadSingle(r io.Reader) (int, error) {
-	readLock.Lock()
-	defer readLock.Unlock()
-
-	// read request length
-	if _, err := io.ReadFull(r, m.storage[0:4]); err != nil {
-		return 0, err
-	}
-
-	l := m.Header().Len
-	if l < 4 || uint64(l) > uint64(len(m.storage)) {
-		return 0, fmt.Errorf("Header says %d bytes, but the buffer holds %d", l, len(m.storage))
-	}
-	// read remaining request
-	if n, err := io.ReadFull(r, m.storage[4:l]); err != nil {
-		return n, err
-	}
-	return int(l), nil
+// A MessageReader reads one whole message per call.
+type MessageReader interface {
+	ReadMessage(p []byte) (int, error)
 }
 
-// Initialize with the data read by a single call to r.Read. The first call to
-// Consume will consume the bytes directly after the fusekernel.InHeader
-// struct.
-func (m *InMessage) Init(r io.Reader) error {
-
-	var n int
-	var err error
-	if fusekernel.IsPlatformFuseT {
-		n, err = m.ReadSingle(r)
-	} else {
-		n, err = r.Read(m.storage[:])
-	}
-
+// Initialize with the message read by a single call to r.ReadMessage. The
+// first call to Consume will consume the bytes directly after the
+// fusekernel.InHeader struct.
+func (m *InMessage) Init(r MessageReader) error {
+	n, err := r.ReadMessage(m.storage)
 	if err != nil {
 		return err
 	}

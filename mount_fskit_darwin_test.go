@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -60,10 +61,12 @@ func TestFSKitOSVersion(t *testing.T) {
 // osVersion as the running macOS version until the test ends.
 func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
 	t.Helper()
-	oldPath, oldVersion := fskitFrameworkPath, fskitOSProductVersion
+	oldPath, oldVersion, oldLoader := fskitFrameworkPath, fskitOSProductVersion, fskitAPILoader
 	fskitFrameworkPath = frameworkPath
 	fskitOSProductVersion = func() (string, error) { return osVersion, nil }
-	t.Cleanup(func() { fskitFrameworkPath, fskitOSProductVersion = oldPath, oldVersion })
+	// The cached loader may hold the installed framework.
+	fskitAPILoader = func() (*fskitAPI, error) { return loadFSKitAPI(frameworkPath) }
+	t.Cleanup(func() { fskitFrameworkPath, fskitOSProductVersion, fskitAPILoader = oldPath, oldVersion, oldLoader })
 }
 
 func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
@@ -94,6 +97,14 @@ func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
 	}
 	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {
 		t.Fatalf("loadFSKitAPI(%q): %v", fskitFrameworkPath, err)
+	}
+	// Mount loads MFMount once per process.
+	first, err := fskitAPILoader()
+	if err != nil {
+		t.Fatalf("fskitAPILoader: %v", err)
+	}
+	if second, _ := fskitAPILoader(); second != first {
+		t.Error("fskitAPILoader loaded MFMount again")
 	}
 }
 
@@ -271,23 +282,104 @@ func TestFSKitTransportSendsWholeMessages(t *testing.T) {
 	f := newFakeMFMount(t)
 	tr := f.transport(t)
 	parts := [][]byte{[]byte("header"), {}, []byte("payload")}
-	if err := tr.WritevMessage(parts); err != nil {
-		t.Fatalf("WritevMessage: %v", err)
+	if err := tr.SendMessage(parts); err != nil {
+		t.Fatalf("SendMessage: %v", err)
 	}
 	if got := string(f.kernel.NextReply(t)); got != "headerpayload" {
 		t.Errorf("sent %q, want %q", got, "headerpayload")
 	}
 
 	f.sendResult = func(n int) (int, syscall.Errno) { return n - 1, 0 }
-	if err := tr.WritevMessage(parts); err == nil {
-		t.Error("WritevMessage accepted a short send")
+	if err := tr.SendMessage(parts); err == nil {
+		t.Error("SendMessage accepted a short send")
 	}
 	// The kernel refuses a reply to an interrupted request with ENOENT, which
 	// Reply treats as benign.
 	f.sendResult = func(int) (int, syscall.Errno) { return -1, syscall.ENOENT }
-	if err := tr.WritevMessage(parts); !errors.Is(err, syscall.ENOENT) {
-		t.Errorf("WritevMessage error = %v, want ENOENT", err)
+	if err := tr.SendMessage(parts); !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("SendMessage error = %v, want ENOENT", err)
 	}
+}
+
+func TestFSKitAPILoaderRetriesAFailedLoad(t *testing.T) {
+	var loads int
+	want := &fskitAPI{}
+	loader := cacheFSKitAPI(func(string) (*fskitAPI, error) {
+		loads++
+		if loads == 1 {
+			return nil, ErrFSKitUnavailable
+		}
+		return want, nil
+	})
+	if _, err := loader(); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Fatalf("first load error = %v, want ErrFSKitUnavailable", err)
+	}
+	for range 2 {
+		if got, err := loader(); err != nil || got != want {
+			t.Errorf("loader() = %p, %v; want %p, nil", got, err, want)
+		}
+	}
+	if loads != 2 {
+		t.Errorf("loads = %d, want 2: one failure, then one success reused", loads)
+	}
+}
+
+// A warm transport reuses a finished send's iovecs instead of allocating.
+func TestFSKitTransportReusesSendIovecs(t *testing.T) {
+	f := newFakeMFMount(t)
+	tr := f.transport(t)
+	parts := [][]byte{[]byte("header"), []byte("payload")}
+	send := func() *syscall.Iovec {
+		t.Helper()
+		if err := tr.SendMessage(parts); err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+		f.kernel.NextReply(t)
+		select {
+		case vectors := <-tr.vectors:
+			tr.vectors <- vectors
+			return &vectors[:1][0]
+		default:
+			t.Fatal("the transport kept no iovecs after a send")
+			return nil
+		}
+	}
+	if first, second := send(), send(); first != second {
+		t.Error("the second send allocated new iovecs")
+	}
+}
+
+// Sends reuse iovecs, so concurrent sends must not mix.
+func TestFSKitTransportSendsConcurrently(t *testing.T) {
+	f := newFakeMFMount(t)
+	tr := f.transport(t)
+	const senders, sends = 8, 50
+	var wg sync.WaitGroup
+	for i := range senders {
+		wg.Go(func() {
+			parts := [][]byte{bytes.Repeat([]byte{'a' + byte(i)}, 16), bytes.Repeat([]byte{'A' + byte(i)}, 32)}
+			for range sends {
+				if err := tr.SendMessage(parts); err != nil {
+					t.Errorf("SendMessage: %v", err)
+					return
+				}
+			}
+		})
+	}
+	// Read every reply, so that no sender blocks on a full channel and Close
+	// can finish.
+	for range senders * sends {
+		reply, ok := f.kernel.nextReply()
+		if !ok {
+			t.Error("the transport sent no reply within 5s")
+			break
+		}
+		i := reply[0] - 'a'
+		if want := append(bytes.Repeat([]byte{'a' + i}, 16), bytes.Repeat([]byte{'A' + i}, 32)...); !bytes.Equal(reply, want) {
+			t.Errorf("sent %q, want %q", reply, want)
+		}
+	}
+	wg.Wait()
 }
 
 // drainServer answers every op with ENOSYS until the connection ends.

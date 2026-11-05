@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"path"
 	"runtime"
 	"sync"
@@ -439,65 +438,18 @@ func (c *Connection) handleInterrupt(fuseID uint64) {
 // Read the next message from the kernel. The message must later be destroyed
 // using destroyInMessage.
 func (c *Connection) readMessage() (*buffer.InMessage, error) {
-	// Allocate a message.
 	m := c.getInMessage()
-
-	// Loop past transient errors.
-	for {
-		// Attempt a read.
-		err := m.Init(transportReader{transport: c.transport})
-
-		// Special cases:
-		//
-		//  *  ENODEV means fuse has hung up.
-		//
-		//  *  On Linux, ECONNABORTED does too. fuse_dev_do_read returns it
-		//     instead of ENODEV when a read races the connection's abort, as
-		//     an unmount does (https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dev.c#L1627-L1629).
-		//
-		//  *  EINTR means we should try again. (This seems to happen often on
-		//     OS X, cf. http://golang.org/issue/11180)
-		//
-		if pe, ok := err.(*os.PathError); ok {
-			switch pe.Err {
-			case syscall.ENODEV:
-				err = io.EOF
-
-			case syscall.ECONNABORTED:
-				if runtime.GOOS == "linux" {
-					err = io.EOF
-				}
-
-			case syscall.EINTR:
-				err = nil
-				continue
-			}
-		}
-
-		if err != nil {
-			c.putInMessage(m)
-			return nil, err
-		}
-
-		return m, nil
+	if err := m.Init(c.transport); err != nil {
+		c.putInMessage(m)
+		return nil, err
 	}
+
+	return m, nil
 }
 
-// Write a buffer.OutMessage to the kernel, with writev if vectored IO is useful
-// and write if not.
+// Write a buffer.OutMessage to the kernel.
 func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
-	var err error
-	if outMsg.Sglist != nil {
-		if fusekernel.IsPlatformFuseT {
-			// writev is not atomic on macos, restrict to fuse-t platform
-			writeLock.Lock()
-			defer writeLock.Unlock()
-		}
-		err = c.transport.WritevMessage(outMsg.Sglist)
-	} else {
-		err = c.transport.WriteMessage(outMsg.OutHeaderBytes())
-	}
-	return err
+	return c.transport.SendMessage(outMsg.Parts())
 }
 
 // ReadOp consumes the next op from the kernel process, returning the op and a
@@ -702,8 +654,6 @@ func (c *Connection) shouldLogError(
 	return true
 }
 
-var writeLock sync.Mutex
-
 // Reply replies to an op previously read using ReadOp, with the supplied error
 // (or nil if successful). The context must be the context returned by ReadOp.
 //
@@ -784,7 +734,7 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 			if c.errorLogger != nil {
 				c.errorLogger.Print(writeErrMsg)
 			}
-			return fmt.Errorf(writeErrMsg)
+			return errors.New(writeErrMsg)
 		}
 		outMsg.Sglist = nil
 	}

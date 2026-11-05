@@ -182,7 +182,7 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	if debugLogger != nil {
 		debugLogger.Println("Starting fusermount/os mount")
 	}
-	// Start fusermount/mount_macfuse/mount_osxfuse.
+	// Start fusermount or mount_macfuse.
 	cmd := exec.Command(binary, argv...)
 	cmd.Env = append(os.Environ(), "_FUSE_COMMFD=3")
 	cmd.Env = append(cmd.Env, additionalEnv...)

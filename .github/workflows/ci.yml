@@ -48,12 +48,12 @@ jobs:
         go-version: stable
     - name: Build
       run: go build ./...
-    # composites and unsafeptr report existing findings in connection.go,
-    # conversions.go and internal/buffer.
+    # composites reports unkeyed fusekernel.Protocol literals older than the
+    # fork.
     - name: Vet
       run: |
-        go vet -composites=false -unsafeptr=false ./...
-        GOARCH=arm64 go vet -composites=false -unsafeptr=false ./...
+        go vet -composites=false ./...
+        GOARCH=arm64 go vet -composites=false ./...
     - name: Test
       run: go test -race -count=1 ./...
     # A 32-bit int catches wire lengths that overflow it. The race detector
@@ -131,8 +131,9 @@ jobs:
       run: HOMEBREW_NO_AUTO_UPDATE=1 brew install macfuse
     - name: Build
       run: go build ./...
-    # composites and unsafeptr report existing findings in connection.go,
-    # conversions.go and internal/buffer.
+    # composites reports unkeyed fusekernel.Protocol literals older than the
+    # fork. unsafeptr reports the purego addresses that the FSKit fake and
+    # probe convert to pointers.
     - name: Vet
       run: go vet -composites=false -unsafeptr=false ./...
     - name: Test

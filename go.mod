@@ -1,10 +1,10 @@
 module github.com/dsfaccini/fuse
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/detailyang/go-fallocate v0.0.0-20180908115635-432fa640bd2e
-	github.com/ebitengine/purego v0.10.2
+	github.com/ebitengine/purego v0.11.2
 	github.com/jacobsa/oglematchers v0.0.0-20150720000706-141901ea67cd
 	github.com/jacobsa/ogletest v0.0.0-20170503003838-80d50a735a11
 	github.com/jacobsa/syncutil v0.0.0-20180201203307-228ac8e5a6c3

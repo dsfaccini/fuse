@@ -150,10 +150,10 @@ func MountWithFakeMFMount(t *testing.T, f *fakeMFMount, server Server, cfg Mount
 	if activeFakeMFMount.Load() != f {
 		t.Fatal("MountWithFakeMFMount needs the active fake MFMount")
 	}
-	oldLoader := fskitAPILoader
-	fskitAPILoader = func(string) (*fskitAPI, error) { return fakeMFMountAPI(), nil }
-	t.Cleanup(func() { fskitAPILoader = oldLoader })
 	setFSKitTestSystem(t, fskitFrameworkPath, "26.0")
+	oldLoader := fskitAPILoader
+	fskitAPILoader = func() (*fskitAPI, error) { return fakeMFMountAPI(), nil }
+	t.Cleanup(func() { fskitAPILoader = oldLoader })
 	cfg.Options = maps.Clone(cfg.Options)
 	if cfg.Options == nil {
 		cfg.Options = map[string]string{}
@@ -239,16 +239,6 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 			f.lastMessage++
 			f.messages[f.lastMessage] = &fakeMessage{buffers: r.buffers}
 			return f.lastMessage
-		}),
-		messageGetBodySize: purego.NewCallback(func(message uintptr) uintptr {
-			f := activeFakeMFMount.Load()
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			var size int
-			for _, b := range f.messages[message].buffers {
-				size += len(b)
-			}
-			return uintptr(size)
 		}),
 		messageGetBodyBuffers: purego.NewCallback(func(message, out uintptr) uintptr {
 			f := activeFakeMFMount.Load()

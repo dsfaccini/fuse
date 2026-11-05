@@ -49,16 +49,39 @@ type fskitAPI struct {
 	channelCreate          uintptr
 	mount                  uintptr
 	channelCopyNextMessage uintptr
-	messageGetBodySize     uintptr
 	messageGetBodyBuffers  uintptr
 	channelSendMessage     uintptr
 	channelClose           uintptr
 	release                uintptr
 }
 
-// fskitAPILoader loads the MFMount functions at mount time. Tests replace it
-// to mount through a fake MFMount.
-var fskitAPILoader = loadFSKitAPI
+// fskitAPILoader returns the MFMount functions. Tests replace it to mount
+// through a fake MFMount.
+var fskitAPILoader = cacheFSKitAPI(loadFSKitAPI)
+
+// cacheFSKitAPI returns a loader that calls load with fskitFrameworkPath until
+// a load succeeds, then returns that result. A failed load is retried, so a
+// running process can use macFUSE once it is installed.
+func cacheFSKitAPI(load func(string) (*fskitAPI, error)) func() (*fskitAPI, error) {
+	var mu sync.Mutex
+	var api *fskitAPI
+	return func() (*fskitAPI, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if api == nil {
+			loaded, err := load(fskitFrameworkPath)
+			if err != nil {
+				return nil, err
+			}
+			api = loaded
+		}
+		return api, nil
+	}
+}
+
+// fskitSendVectors is how many finished sends' iovec slices a transport keeps
+// for reuse. A send that finds none kept allocates one.
+const fskitSendVectors = 16
 
 func loadFSKitAPI(path string) (*fskitAPI, error) {
 	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -73,7 +96,6 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 		{"MFChannelCreate", &api.channelCreate},
 		{"MFMount", &api.mount},
 		{"MFChannelCopyNextMessage", &api.channelCopyNextMessage},
-		{"MFMessageGetBodySize", &api.messageGetBodySize},
 		{"MFMessageGetBodyBuffers", &api.messageGetBodyBuffers},
 		{"MFChannelSendMessage", &api.channelSendMessage},
 		{"MFChannelClose", &api.channelClose},
@@ -88,7 +110,12 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 }
 
 type fskitTransport struct {
-	api            *fskitAPI
+	api *fskitAPI
+
+	// vectors holds iovec slices that sends have finished with, so that a warm
+	// transport sends without allocating and without a lock across the send.
+	vectors chan []syscall.Iovec
+
 	mu             sync.Mutex
 	channel        uintptr
 	closed         bool
@@ -118,7 +145,7 @@ func mountFSKitTransport(
 		return nil, fmt.Errorf("FSKit mount point: %w", err)
 	}
 
-	api, err := fskitAPILoader(fskitFrameworkPath)
+	api, err := fskitAPILoader()
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +181,7 @@ func mountFSKitTransport(
 func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
 	return &fskitTransport{
 		api:     api,
+		vectors: make(chan []syscall.Iovec, fskitSendVectors),
 		channel: channel,
 		closeNative: func() error {
 			closed, _, errno := purego.SyscallN(api.channelClose, channel)
@@ -255,17 +283,8 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 }
 
 func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
-	result, _, callErr := purego.SyscallN(api.messageGetBodySize, message)
-	bodySize := int(result)
-	if bodySize < 0 {
-		return 0, fmt.Errorf("MFMessageGetBodySize: %w", callErrno(callErr))
-	}
-	if bodySize > len(dst) {
-		return 0, fmt.Errorf("FUSE message has %d bytes; transport buffer holds %d", bodySize, len(dst))
-	}
-
 	var bodyBuffers *syscall.Iovec
-	result, _, callErr = purego.SyscallN(
+	result, _, callErr := purego.SyscallN(
 		api.messageGetBodyBuffers,
 		message,
 		uintptr(unsafe.Pointer(&bodyBuffers)))
@@ -277,41 +296,49 @@ func (api *fskitAPI) copyMessage(message uintptr, dst []byte) (int, error) {
 		return 0, fmt.Errorf("MFMessageGetBodyBuffers returned no body buffers")
 	}
 
+	// InMessage.Init checks the header's length against the bytes copied.
 	var offset int
 	for _, body := range unsafe.Slice(bodyBuffers, count) {
 		if body.Len > uint64(len(dst)-offset) {
-			return 0, fmt.Errorf("FUSE message buffers exceed reported body size %d", bodySize)
+			return 0, fmt.Errorf("FUSE message exceeds the %d-byte transport buffer", len(dst))
 		}
 		length := int(body.Len)
 		copy(dst[offset:offset+length], unsafe.Slice(body.Base, length))
 		offset += length
 	}
-	if offset != bodySize {
-		return 0, fmt.Errorf("FUSE message buffers contain %d bytes; header reports %d", offset, bodySize)
-	}
 	return offset, nil
 }
 
-func (t *fskitTransport) WriteMessage(message []byte) error {
-	return t.WritevMessage([][]byte{message})
-}
-
-func (t *fskitTransport) WritevMessage(parts [][]byte) error {
+func (t *fskitTransport) SendMessage(parts [][]byte) error {
 	if len(parts) == 0 {
 		return fmt.Errorf("cannot send an empty FUSE message")
 	}
 
 	var total int
-	vectors := make([]syscall.Iovec, len(parts))
+	var vectors []syscall.Iovec
+	select {
+	case vectors = <-t.vectors:
+	default:
+	}
+	defer func() {
+		// Drop the references to parts before the slice is reused.
+		clear(vectors)
+		select {
+		case t.vectors <- vectors[:0]:
+		default:
+		}
+	}()
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
-	for i, part := range parts {
-		total += len(part)
+	for _, part := range parts {
+		var vector syscall.Iovec
 		if len(part) != 0 {
 			pinner.Pin(&part[0])
-			vectors[i].Base = &part[0]
-			vectors[i].SetLen(len(part))
+			vector.Base = &part[0]
+			vector.SetLen(len(part))
 		}
+		vectors = append(vectors, vector)
+		total += len(part)
 	}
 
 	t.mu.Lock()
