@@ -50,13 +50,16 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Mount`'s config validation without a mount, pass a mount point that
   does not exist. `Mount` validates the config before it checks the mount
   point. A regression then fails with ENOENT instead of mounting.
-- On darwin, make FSKit unreachable in every ungated test that calls `Mount`
-  or `MountContext` on a mount point that exists, other than through
-  `MountWithFakeMFMount`. Call `setFSKitTestSystem` with a framework path that
-  does not exist, as `TestMountReturnsTypedFSKitErrors` and
-  `useFakeMacFUSEMountHelper` do. Without it, a regression that routes the
-  test to `BackendFSKit` mounts through the installed macFUSE. A mutation you
-  make to check the test counts as such a regression.
+- On darwin, the root package's test binary cannot reach macFUSE by default.
+  Its `init` in `mount_deny_darwin_test.go` points `fskitFrameworkPath` at a
+  missing path unless `FUSE_RUN_FSKIT_PROBE=1`, and `macfuseMountHelper`
+  unless `FUSE_RUN_MOUNT_TESTS=1`. `TestMountsAreDeniedByDefault` checks it.
+- To load the installed MFMount in a test, call `useInstalledMFMount`. It
+  restores the denied path and the loader cache when the test ends.
+- Before you run a mutant of mount, backend or loader code, check that every
+  test it runs reaches only the fake MFMount, a fake mount helper or a missing
+  path. If you cannot tell, do not run it. Packages other than the root have
+  no default-deny.
 - `Mount` force-unmounts a native mount it will not return, and
   `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
   `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test
@@ -100,9 +103,9 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - `linux-mount` fails when no test that `mounttest.SkipUnlessEnabled` let run
   passed. It finds those tests by the line the gate logs.
 - `macos` installs macFUSE 5.5.0 from its GitHub release, pinned by
-  SHA-256. `requireInstalledMFMount` guards the tests that load the installed
-  MFMount framework. They fail when `GITHUB_ACTIONS=true` and macFUSE is
-  missing or older than 5.5, and skip elsewhere.
+  SHA-256. The tests that call `useInstalledMFMount` fail when
+  `GITHUB_ACTIONS=true` and macFUSE is missing or older than 5.5, and skip
+  elsewhere.
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.

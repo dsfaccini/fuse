@@ -90,3 +90,71 @@ func TestNotifierSendsWhileServing(t *testing.T) {
 		t.Errorf("notification code = %d, unique = %d; want an inode invalidation", code, unique)
 	}
 }
+
+// notifyBlockingKernel is a fake kernel whose notification writes block until
+// release is closed. Replies go through.
+type notifyBlockingKernel struct {
+	*fakeKernel
+	sending chan struct{}
+	release chan struct{}
+}
+
+func (k *notifyBlockingKernel) SendMessage(parts [][]byte) error {
+	// A notification's header carries unique 0.
+	if binary.NativeEndian.Uint64(parts[0][8:16]) == 0 {
+		close(k.sending)
+		<-k.release
+	}
+	return k.fakeKernel.SendMessage(parts)
+}
+
+// ServeOps returns only after the notification in progress is sent, so that
+// the connection is still open for it.
+func TestNotifierServerWaitsForTheNotificationInProgress(t *testing.T) {
+	cfg, err := (&MountConfig{}).normalize()
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	k := &notifyBlockingKernel{fakeKernel: newFakeKernel(), sending: make(chan struct{}), release: make(chan struct{})}
+	k.Send(fakeInit()...)
+	c, err := newConnection(cfg, nil, nil, nil, k)
+	if err != nil {
+		t.Fatalf("newConnection: %v", err)
+	}
+	defer c.close()
+	checkInitReply(t, k.NextReply(t))
+
+	n := NewNotifier()
+	server := newStartedServer()
+	served := make(chan struct{})
+	go func() {
+		NewServerWithNotifier(n, server).ServeOps(c)
+		close(served)
+	}()
+	server.wait(t)
+	notified := make(chan error, 1)
+	go func() { notified <- n.InvalidateInode(7, 0, 0) }()
+	select {
+	case <-k.sending:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the notification was not sent within 5s")
+	}
+
+	// The server stops while the notification write is blocked.
+	k.HangUp()
+	select {
+	case <-served:
+		t.Fatal("ServeOps returned while a notification was being sent")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(k.release)
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeOps did not return within 5s of the notification")
+	}
+	if err := <-notified; err != nil {
+		t.Errorf("InvalidateInode = %v, want nil", err)
+	}
+}

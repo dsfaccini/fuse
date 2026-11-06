@@ -406,8 +406,7 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 		FSName:                  probeDirPrefix + name,
 		Subtype:                 "fskit-probe",
 		DisableWritebackCaching: true,
-		Backend:                 BackendFSKit,
-		Options:                 map[string]string{},
+		Options:                 map[string]string{"backend": "fskit"},
 	}
 	if configure != nil {
 		configure(&cfg)
@@ -420,6 +419,7 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 		return nil
 	}
 	m.options = cfg.toMap()
+	delete(m.options, "backend")
 	var options []string
 	for _, key := range slices.Sorted(maps.Keys(m.options)) {
 		if value := m.options[key]; value != "" {

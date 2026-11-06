@@ -148,26 +148,8 @@ func TestCheckMacFUSEVersion(t *testing.T) {
 	}
 }
 
-// requireInstalledMFMount skips the test unless macFUSE 5.5 or later is
-// installed. CI installs it, so there a missing or older macFUSE fails the
-// test.
-func requireInstalledMFMount(t *testing.T) {
-	t.Helper()
-	err := checkMacFUSEVersion(fskitFrameworkPath)
-	if err == nil {
-		_, err = os.Stat(fskitFrameworkPath)
-	}
-	switch {
-	case err == nil:
-	case os.Getenv("GITHUB_ACTIONS") == "true":
-		t.Fatalf("macFUSE 5.5 or later not installed: %v", err)
-	default:
-		t.Skipf("macFUSE 5.5 or later not installed: %v", err)
-	}
-}
-
 func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
-	requireInstalledMFMount(t)
+	useInstalledMFMount(t)
 	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {
 		t.Fatalf("loadFSKitAPI(%q): %v", fskitFrameworkPath, err)
 	}
@@ -286,6 +268,7 @@ const redirectedMFMount = "FUSE_TEST_REDIRECTED_MFMOUNT"
 // dyld honors DYLD_FRAMEWORK_PATH in a process without the hardened runtime,
 // such as a test binary, so dlopen can load a copy of MFMount from elsewhere.
 func TestLoadFSKitAPIRefusesARedirectedFramework(t *testing.T) {
+	useInstalledMFMount(t)
 	if os.Getenv(redirectedMFMount) == "1" {
 		_, err := loadFSKitAPI(fskitFrameworkPath)
 		if err != nil && strings.Contains(err.Error(), "instead of "+fskitFrameworkPath) {
@@ -302,7 +285,6 @@ func TestLoadFSKitAPIRefusesARedirectedFramework(t *testing.T) {
 		t.Fatalf("loadFSKitAPI error = %v, want a refusal of the redirected framework", err)
 	}
 
-	requireInstalledMFMount(t)
 	framework := filepath.Dir(filepath.Dir(filepath.Dir(fskitFrameworkPath)))
 	// The copy keeps the bundle, whose resources its code signature covers.
 	redirect := t.TempDir()
@@ -315,6 +297,8 @@ func TestLoadFSKitAPIRefusesARedirectedFramework(t *testing.T) {
 	switch {
 	case err != nil:
 		t.Fatalf("redirected load: %v\n%s", err, out)
+	case bytes.Contains(out, []byte("--- SKIP")) && os.Getenv("GITHUB_ACTIONS") == "true":
+		t.Fatalf("redirected load skipped:\n%s", out)
 	case bytes.Contains(out, []byte("--- SKIP")):
 		t.Skipf("redirected load skipped:\n%s", out)
 	case !bytes.Contains(out, []byte("--- PASS")):

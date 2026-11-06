@@ -12,7 +12,6 @@ func TestMountUsesMacFUSEForEveryFuseImpl(t *testing.T) {
 	oldHelper := macfuseMountHelper
 	macfuseMountHelper = filepath.Join(t.TempDir(), "mount_macfuse")
 	t.Cleanup(func() { macfuseMountHelper = oldHelper })
-	setFSKitTestSystem(t, filepath.Join(t.TempDir(), "MFMount"), "26.0")
 
 	for _, impl := range []FUSEImpl{FUSEImplFuseT, FUSEImplMacFUSE} {
 		if _, err := Mount(t.TempDir(), nil, &MountConfig{FuseImpl: impl}); !errors.Is(err, errMacFUSENotFound) {
@@ -21,13 +20,12 @@ func TestMountUsesMacFUSEForEveryFuseImpl(t *testing.T) {
 	}
 }
 
-// Backend wins over Options["backend"]. The mount helper and MFMount are
-// missing, so nothing mounts, whichever backend Mount picks.
+// Backend wins over Options["backend"]. The mount helper is missing, and the
+// test init denies MFMount, so nothing mounts, whichever backend Mount picks.
 func TestMountBackendWinsOverTheDeprecatedOption(t *testing.T) {
 	oldHelper := macfuseMountHelper
 	macfuseMountHelper = filepath.Join(t.TempDir(), "mount_macfuse")
 	t.Cleanup(func() { macfuseMountHelper = oldHelper })
-	setFSKitTestSystem(t, filepath.Join(t.TempDir(), "MFMount"), "26.0")
 
 	config := &MountConfig{Backend: BackendMacFUSEKernelExtension, Options: map[string]string{"backend": "fskit"}}
 	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, errMacFUSENotFound) {
