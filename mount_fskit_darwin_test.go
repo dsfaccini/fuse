@@ -443,6 +443,14 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 			if f.channelCloses != 0 {
 				t.Errorf("MFChannelClose calls = %d, want 0: MFMount closes the channel when it fails", f.channelCloses)
 			}
+			// MFMount can fail with the unexpected result after it mounted.
+			wantUnmounts := 0
+			if test.result == FSKitMountResultUnexpectedFailure {
+				wantUnmounts = 1
+			}
+			if len(f.unmounts) != wantUnmounts {
+				t.Errorf("unmount calls = %v, want %d", f.unmounts, wantUnmounts)
+			}
 		})
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -131,7 +132,9 @@ type fskitTransport struct {
 	// cancelled is set once cancel runs or MFMount fails. A read that EINTR
 	// interrupts then returns io.EOF instead of retrying, so the read waiting
 	// for INIT ends.
-	cancelled       bool
+	cancelled bool
+	// reading counts the reads in progress.
+	reading         int
 	mountSucceeded  bool
 	operations      sync.WaitGroup
 	closeOnce       sync.Once
@@ -183,6 +186,11 @@ func mountFSKitTransport(dir string, cfg *MountConfig) (nativeMount, error) {
 		var mountErr error
 		if code := int32(result); code != 0 {
 			mountErr = FSKitMountError{Result: code}
+		}
+		if int32(result) == FSKitMountResultUnexpectedFailure {
+			// MFMount may have mounted before it failed: it returns this
+			// result when it cannot unpack the mount service's reply.
+			forceUnmount(dir, BackendFSKit)
 		}
 		t.setMountResult(mountErr)
 	}()
@@ -267,10 +275,26 @@ func (t *fskitTransport) setMountResult(err error) {
 		t.closeNative()
 	}
 	if err != nil {
-		t.interruptNative()
+		t.interruptReads()
 	}
 	t.mountErr = err
 	close(t.mounted)
+}
+
+// interruptReads interrupts the channel until no read is in progress.
+// MFChannelInterrupt wakes only the reads already waiting, so a read that
+// checked cancelled just before it was set needs a later interrupt.
+func (t *fskitTransport) interruptReads() {
+	for {
+		t.interruptNative()
+		t.mu.Lock()
+		reading := t.reading
+		t.mu.Unlock()
+		if reading == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (t *fskitTransport) backend() Backend { return BackendFSKit }
@@ -292,7 +316,7 @@ func (t *fskitTransport) cancel() {
 	t.operations.Add(1)
 	t.mu.Unlock()
 	defer t.operations.Done()
-	t.interruptNative()
+	t.interruptReads()
 }
 
 func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
@@ -302,9 +326,15 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	t.operations.Add(1)
+	t.reading++
 	channel := t.channel
 	t.mu.Unlock()
-	defer t.operations.Done()
+	defer func() {
+		t.mu.Lock()
+		t.reading--
+		t.mu.Unlock()
+		t.operations.Done()
+	}()
 
 	for {
 		message, _, callErr := purego.SyscallN(t.api.channelCopyNextMessage, channel)

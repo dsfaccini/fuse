@@ -2,12 +2,15 @@ package fuse_test
 
 import (
 	"context"
+	"errors"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -66,6 +69,39 @@ func TestSuccessfulMount(t *testing.T) {
 	}()
 
 	defer fuse.Unmount(mfs.Dir())
+}
+
+func TestMountContextUnmountsThroughItsBackend(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	mfs, err := fuse.MountContext(ctx, t.TempDir(), fuseutil.NewFileSystemServer(&minimalFS{}), &fuse.MountConfig{})
+	if err != nil {
+		t.Fatalf("fuse.MountContext: %v", err)
+	}
+	want := fuse.BackendLinux
+	if runtime.GOOS == "darwin" {
+		want = fuse.BackendMacFUSEKernelExtension
+	}
+	if got := mfs.Backend(); got != want {
+		t.Errorf("Backend() = %q, want %q", got, want)
+	}
+	if err := mfs.Unmount(ctx); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+	if err := mfs.Join(ctx); err != nil {
+		t.Errorf("Join after Unmount: %v", err)
+	}
+}
+
+func TestMountContextReturnsAtOnceWhenContextEnded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := fuse.MountContext(ctx, t.TempDir(), fuseutil.NewFileSystemServer(&minimalFS{}), &fuse.MountConfig{})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("fuse.MountContext error = %v, want context.Canceled", err)
+	}
 }
 
 func TestNonexistentMountPoint(t *testing.T) {

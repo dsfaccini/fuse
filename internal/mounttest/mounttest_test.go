@@ -329,6 +329,7 @@ func TestFakeMount(t *testing.T) { MountWithFakeMFMount(t) }`,
 // SkipUnlessFSKitProbeEnabled.
 var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                          "checkMountPoint rejects the directory",
+	"TestMountContextReturnsAtOnceWhenContextEnded":      "the context has ended",
 	"TestMountReturnsTypedFSKitErrors":                   "the FSKit preflight fails",
 	"TestMountRejectsInvalidConfigBeforeMounting":        "config validation fails",
 	"TestMountUsesMacFUSEForEveryFuseImpl":               "the macFUSE mount helper is missing",
