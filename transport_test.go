@@ -234,11 +234,11 @@ func TestPayloadRepliesReuseOutMessageStorage(t *testing.T) {
 	lookUp, create, readDir := &fuseops.LookUpInodeOp{}, &fuseops.CreateFileOp{}, &fuseops.ReadDirOp{BytesRead: 100}
 	tests := []struct {
 		name  string
-		build func(m *buffer.OutMessage)
+		build func(t *testing.T, m *buffer.OutMessage)
 	}{
-		{"lookup", func(m *buffer.OutMessage) { c.kernelResponse(m, 1, lookUp, nil) }},
-		{"create", func(m *buffer.OutMessage) { c.kernelResponse(m, 1, create, nil) }},
-		{"readdir", func(m *buffer.OutMessage) {
+		{"lookup", func(_ *testing.T, m *buffer.OutMessage) { c.kernelResponse(m, 1, lookUp, nil) }},
+		{"create", func(_ *testing.T, m *buffer.OutMessage) { c.kernelResponse(m, 1, create, nil) }},
+		{"readdir", func(t *testing.T, m *buffer.OutMessage) {
 			if _, err := growDst(m, 64<<10, limit); err != nil {
 				t.Fatalf("growDst: %v", err)
 			}
@@ -249,7 +249,7 @@ func TestPayloadRepliesReuseOutMessageStorage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			allocs := testing.AllocsPerRun(100, func() {
 				m := c.getOutMessage()
-				tt.build(m)
+				tt.build(t, m)
 				if err := c.writeOutMessage(m); err != nil {
 					t.Fatalf("writeOutMessage: %v", err)
 				}

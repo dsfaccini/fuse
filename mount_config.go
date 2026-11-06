@@ -185,22 +185,33 @@ type MountConfig struct {
 
 	// Linux only.
 	//
-	// Negotiate FUSE_AUTO_INVAL_DATA when the kernel offers it. The kernel then
-	// drops a regular file's cached pages whenever new attributes for it carry
-	// a changed mtime, and each read through the page cache first refreshes
-	// attributes whose expiration has passed. Without it, the kernel drops
-	// the pages only when the size changes.
+	// Negotiate FUSE_AUTO_INVAL_DATA when the kernel offers it. Each read
+	// through the page cache then first refreshes the file's attributes if
+	// they have expired [1].
 	//
-	// This matters to a file system that keeps the page cache across opens
-	// with OpenFileOp.KeepPageCache. A change that keeps the size but changes
-	// the mtime stops being served from stale pages once the attributes
-	// expire. A change that keeps both the size and the mtime is still served
-	// stale.
+	// Without writeback caching, the kernel drops a regular file's cached
+	// pages whenever new attributes carry a changed size. With this field, it
+	// also drops them when the mtime changed.
 	//
-	// It has no effect unless DisableWritebackCaching is also set. With
-	// writeback caching, the kernel keeps its own size and mtime for regular
-	// files and never compares them with the file system's
-	// (https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/inode.c#L304-L386).
+	// This matters to a file system that keeps the page cache across opens. It
+	// keeps the cache when it sets OpenFileOp.KeepPageCache. It also keeps the
+	// cache when it sets EnableNoOpenSupport and answers OpenFile with ENOSYS,
+	// because the kernel then keeps the cache by default [2]. A change that
+	// keeps the size but changes the mtime stops being served from stale pages
+	// once the attributes expire. A change that keeps both the size and the
+	// mtime is still served stale.
+	//
+	// With writeback caching, the default unless DisableWritebackCaching is
+	// set, the kernel keeps its own size and mtime for regular files. It never
+	// drops their pages for a change the file system reports [3]. Reads still
+	// refresh expired attributes, so each read after an expiration costs a
+	// GETATTR [4] [5].
+	//
+	// [1]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/file.c#L1155-L1174
+	// [2]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/file.c#L160
+	// [3]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/inode.c#L304-L386
+	// [4]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/dir.c#L1564-L1567
+	// [5]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/dir.c#L1596-L1599
 	EnableAutoInvalData bool
 
 	// Linux only.

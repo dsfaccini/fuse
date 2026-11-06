@@ -942,20 +942,21 @@ func TestFreelistsKeepAtMostMaxFreeMessages(t *testing.T) {
 	}
 }
 
-// getOutMessage does not reset what it hands out, so putOutMessage must.
+// A freed message must not keep the slices a file system appended, so
+// putOutMessage resets it before it enters the freelist.
 func TestPutOutMessageResetsIt(t *testing.T) {
 	c := newTestConnection(nil)
 	m := c.getOutMessage()
 	m.OutHeader().Unique = 7
-	m.Grow(16)
+	m.Append([]byte("data"))
 	c.putOutMessage(m)
 
-	got := c.getOutMessage()
+	got := (*buffer.OutMessage)(c.outMessages.Get())
 	if got != m {
-		t.Fatal("getOutMessage did not reuse the freed message")
+		t.Fatal("the freelist does not hold the freed message")
 	}
-	if got.Len() != buffer.OutMessageHeaderSize || *got.OutHeader() != (fusekernel.OutHeader{}) {
-		t.Errorf("reused message has Len %d and header %+v, want a bare zero header", got.Len(), *got.OutHeader())
+	if got.Len() != buffer.OutMessageHeaderSize || got.Sglist != nil || *got.OutHeader() != (fusekernel.OutHeader{}) {
+		t.Errorf("freed message has Len %d, Sglist %q and header %+v, want a bare zero header", got.Len(), got.Sglist, *got.OutHeader())
 	}
 }
 
