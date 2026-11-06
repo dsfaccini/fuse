@@ -75,10 +75,6 @@ const (
 	probeDirPrefix = "fskit-probe-"
 	// probeFiller is the byte the server fills every READ reply with.
 	probeFiller = 'p'
-	// probePollInterval and probePollLimit pace the stats that wait for FSKit
-	// to show a new size.
-	probePollInterval = 250 * time.Millisecond
-	probePollLimit    = 15 * time.Second
 
 	frameFromFSKit  = 'K'
 	frameFromServer = 'S'
@@ -665,7 +661,8 @@ func (m *probeMount) measureBase() {
 		m.measureNegativeEntry,
 		m.measureLookupAttributes,
 		m.measureInterrupt,
-		m.measure1231,
+		m.measure1231FirstRead,
+		m.measure1231Reread,
 		m.measurePaddingTimings,
 		m.measurePermissions,
 		m.measureWriteSizes,
@@ -700,19 +697,12 @@ func (m *probeMount) stat(name string) (int64, error) {
 	return m.statPath(m.path(name))
 }
 
+// statPath stats path, bounded. While the probe holds a READ, FSKit can hold
+// a stat of that file until the READ is answered; use startStat for such a
+// stat.
 func (m *probeMount) statPath(path string) (int64, error) {
-	size, err := statSize(path)
-	if errors.Is(err, errProbeTimeout) {
-		m.stop(fmt.Sprintf("stat on %s did not return within %v", m.name, probeWait))
-	}
-	return size, err
-}
-
-// statSize stats path, bounded. Use probeMount.statPath unless the probe
-// itself holds a request the stat may wait behind.
-func statSize(path string) (int64, error) {
 	var size int64
-	err := within(probeWait, func() error {
+	err := m.within("stat", probeWait, func() error {
 		info, err := os.Stat(path)
 		if err == nil {
 			size = info.Size()
@@ -723,6 +713,48 @@ func statSize(path string) (int64, error) {
 		return 0, err
 	}
 	return size, nil
+}
+
+// asyncStat is a stat on its own goroutine, which the probe waits for only as
+// long as it chooses.
+type asyncStat struct {
+	done chan struct{}
+	// size and err are set once done is closed.
+	size int64
+	err  error
+}
+
+func startStat(path string) *asyncStat {
+	s := &asyncStat{done: make(chan struct{})}
+	go func() {
+		defer close(s.done)
+		info, err := os.Stat(path)
+		if err == nil {
+			s.size = info.Size()
+		}
+		s.err = err
+	}()
+	return s
+}
+
+// wait waits up to d for the stat and reports whether it returned.
+func (s *asyncStat) wait(d time.Duration) bool {
+	select {
+	case <-s.done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// String describes the stat as its size and error, or "pending".
+func (s *asyncStat) String() string {
+	select {
+	case <-s.done:
+		return fmt.Sprintf("%d,%s", s.size, errName(s.err))
+	default:
+		return "pending"
+	}
 }
 
 func (m *probeMount) open(path string, flag int) (*os.File, error) {
@@ -907,65 +939,123 @@ func (m *probeMount) measureInterrupt() {
 	})
 }
 
-// measure1231 reproduces macfuse#1231: the server reports 8192 bytes and
-// answers READ with 100 bytes and no error. The test fails once the read
-// returns only those 100 bytes, or fails with EIO.
-func (m *probeMount) measure1231() {
+// measure1231FirstRead checks macfuse#1231 on the first read of a file whose
+// data FSKit has not cached: the server reports 8192 bytes and answers READ
+// with 100 bytes and no error. The test fails once the read returns only those
+// 100 bytes, or fails with EIO.
+func (m *probeMount) measure1231FirstRead() {
 	const name, reported, sent = "short_read", 8192, 100
 	mark := m.log.mark()
 	got, err := m.readOnce(name, reported)
-	replies := m.log.readReplies(mark, name)
-	// An error reply comes from the library, not the server. macFUSE 5.5.0
-	// changed how it handles an empty reply
-	// (https://github.com/macfuse/macfuse/issues/1196).
-	libraryError := slices.ContainsFunc(replies, func(e probeEvent) bool { return e.status != 0 })
-	emptyReply := slices.ContainsFunc(replies, func(e probeEvent) bool { return e.size <= int64(buffer.OutMessageHeaderSize) })
+	m.report1231("macfuse_1231_first_read", sent, got, err, m.log.readReplies(mark, name), map[string]string{
+		"reported_size": fmt.Sprint(reported),
+	})
+}
+
+// measure1231Reread reproduces macfuse#1231 as reported: a first read of a
+// 200-byte file returns all 200 bytes. The server then answers READ with 46
+// bytes and no error, while it still reports 200 bytes with a new mtime, and
+// the file is read again. The test fails once the second read returns only
+// those 46 bytes, or fails with EIO. A second read that sends no READ is
+// unknown.
+func (m *probeMount) measure1231Reread() {
+	const name, reported, sent = "reread", 200, 46
+	const item = "macfuse_1231_reread"
+	n := m.server.names[name]
+	first, firstErr := m.readOnce(name, reported)
 	details := map[string]string{
-		"reported_size":  fmt.Sprint(reported),
-		"reply_bytes":    fmt.Sprint(sent),
-		"read_bytes":     fmt.Sprint(got),
-		"error":          errName(err),
-		"read_replies":   fmt.Sprint(len(replies)),
-		"library_errors": yesNo(libraryError),
-		"empty_replies":  yesNo(emptyReply),
+		"reported_size":    fmt.Sprint(reported),
+		"first_read_bytes": fmt.Sprint(first),
+		"first_read_error": errName(firstErr),
 	}
-	fixed := "FSKit no longer returns the reported size for a %d-byte READ reply, so macfuse#1231 looks fixed (%s): make this case expect the fix, and revisit the workarounds for it"
-	switch {
-	case len(replies) == 0 || libraryError || emptyReply || errors.Is(err, errProbeTimeout):
-		m.report("macfuse_1231", "unknown", details)
-	case errors.Is(err, syscall.EIO):
-		m.report("macfuse_1231", "fails_read", details)
-		m.t.Errorf(fixed, sent, "the read fails with EIO")
-	case err != nil || got < sent:
-		m.report("macfuse_1231", "unknown", details)
-	case got == sent:
-		m.report("macfuse_1231", "not_padded", details)
-		m.t.Errorf(fixed, sent, "the read returns only the reply")
-	default:
-		m.report("macfuse_1231", "padded", details)
+	if firstErr != nil || first != reported {
+		m.report(item, "unknown", details)
+		return
+	}
+	n.dataSize.Store(sent)
+	n.mtimeShift.Store(int64(time.Hour))
+	mark := m.log.mark()
+	got, err := m.readOnce(name, reported)
+	m.report1231(item, sent, got, err, m.log.readReplies(mark, name), details)
+}
+
+// report1231 reports a macfuse#1231 case, and fails the test when the read
+// measured the fix.
+func (m *probeMount) report1231(item string, sent, got int, err error, replies []probeEvent, details map[string]string) {
+	m.t.Helper()
+	result := shortReadResult(sent, got, err, replies)
+	details["reply_bytes"] = fmt.Sprint(sent)
+	details["read_bytes"] = fmt.Sprint(got)
+	details["error"] = errName(err)
+	details["read_replies"] = fmt.Sprint(len(replies))
+	details["library_errors"] = yesNo(slices.ContainsFunc(replies, isLibraryError))
+	details["empty_replies"] = yesNo(slices.ContainsFunc(replies, isEmptyReply))
+	m.report(item, result, details)
+	fixed := "%s: FSKit no longer returns the reported size for a %d-byte READ reply, so macfuse#1231 looks fixed (%s): make this case expect the fix, and revisit the workarounds for it"
+	switch result {
+	case "fails_read":
+		m.t.Errorf(fixed, item, sent, "the read fails with EIO")
+	case "not_padded":
+		m.t.Errorf(fixed, item, sent, "the read returns only the reply")
 	}
 }
 
-// measurePaddingTiming holds the first READ of a file, sets a new size, and
-// answers the READ with 1024 bytes once a stat returns the new size. It
-// returns and reports how many bytes the read returned, against the size at
-// the READ and the new size.
-func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
+// shortReadResult judges one read(2) of a file whose READ replies carried sent
+// bytes, fewer than the size the server reported. got and err are what the
+// read returned, and replies are the replies to the READs it caused.
+func shortReadResult(sent, got int, err error, replies []probeEvent) string {
+	switch {
+	// An error reply comes from the library, not the server. macFUSE 5.5.0
+	// changed how it handles an empty reply
+	// (https://github.com/macfuse/macfuse/issues/1196).
+	case len(replies) == 0 || slices.ContainsFunc(replies, isLibraryError) ||
+		slices.ContainsFunc(replies, isEmptyReply) || errors.Is(err, errProbeTimeout):
+		return "unknown"
+	case errors.Is(err, syscall.EIO):
+		return "fails_read"
+	case err != nil || got < sent:
+		return "unknown"
+	case got == sent:
+		return "not_padded"
+	}
+	return "padded"
+}
+
+func isLibraryError(reply probeEvent) bool { return reply.status != 0 }
+
+func isEmptyReply(reply probeEvent) bool { return reply.size <= int64(buffer.OutMessageHeaderSize) }
+
+// measurePaddingTiming holds the first READ of a file, changes the file's size
+// to after, and answers the READ with 1024 bytes. It reports which size the
+// read returned: the size when FSKit sent the READ, the size after the
+// change, or only the reply.
+//
+// FSKit can send no GETATTR for a file while its READ is unanswered, and can
+// hold a stat of the file until then. So the new size reaches FSKit in the
+// reply to a LOOKUP of name+"_link", a second name for the same inode. FSKit
+// sends that LOOKUP for the root directory, not for the file. Each stat runs
+// on its own goroutine, and the READ is answered after a bounded wait for
+// each, so a stat FSKit holds cannot stall the measurement. A stat of the file's own name, after the LOOKUP
+// reply, shows whether FSKit applied the new size before the READ reply.
+//
+// It returns the result and whether the server sent the new size before it
+// answered the READ.
+func (m *probeMount) measurePaddingTiming(name string, after uint64) (string, bool) {
 	const answered = 1024
 	n, h := m.server.names[name], m.holds[name]
 	defer h.answer(answered)
 	before := n.getattrSize.Load()
 	item := "read_padding_timing_" + name
 	details := map[string]string{
-		"size_at_read":    fmt.Sprint(before),
-		"size_in_getattr": fmt.Sprint(after),
-		"reply_bytes":     fmt.Sprint(answered),
+		"size_at_read":      fmt.Sprint(before),
+		"size_after_change": fmt.Sprint(after),
+		"reply_bytes":       fmt.Sprint(answered),
 	}
 	f, err := m.open(m.path(name), os.O_RDONLY)
 	if err != nil {
 		details["error"] = errName(err)
 		m.report(item, "unknown", details)
-		return "unknown"
+		return "unknown", false
 	}
 	defer m.close(f)
 
@@ -983,25 +1073,26 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 	if !ok {
 		details["error"] = "no READ arrived"
 		m.report(item, "unknown", details)
-		return "unknown"
+		return "unknown", false
 	}
 	mark := m.log.mark()
 	n.setSize(after)
-	// FSKit keeps its own attribute cache, so poll until a stat shows the new
-	// size. FSKit may queue the stat behind the READ the probe holds, so a
-	// stat that hits its bound here does not stop further mounts. The read
-	// must still return once answered.
-	var size int64
-	var statErr error
-	stats := 0
-	for deadline := time.Now().Add(probePollLimit); ; {
-		size, statErr = statSize(m.path(name))
-		stats++
-		if (statErr == nil && size == int64(after)) || time.Now().After(deadline) || m.ctx.Err() != nil {
-			break
-		}
-		m.sleep(probePollInterval)
+	link := startStat(m.path(name + "_link"))
+	_, sent := m.log.waitFor(m.ctx, probeWait, mark, func(e probeEvent) bool {
+		return e.op == "ATTRS_SENT" && e.name == name && e.size == int64(after)
+	})
+	link.wait(probeWait)
+	own := startStat(m.path(name))
+	applied := "pending"
+	if own.wait(probeWait) {
+		applied = yesNo(own.err == nil && own.size == int64(after))
 	}
+	details["new_size_sent_before_reply"] = yesNo(sent)
+	details["new_size_applied_before_reply"] = applied
+	details["link_stat_before_reply"] = link.String()
+	details["stat_before_reply"] = own.String()
+	details["getattrs_while_read_held"] = fmt.Sprint(len(m.log.matching(mark, isOp("GETATTR", name))))
+
 	h.answer(answered)
 	var r readResult
 	select {
@@ -1010,51 +1101,68 @@ func (m *probeMount) measurePaddingTiming(name string, after uint64) string {
 		r.err = errProbeTimeout
 		m.stop(fmt.Sprintf("the read of %s on %s did not return after its answer", name, m.name))
 	}
+	// The READ is answered now, so a stat that stays pending means a wedge.
+	for _, s := range []*asyncStat{link, own} {
+		if !s.wait(probeWait) {
+			m.stop(fmt.Sprintf("a stat of %s on %s did not return after its READ was answered", name, m.name))
+		}
+	}
+	size, err := m.stat(name)
+	details["stat_after_reply"] = fmt.Sprintf("%d,%s", size, errName(err))
 
 	laterReads := m.log.count("READ", name) - 1
 	details["read_request_bytes"] = fmt.Sprint(request.size)
-	details["stat_while_read_held"] = fmt.Sprintf("%d,%s", size, errName(statErr))
-	details["stats_while_read_held"] = fmt.Sprint(stats)
-	details["getattrs_while_read_held"] = fmt.Sprint(len(m.log.matching(mark, isOp("GETATTR_SENT", name))))
 	details["reads_after_held"] = fmt.Sprint(laterReads)
 	details["read_bytes"] = fmt.Sprint(len(r.data))
 	details["read_error"] = errName(r.err)
-	// The READ is answered now, so a stat that stays stuck means a wedge.
-	m.stat(name)
+	result := paddingTimingResult(int64(before), int64(after), request.size, answered, int64(len(r.data)), r.err, laterReads)
+	m.report(item, result, details)
+	return result, sent
+}
 
-	sendTime, arrival := min(request.size, int64(before)), min(request.size, int64(after))
-	result := "unknown"
+// paddingTimingResult names the size a read returned from a READ of request
+// bytes that the server answered with reply bytes: "size_at_read" for the
+// file's size when FSKit sent the READ, "size_after_change" for the size the
+// server reported while it held the READ, or "not_padded" for the reply alone.
+func paddingTimingResult(atRead, afterChange, request, reply, got int64, readErr error, laterReads int) string {
+	atRead, afterChange = min(request, atRead), min(request, afterChange)
 	switch {
-	case statErr != nil || size != int64(after) || r.err != nil:
-		// FSKit did not show the new size while the READ was held.
+	case readErr != nil:
 	case laterReads > 0:
 		// A later READ got an empty reply, which macFUSE 5.5.0 handles in its
 		// own way (https://github.com/macfuse/macfuse/issues/1196).
-	case len(r.data) == answered:
-		result = "not_padded"
-	case sendTime == arrival:
+	case got == reply:
+		return "not_padded"
+	case atRead == afterChange:
 		// The READ's size cannot tell the two sizes apart.
-	case int64(len(r.data)) == sendTime:
-		result = "send_time"
-	case int64(len(r.data)) == arrival:
-		result = "arrival_time"
+	case got == atRead:
+		return "size_at_read"
+	case got == afterChange:
+		return "size_after_change"
 	}
-	m.report(item, result, details)
-	return result
+	return "unknown"
 }
 
 // measurePaddingTimings runs the padding timing with a shrink and with a
-// growth. The shrink run decides what a reader gets when a GETATTR reply that
-// shrinks the file reaches FSKit while a READ it sent earlier is unanswered.
-// That ordering decides the open short-read guard in
-// https://github.com/dsfaccini/fuse/pull/5.
+// growth. The shrink run decides what a reader gets when a reply that shrinks
+// the file reaches FSKit while a READ it sent earlier is unanswered. That
+// ordering decides the open short-read guard in
+// https://github.com/dsfaccini/fuse/pull/5. The summary's result is the
+// shrink run's, or "new_size_not_sent" when the server did not send the
+// smaller size before it answered the READ.
 func (m *probeMount) measurePaddingTimings() {
-	shrink := m.measurePaddingTiming("shrink", 5000)
-	grow := m.measurePaddingTiming("grow", 5100)
-	m.report("read_padding_timing", shrink, map[string]string{
-		"shrink": shrink,
-		"grow":   grow,
-		"agree":  yesNo(shrink == grow),
+	shrink, shrinkSent := m.measurePaddingTiming("shrink", 5000)
+	grow, growSent := m.measurePaddingTiming("grow", 5100)
+	result := shrink
+	if !shrinkSent {
+		result = "new_size_not_sent"
+	}
+	m.report("read_padding_timing", result, map[string]string{
+		"shrink":               shrink,
+		"grow":                 grow,
+		"agree":                yesNo(shrink == grow),
+		"shrink_new_size_sent": yesNo(shrinkSent),
+		"grow_new_size_sent":   yesNo(growSent),
 	})
 }
 
@@ -1442,11 +1550,20 @@ func (m *probeMount) newServer() *probeServer {
 		serveFiller(op, 100)
 		return nil
 	}
+	file("reread", hour, hour, 200)
 	m.hold(file("interrupt", hour, hour, 4096), true)
 	// Both sizes of each padding case fit in one READ of the first size
-	// rounded up to 512 bytes.
-	m.hold(file("shrink", hour, time.Second, 5100), false)
-	m.hold(file("grow", hour, time.Second, 5000), false)
+	// rounded up to 512 bytes. Each file has a second name, whose LOOKUP
+	// carries a new size to FSKit while the file's READ is held.
+	for _, f := range []struct {
+		name string
+		size uint64
+	}{{"shrink", 5100}, {"grow", 5000}} {
+		n := file(f.name, hour, time.Second, f.size)
+		m.hold(n, false)
+		s.names[f.name+"_link"] = n
+		n.links++
+	}
 	file("noperm", hour, hour, 1).mode = 0
 	file("write", hour, 0, 0)
 	file("notify_entry", hour, hour, 1)
@@ -1538,16 +1655,24 @@ type probeNode struct {
 	attrTTL  time.Duration
 	// negative makes LOOKUP answer with no child, cached for entryTTL.
 	negative bool
-	// lookupSize and getattrSize are the sizes LOOKUP and GETATTR report.
+	// links counts the node's names beyond its first.
+	links uint32
+	// lookupSize and getattrSize are the sizes LOOKUP and GETATTR report, and
+	// dataSize is the size READ serves.
 	lookupSize  atomic.Uint64
 	getattrSize atomic.Uint64
-	// read answers READ. Without it, READ gets filler up to getattrSize.
+	dataSize    atomic.Uint64
+	// mtimeShift moves the reported mtime, so that new data under an unchanged
+	// size still reads as a change.
+	mtimeShift atomic.Int64
+	// read answers READ. Without it, READ gets filler up to dataSize.
 	read func(context.Context, *fuseops.ReadFileOp) error
 }
 
 func (n *probeNode) setSize(size uint64) {
 	n.lookupSize.Store(size)
 	n.getattrSize.Store(size)
+	n.dataSize.Store(size)
 }
 
 // probeEpoch anchors the probe's timestamps. A file's mtime follows its size,
@@ -1601,11 +1726,22 @@ func (s *probeServer) serve(c *Connection, ctx context.Context, op interface{}) 
 	}()
 	err := s.handle(ctx, op)
 	replying = true
-	if err := c.Reply(ctx, err); err != nil {
-		s.log.add(probeEvent{op: "REPLY_ERROR", name: err.Error()})
+	if replyErr := c.Reply(ctx, err); replyErr != nil {
+		s.log.add(probeEvent{op: "REPLY_ERROR", name: replyErr.Error()})
+		return
 	}
-	if o, ok := op.(*fuseops.GetInodeAttributesOp); ok {
-		s.log.add(probeEvent{op: "GETATTR_SENT", name: s.log.names[uint64(o.Inode)]})
+	if err != nil {
+		return
+	}
+	// ATTRS_SENT names the node by its first name, and records the size the
+	// reply gave FSKit.
+	switch o := op.(type) {
+	case *fuseops.GetInodeAttributesOp:
+		s.log.add(probeEvent{op: "ATTRS_SENT", name: s.log.names[uint64(o.Inode)], size: int64(o.Attributes.Size)})
+	case *fuseops.LookUpInodeOp:
+		if o.Entry.Child != 0 {
+			s.log.add(probeEvent{op: "ATTRS_SENT", name: s.log.names[uint64(o.Entry.Child)], size: int64(o.Entry.Attributes.Size)})
+		}
 	}
 }
 
@@ -1658,7 +1794,7 @@ func (s *probeServer) handle(ctx context.Context, op interface{}) error {
 		if n.read != nil {
 			return n.read(ctx, o)
 		}
-		serveFiller(o, int64(n.getattrSize.Load()))
+		serveFiller(o, int64(n.dataSize.Load()))
 	case *fuseops.WriteFileOp:
 		n := s.nodes[o.Inode]
 		if n == nil {
@@ -1679,11 +1815,11 @@ func (s *probeServer) handle(ctx context.Context, op interface{}) error {
 }
 
 func (s *probeServer) attributes(n *probeNode, size uint64) fuseops.InodeAttributes {
-	nlink := uint32(1)
+	nlink := 1 + n.links
 	if n.mode.IsDir() {
 		nlink = 2
 	}
-	mtime := probeEpoch.Add(time.Duration(size) * time.Second)
+	mtime := probeEpoch.Add(time.Duration(size)*time.Second + time.Duration(n.mtimeShift.Load()))
 	return fuseops.InodeAttributes{
 		Size:   size,
 		Nlink:  nlink,
@@ -2279,5 +2415,116 @@ func TestFSKitProbeConflictsMatchOnlyMacFUSEAndProbeVolumes(t *testing.T) {
 		if got := isProbeConflict(test.st); got != test.want {
 			t.Errorf("isProbeConflict(%s) = %v, want %v", test.name, got, test.want)
 		}
+	}
+}
+
+func TestFSKitProbePaddingTimingResult(t *testing.T) {
+	const request, reply = 5120, 1024
+	for _, test := range []struct {
+		name               string
+		atRead, after, got int64
+		readErr            error
+		laterReads         int
+		want               string
+	}{
+		{"shrink, size at read", 5100, 5000, 5100, nil, 0, "size_at_read"},
+		{"shrink, size after change", 5100, 5000, 5000, nil, 0, "size_after_change"},
+		{"grow, size at read", 5000, 5100, 5000, nil, 0, "size_at_read"},
+		{"grow, size after change", 5000, 5100, 5100, nil, 0, "size_after_change"},
+		{"reply only", 5100, 5000, reply, nil, 0, "not_padded"},
+		{"neither size", 5100, 5000, 4000, nil, 0, "unknown"},
+		{"read failed", 5100, 5000, 0, syscall.EIO, 0, "unknown"},
+		{"read timed out", 5100, 5000, 0, errProbeTimeout, 0, "unknown"},
+		{"a later READ", 5100, 5000, 5100, nil, 1, "unknown"},
+		{"sizes past the READ", 6000, 7000, request, nil, 0, "unknown"},
+	} {
+		if got := paddingTimingResult(test.atRead, test.after, request, reply, test.got, test.readErr, test.laterReads); got != test.want {
+			t.Errorf("%s: paddingTimingResult = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+func TestFSKitProbeShortReadResult(t *testing.T) {
+	const sent = 100
+	reply := []probeEvent{{op: "SEND", size: int64(buffer.OutMessageHeaderSize) + sent}}
+	for _, test := range []struct {
+		name    string
+		got     int
+		err     error
+		replies []probeEvent
+		want    string
+	}{
+		{"reported size", 8192, nil, reply, "padded"},
+		{"reply only", sent, nil, reply, "not_padded"},
+		{"EIO", 0, syscall.EIO, reply, "fails_read"},
+		{"no READ reached the server", 8192, nil, nil, "unknown"},
+		{"library error reply", 0, syscall.EIO, []probeEvent{{op: "SEND", status: -int32(syscall.EIO), size: int64(buffer.OutMessageHeaderSize)}}, "unknown"},
+		{"empty reply", 0, nil, []probeEvent{{op: "SEND", size: int64(buffer.OutMessageHeaderSize)}}, "unknown"},
+		{"timed out", 0, errProbeTimeout, reply, "unknown"},
+		{"other error", 0, syscall.ENXIO, reply, "unknown"},
+		{"less than the reply", sent - 1, nil, reply, "unknown"},
+	} {
+		if got := shortReadResult(sent, test.got, test.err, test.replies); got != test.want {
+			t.Errorf("%s: shortReadResult = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+// TestFSKitProbeLinkLookupSendsNewSizeWhileReadHeld serves the probe's file
+// system over a fake kernel: while the first READ of a padding file is held,
+// a LOOKUP of the file's second name is answered with the same inode and its
+// new size, and the log records that size as sent.
+func TestFSKitProbeLinkLookupSendsNewSizeWhileReadHeld(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &probeMount{
+		ctx:   ctx,
+		log:   &probeLog{names: map[uint64]string{}, changed: make(chan struct{})},
+		holds: map[string]*heldRead{},
+	}
+	m.server = m.newServer()
+	k := ServeFakeKernel(t, m.server)
+	// Registered after ServeFakeKernel, so it releases the held READ before
+	// the hang-up waits for the server.
+	t.Cleanup(cancel)
+	n, h := m.server.names["shrink"], m.holds["shrink"]
+
+	k.Send(FakeRequest(fusekernel.InHeader{Opcode: fusekernel.OpRead, Unique: 2, Nodeid: uint64(n.id)},
+		NativeBytes(&fusekernel.ReadIn{Size: 5120}))...)
+	if _, ok := m.awaitRead(h); !ok {
+		t.Fatal("the READ was not held")
+	}
+	mark := m.log.mark()
+	n.setSize(5000)
+	k.Send(FakeRequest(fusekernel.InHeader{Opcode: fusekernel.OpLookup, Unique: 3, Nodeid: uint64(fuseops.RootInodeID)},
+		[]byte("shrink_link\x00"))...)
+
+	reply := k.NextReply(t)
+	entry := reply[buffer.OutMessageHeaderSize:]
+	attr := entry[unsafe.Offsetof(fusekernel.EntryOut{}.Attr):]
+	if unique, errno := binary.NativeEndian.Uint64(reply[8:16]), int32(binary.NativeEndian.Uint32(reply[4:8])); unique != 3 || errno != 0 {
+		t.Fatalf("first reply: unique %d, error %d; want the LOOKUP's, 3, with no error", unique, errno)
+	}
+	if child := binary.NativeEndian.Uint64(entry[0:8]); child != uint64(n.id) {
+		t.Errorf("LOOKUP shrink_link: child %d, want shrink's inode %d", child, n.id)
+	}
+	if size := binary.NativeEndian.Uint64(attr[unsafe.Offsetof(fusekernel.Attr{}.Size):]); size != 5000 {
+		t.Errorf("LOOKUP shrink_link: size %d, want 5000", size)
+	}
+	if nlink := binary.NativeEndian.Uint32(attr[unsafe.Offsetof(fusekernel.Attr{}.Nlink):]); nlink != 2 {
+		t.Errorf("LOOKUP shrink_link: nlink %d, want 2", nlink)
+	}
+	if _, sent := m.log.waitFor(ctx, probeWait, mark, func(e probeEvent) bool {
+		return e.op == "ATTRS_SENT" && e.name == "shrink" && e.size == 5000
+	}); !sent {
+		t.Error("the log has no ATTRS_SENT for shrink with size 5000")
+	}
+
+	h.answer(1024)
+	reply = k.NextReply(t)
+	if unique := binary.NativeEndian.Uint64(reply[8:16]); unique != 2 {
+		t.Fatalf("second reply: unique %d, want the READ's, 2", unique)
+	}
+	if got := len(reply) - buffer.OutMessageHeaderSize; got != 1024 {
+		t.Errorf("READ reply carries %d bytes, want 1024", got)
 	}
 }

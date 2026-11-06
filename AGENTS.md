@@ -177,6 +177,15 @@ covers the change.
 - `-tags fuse_record` writes each mount's message stream to
   `testdata/fskit/<mount>.frames`. `fskit_probe_record_darwin_test.go` defines
   the format.
+- While the probe holds a READ, stat that file only through `startStat`.
+  FSKit can hold the stat until the READ is answered, and `probeMount.stat`
+  would then stop the run as wedged.
+- FSKit can send no GETATTR for a file while its READ is unanswered. To give
+  FSKit a new size then, answer a LOOKUP of a second name for the inode, as
+  `measurePaddingTiming` does.
+- To test the probe's file system without a mount, serve
+  `probeMount.newServer` through `ServeFakeKernel`, as
+  `TestFSKitProbeLinkLookupSendsNewSizeWhileReadHeld` does.
 - After the run, `mount | grep -E 'macfuse|fskit-probe'` must print nothing.
 - `mount | grep -i fskit` also lists Apple's FSKit volumes, such as
   CoreDevice's DeviceFS. They are expected. Never unmount them.
