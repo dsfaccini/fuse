@@ -20,13 +20,16 @@ import (
 )
 
 // ErrFSKitUnavailable means the FSKit backend cannot serve any mount on this
-// machine until the user acts: installs macFUSE 5.5 or later, upgrades macOS,
-// or enables macFUSE's file system extension. Test for it with errors.Is.
+// machine. On macOS that holds until the user acts: installs macFUSE 5.5 or
+// later, upgrades macOS, or enables macFUSE's file system extension. Off
+// macOS it always holds, and there is nothing to install. Test for it with
+// errors.Is.
 //
-// Mount with BackendFSKit and FSKitAvailable return an error that matches it
-// when the installed macFUSE is older than 5.5, or when its MFMount framework,
-// or a function this package needs from it, cannot be loaded. An
-// FSKitMountError with result 1 through 4 matches it too.
+// On macOS, Mount with BackendFSKit and FSKitAvailable return an error that
+// matches it when the installed macFUSE is older than 5.5, or when its MFMount
+// framework, or a function this package needs from it, cannot be loaded. An
+// FSKitMountError with result 1 through 4 matches it too. Off macOS,
+// FSKitAvailable always returns an error that matches it.
 var ErrFSKitUnavailable = errors.New("macFUSE FSKit backend is unavailable; install macFUSE 5.5 or later")
 
 // FSKitMountError results. They mirror MFMountResult in macFUSE's MFMount
