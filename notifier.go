@@ -1,6 +1,8 @@
 package fuse
 
 import (
+	"sync"
+	"syscall"
 	"unsafe"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -13,12 +15,19 @@ import (
 type Notifier struct {
 	inodeInvalidations  chan invalidateInodeCommand
 	dentryInvalidations chan invalidateEntryCommand
+
+	mu sync.Mutex
+	// stopped is closed while no server wrapped with this Notifier serves.
+	stopped chan struct{}
 }
 
 func NewNotifier() *Notifier {
+	stopped := make(chan struct{})
+	close(stopped)
 	return &Notifier{
 		inodeInvalidations:  make(chan invalidateInodeCommand),
 		dentryInvalidations: make(chan invalidateEntryCommand),
+		stopped:             stopped,
 	}
 }
 
@@ -44,11 +53,16 @@ type invalidateEntryCommand struct {
 //
 // InvalidateInode blocks until the kernel write completes, and returns the
 // error from the kernel, if any. ENOSYS indicates that the kernel does not
-// support inode invalidations.
+// support inode invalidations. See Notifier.InvalidateEntry for the errors it
+// returns without sending.
 func (n *Notifier) InvalidateInode(inode fuseops.InodeID, offset, length int64) error {
 	done := make(chan error)
-	n.inodeInvalidations <- invalidateInodeCommand{inode, offset, length, done}
-	return <-done
+	select {
+	case n.inodeInvalidations <- invalidateInodeCommand{inode, offset, length, done}:
+		return <-done
+	case <-n.servingStopped():
+		return syscall.ENOTCONN
+	}
 }
 
 // InvalidateEntry notifies to the kernel to invalidate a dentry cache entry.
@@ -59,13 +73,46 @@ func (n *Notifier) InvalidateInode(inode fuseops.InodeID, offset, length int64) 
 // InvalidateEntry blocks until the kernel write completes, and returns the
 // error from the kernel, if any. ENOSYS indicates that the kernel does not
 // support dentry invalidations.
+//
+// InvalidateInode and InvalidateEntry send nothing in two cases:
+//
+//   - On macFUSE's FSKit backend, which supports no notifications, they
+//     return ENOSYS.
+//   - While no server wrapped with this Notifier serves, before its ServeOps
+//     starts or once it has returned, they return ENOTCONN. Until ServeOps
+//     starts, the server has answered nothing, so the kernel holds nothing of
+//     it to invalidate.
 func (n *Notifier) InvalidateEntry(parent fuseops.InodeID, name string) error {
 	done := make(chan error)
-	n.dentryInvalidations <- invalidateEntryCommand{parent, name, done}
-	return <-done
+	select {
+	case n.dentryInvalidations <- invalidateEntryCommand{parent, name, done}:
+		return <-done
+	case <-n.servingStopped():
+		return syscall.ENOTCONN
+	}
+}
+
+func (n *Notifier) servingStopped() <-chan struct{} {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.stopped
+}
+
+// notificationSupport is implemented by a transport that knows whether its
+// kernel side takes FUSE notifications. A transport without it takes them.
+type notificationSupport interface {
+	supportsNotifications() bool
+}
+
+func supportsNotifications(c *Connection) bool {
+	t, ok := c.transport.(notificationSupport)
+	return !ok || t.supportsNotifications()
 }
 
 func serviceInodeInvalidation(c *Connection, inode fuseops.InodeID, offset, length int64) error {
+	if !supportsNotifications(c) {
+		return syscall.ENOSYS
+	}
 	outMsg := c.getOutMessage()
 	defer c.putOutMessage(outMsg)
 
@@ -83,6 +130,9 @@ func serviceInodeInvalidation(c *Connection, inode fuseops.InodeID, offset, leng
 }
 
 func serviceEntryInval(c *Connection, parent fuseops.InodeID, name string) error {
+	if !supportsNotifications(c) {
+		return syscall.ENOSYS
+	}
 	outMsg := c.getOutMessage()
 	defer c.putOutMessage(outMsg)
 
@@ -101,14 +151,14 @@ func serviceEntryInval(c *Connection, parent fuseops.InodeID, name string) error
 	return c.writeOutMessage(outMsg)
 }
 
-func (n *Notifier) notify(c *Connection, terminate <-chan struct{}) {
+func (n *Notifier) notify(c *Connection, stopped <-chan struct{}) {
 	for {
 		select {
 		case i := <-n.inodeInvalidations:
 			i.done <- serviceInodeInvalidation(c, i.inode, i.offset, i.length)
 		case e := <-n.dentryInvalidations:
 			e.done <- serviceEntryInval(c, e.parent, e.name)
-		case <-terminate:
+		case <-stopped:
 			return
 		}
 	}
@@ -119,12 +169,23 @@ type notifierServer struct {
 	s Server
 }
 
+// ServeOps sends the Notifier's notifications while s serves. Once s
+// returns, it finishes the notification in progress, if any, before it
+// returns, so the connection is still open for it.
 func (s *notifierServer) ServeOps(c *Connection) {
-	terminate := make(chan struct{})
+	stopped := make(chan struct{})
+	s.n.mu.Lock()
+	s.n.stopped = stopped
+	s.n.mu.Unlock()
 
-	go s.n.notify(c, terminate)
+	notified := make(chan struct{})
+	go func() {
+		defer close(notified)
+		s.n.notify(c, stopped)
+	}()
 	s.s.ServeOps(c)
-	close(terminate)
+	close(stopped)
+	<-notified
 }
 
 func NewServerWithNotifier(n *Notifier, s Server) Server {

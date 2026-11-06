@@ -15,7 +15,7 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `mounttest.SkipUnlessFSKitProbeEnabled`. A test that calls
   `MountWithFakeMFMount` takes no gate, because the fake MFMount never reaches
   FSKit. The scanner checks the FSKit gate only for calls to
-  `mountFSKitTransport`, not for `Mount` with the `fskit` backend.
+  `mountFSKitTransport`, not for `Mount` with `BackendFSKit`.
 - `TestMountingTestsAreGated` in `internal/mounttest` enforces the gate. Its
   failure names the fix.
 - That test matches names without type checking, so it can miss a mount
@@ -52,6 +52,16 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Mount`'s config validation without a mount, pass a mount point that
   does not exist. `Mount` validates the config before it checks the mount
   point. A regression then fails with ENOENT instead of mounting.
+- On darwin, the root package's test binary cannot reach macFUSE by default.
+  Its `init` in `mount_deny_darwin_test.go` points `fskitFrameworkPath` at a
+  missing path unless `FUSE_RUN_FSKIT_PROBE=1`, and `macfuseMountHelper`
+  unless `FUSE_RUN_MOUNT_TESTS=1`. `TestMountsAreDeniedByDefault` checks it.
+- To load the installed MFMount in a test, call `useInstalledMFMount`. It
+  restores the denied path and the loader cache when the test ends.
+- Before you run a mutant of mount, backend or loader code, check that every
+  test it runs reaches only the fake MFMount, a fake mount helper or a missing
+  path. If you cannot tell, do not run it. Packages other than the root have
+  no default-deny.
 - `Mount` force-unmounts a native mount it will not return, and
   `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
   `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test
@@ -94,9 +104,10 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   through `sudo`, `Mount` mounts directly.
 - `linux-mount` fails when no test that `mounttest.SkipUnlessEnabled` let run
   passed. It finds those tests by the line the gate logs.
-- `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
-  That test loads the installed MFMount framework. It fails when
-  `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
+- `macos` installs macFUSE 5.5.0 from its GitHub release, pinned by
+  SHA-256. The tests that call `useInstalledMFMount` fail when
+  `GITHUB_ACTIONS=true` and macFUSE is missing or older than 5.5, and skip
+  elsewhere.
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.
@@ -145,6 +156,17 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   lookup, and must be listed in `changesReportedSizes`. A missed size goes
   stale and fails reads inside it with EIO. A missed lookup lets a forget drop
   the record while the kernel still holds the inode.
+
+## Wire structs have the host's layout
+
+- Size a wire struct with `unsafe.Sizeof` of its `fusekernel` type. Never sum
+  field widths by hand. On darwin, `Attr` carries crtime and flags, so `Attr`
+  and `EntryOut` are 16 bytes longer than on Linux.
+- Write a `fusekernel.Dirent` header as `fusekernel.DirentSize` bytes. Its
+  trailing `Name [0]byte` pads `unsafe.Sizeof` past the 24-byte header.
+- Check a layout against the C headers: Linux `include/uapi/linux/fuse.h`, and
+  `include/fuse_kernel.h` in `macfuse/library`, macFUSE's libfuse.
+  `fuseutil/dirent_test.go` parses READDIRPLUS replies by those headers.
 
 ## FSKit changes need a test that does not mount
 
