@@ -218,8 +218,6 @@ func protocolCases() []protocolCase {
 	readIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Offset: 10, Size: 1 << 16})
 	dirent := fuseutil.Dirent{Offset: 1, Inode: 5, Name: "file", Type: fuseutil.DT_File}
 	direntPlus := fuseutil.DirentPlus{Dirent: dirent, Entry: entry}
-	direntPlusBytes := make([]byte, 4096)
-	direntPlusBytes = direntPlusBytes[:fuseutil.WriteDirentPlus(direntPlusBytes, direntPlus)]
 
 	var setattrIn fusekernel.SetattrIn
 	setattrIn.Valid = uint32(fusekernel.SetattrMode | fusekernel.SetattrUid | fusekernel.SetattrGid |
@@ -476,7 +474,12 @@ func protocolCases() []protocolCase {
 				}
 				return nil
 			},
-			reply: direntPlusBytes,
+			// fuse_direntplus: fuse_entry_out, then fuse_dirent and the name,
+			// padded to 8 bytes.
+			reply: join(
+				kernelEntry(),
+				fuse.NativeBytes(&fusekernel.Dirent{Ino: 5, Off: 1, Namelen: 4, Type: syscall.DT_REG})[:fusekernel.DirentSize],
+				[]byte("file\x00\x00\x00\x00")),
 		},
 		{
 			name:    "releasedir",

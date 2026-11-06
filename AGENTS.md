@@ -135,6 +135,17 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   `Errno` finds. When `Errno` finds none, the kernel gets EIO and the wire-log
   `Status` stays 0.
 
+## Wire structs have the host's layout
+
+- Size a wire struct with `unsafe.Sizeof` of its `fusekernel` type. Never sum
+  field widths by hand. On darwin, `Attr` carries crtime and flags, so `Attr`
+  and `EntryOut` are 16 bytes longer than on Linux.
+- Write a `fusekernel.Dirent` header as `fusekernel.DirentSize` bytes. Its
+  trailing `Name [0]byte` pads `unsafe.Sizeof` past the 24-byte header.
+- Check a layout against the C headers: Linux `include/uapi/linux/fuse.h`, and
+  `include/fuse_kernel.h` in `macfuse/library`, macFUSE's libfuse.
+  `fuseutil/dirent_test.go` parses READDIRPLUS replies by those headers.
+
 ## FSKit changes need a test that does not mount
 
 Ship every change to `mount_fskit*.go` with a test that exercises the changed
