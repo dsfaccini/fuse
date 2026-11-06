@@ -611,3 +611,12 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 		})
 	}
 }
+
+// Without this, the connection would send short read replies on FSKit.
+func TestFSKitTransportPadsShortReads(t *testing.T) {
+	var transport connectionTransport = &fskitTransport{}
+	p, ok := transport.(shortReadPadder)
+	if !ok || !p.padsShortReads() {
+		t.Error("fskitTransport does not report that it pads short reads")
+	}
+}

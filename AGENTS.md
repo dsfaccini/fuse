@@ -28,7 +28,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   mounting test, push and read that job.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
-  fails the writes `Reply` makes.
+  fails the writes `Reply` makes. `newOpTestConnection` in
+  `short_reads_test.go` completes `Init` over it and drives ops through
+  `ReadOp` and `Reply`.
 - To pin that a path does not allocate, use `testing.AllocsPerRun`, as
   `transport_test.go` does. Take out-messages from `getOutMessage`. A zero
   `buffer.OutMessage` keeps no scratch, so each of its `Grow` calls allocates.
@@ -134,6 +136,26 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - The kernel reply, the error log and the wire log all judge the errno that
   `Errno` finds. When `Errno` finds none, the kernel gets EIO and the wire-log
   `Status` stays 0.
+
+## Ops that return attributes feed the FSKit short-read check
+
+- On FSKit, `Connection` replies EIO to a `ReadFileOp` reply that ends before
+  both the read and the inode's size (macfuse#1231). That size is the larger of
+  the sizes recorded when the read arrived and when it is answered.
+- `short_reads.go` keeps a record for each inode the kernel holds through a
+  lookup. Entry replies create records and count lookups. Getattr and setattr
+  replies only update existing records. `trackReportedSizes` records growth
+  before a reply is written, and `shrinkReportedSizes` records a shrink after
+  the kernel has the reply. Each reply that can change a record holds the
+  write side of `sizeReplyMu` from recording its growth, through its write, to
+  recording its shrink, so records change in write order. A READ reply holds
+  the read side from its check through its write. Forgets change records too,
+  but write nothing and take neither side.
+- An op whose reply gains an inode's attributes must report them in
+  `forEachReportedSize`, with `lookup` true when the reply gives the kernel a
+  lookup, and must be listed in `changesReportedSizes`. A missed size goes
+  stale and fails reads inside it with EIO. A missed lookup lets a forget drop
+  the record while the kernel still holds the inode.
 
 ## Wire structs have the host's layout
 

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -34,12 +35,15 @@ import (
 type testTransport struct {
 	messages [][]byte
 	reads    int
-	writes   [][]byte
 	writeErr error
 
 	// readErr is the error a read returns once messages run out. Nil means
 	// io.EOF.
 	readErr error
+
+	// Reply writes concurrently.
+	mu     sync.Mutex
+	writes [][]byte
 }
 
 func (t *testTransport) ReadMessage(dst []byte) (int, error) {
@@ -65,11 +69,19 @@ func (t *testTransport) SendMessage(parts [][]byte) error {
 	for _, part := range parts {
 		message = append(message, part...)
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.writes = append(t.writes, message)
 	return nil
 }
 
 func (t *testTransport) Close() error { return nil }
+
+func (t *testTransport) written() [][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.writes
+}
 
 func TestConnectionTransportReadsWholeMessages(t *testing.T) {
 	messageA := makeTestInMessage(101)
