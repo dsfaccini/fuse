@@ -23,24 +23,30 @@ func unmount(dir string) error {
 	return nil
 }
 
-// unmountBackend unmounts dir, lazily when force is set, so that a busy mount
-// detaches at once.
+// unmountSyscall is umount2(2). Tests replace it to unmount nothing.
+var unmountSyscall = unix.Unmount
+
+// unmountBackend unmounts dir with umount2(2), lazily when force is set, so
+// that a busy mount detaches at once. Without the privilege to, as for a
+// mount fusermount made, it runs fusermount -u, with -z when force is set.
 func unmountBackend(dir string, _ Backend, force bool) error {
-	if !force {
-		return unmount(dir)
-	}
 	if strings.HasPrefix(dir, "/dev/fd/") {
 		return ErrExternallyManagedMountPoint
 	}
-	// Mount mounts directly when it may, as root does.
-	err := unix.Unmount(dir, unix.MNT_DETACH)
-	if !errors.Is(err, unix.EPERM) {
-		if err != nil {
-			return &os.PathError{Op: "unmount", Path: dir, Err: err}
-		}
-		return nil
+	flags := 0
+	var fusermountFlags []string
+	if force {
+		flags = unix.MNT_DETACH
+		fusermountFlags = []string{"-z"}
 	}
-	return fuserunmount(dir, "-z")
+	err := unmountSyscall(dir, flags)
+	if errors.Is(err, unix.EPERM) {
+		return fuserunmount(dir, fusermountFlags...)
+	}
+	if err != nil {
+		return &os.PathError{Op: "unmount", Path: dir, Err: err}
+	}
+	return nil
 }
 
 // fuserunmount runs fusermount -u with flags on dir. Its error wraps

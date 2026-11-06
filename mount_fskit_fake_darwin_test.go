@@ -70,12 +70,6 @@ type fakeMessage struct {
 	iovecs  []syscall.Iovec
 }
 
-// fakeUnmount is one unmount(2) call.
-type fakeUnmount struct {
-	dir   string
-	flags int
-}
-
 // fakeChannel is the MFChannelRef that the fake hands out.
 const fakeChannel uintptr = 1
 
