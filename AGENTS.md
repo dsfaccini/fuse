@@ -64,9 +64,11 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   no default-deny.
 - `Mount` force-unmounts a native mount it will not return, and
   `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
-  `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test
-  that reaches them replaces those first: `recordUnmounts` in
-  `unmount_test.go` records the unmount(2) calls and answers them.
+  `unmountSyscall`. On EPERM, FSKit falls back to `diskutilPath`, and Linux
+  to the `fusermount3` or `fusermount` on `PATH`. A test that reaches them
+  replaces those first: `recordUnmounts` in `unmount_test.go` records the
+  unmount(2) calls and answers them, and `fakeFusermount` in
+  `unmount_linux_test.go` puts a recording `fusermount3` on `PATH`.
 - To test the macFUSE kernel extension path without a mount, call
   `useFakeMacFUSEMountHelper`. It points `macfuseMountHelper` at the test
   binary running `TestFakeMacFUSEMountHelper`, which `fakeMountHelper`
