@@ -185,6 +185,26 @@ type MountConfig struct {
 
 	// Linux only.
 	//
+	// Negotiate FUSE_AUTO_INVAL_DATA when the kernel offers it. The kernel then
+	// drops a regular file's cached pages whenever new attributes for it carry
+	// a changed mtime, and each read through the page cache first refreshes
+	// attributes whose expiration has passed. Without it, the kernel drops
+	// the pages only when the size changes.
+	//
+	// This matters to a file system that keeps the page cache across opens
+	// with OpenFileOp.KeepPageCache. A change that keeps the size but changes
+	// the mtime stops being served from stale pages once the attributes
+	// expire. A change that keeps both the size and the mtime is still served
+	// stale.
+	//
+	// It has no effect unless DisableWritebackCaching is also set. With
+	// writeback caching, the kernel keeps its own size and mtime for regular
+	// files and never compares them with the file system's
+	// (https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/inode.c#L304-L386).
+	EnableAutoInvalData bool
+
+	// Linux only.
+	//
 	// Tell the kernel to treat returning -ENOSYS on OpenDir as not needing
 	// OpenDir calls at all (Linux >= 5.1):
 	EnableNoOpendirSupport bool

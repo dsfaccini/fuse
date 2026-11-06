@@ -29,6 +29,13 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes.
+- To pin that a path does not allocate, use `testing.AllocsPerRun`, as
+  `transport_test.go` does. Take out-messages from `getOutMessage`. A zero
+  `buffer.OutMessage` keeps no scratch, so each of its `Grow` calls allocates.
+- `BenchmarkRoundTrip*` in `reply_bench_test.go` measure one request and its
+  reply over `cannedTransport`. Run them with
+  `-run '^$' -bench BenchmarkRoundTrip -benchmem -benchtime 200ms -count 5`.
+  Trust their allocation counts. Their timings vary with the machine's load.
 - `readDevice` maps device errnos, and `fskitTransport.ReadMessage` maps
   FSKit's. `testTransport` returns its errors unmapped, so test a device errno
   through `fakeKernel`.
