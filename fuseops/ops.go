@@ -614,6 +614,8 @@ type ReadDirOp struct {
 	// of fuse_dirent (https://tinyurl.com/mp43bu8) plus the 8-byte alignment of
 	// FUSE_DIRENT_ALIGN (https://tinyurl.com/3m3ewu7h) is less than the read
 	// size of PAGE_SIZE used by fuse_readdir (https://tinyurl.com/mrwxsfxw).
+	//
+	// The op is answered with EIO when BytesRead is negative or exceeds Dst.
 	BytesRead int
 	OpContext OpContext
 }
@@ -742,12 +744,16 @@ type ReadFileOp struct {
 	// LookUpInode, GetInodeAttributes, etc.
 	//
 	// If direct IO is enabled, semantics should match those of read(2).
+	//
+	// The op is answered with EIO when BytesRead is negative or exceeds the
+	// bytes in Data, or in Dst when Data is nil.
 	BytesRead int
 	OpContext OpContext
 
 	// If set, this function will be invoked after the operation response has been
 	// sent to the kernel and before the buffers containing the response data are
-	// freed.
+	// freed. Reply recovers a panic in it and logs the panic with its stack,
+	// where it logs an op's error.
 	Callback func()
 }
 
@@ -813,7 +819,8 @@ type WriteFileOp struct {
 
 	// If set, this function will be invoked after the operation response has been
 	// sent to the kernel and before the buffers containing the response data are
-	// freed.
+	// freed. Reply recovers a panic in it and logs the panic with its stack,
+	// where it logs an op's error.
 	Callback func()
 }
 
@@ -966,6 +973,9 @@ type GetXattrOp struct {
 	// Set by the file system: the number of bytes read into Dst, or
 	// the number of bytes that would have been read into Dst if Dst was
 	// big enough (return ERANGE in this case).
+	//
+	// When the op succeeds, it is answered with EIO if BytesRead is negative
+	// or exceeds Dst. A size query, where Dst is empty, is exempt.
 	BytesRead int
 	OpContext OpContext
 }
@@ -989,6 +999,9 @@ type ListXattrOp struct {
 	// Set by the file system: the number of bytes read into Dst, or
 	// the number of bytes that would have been read into Dst if Dst was
 	// big enough (return ERANGE in this case).
+	//
+	// When the op succeeds, it is answered with EIO if BytesRead is negative
+	// or exceeds Dst. A size query, where Dst is empty, is exempt.
 	BytesRead int
 	OpContext OpContext
 }

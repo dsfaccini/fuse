@@ -18,6 +18,7 @@ package operror
 
 import (
 	"errors"
+	"fmt"
 	"syscall"
 )
 
@@ -33,3 +34,14 @@ func Errno(err error) (errno syscall.Errno, ok bool) {
 	ok = errors.As(err, &errno)
 	return errno, ok
 }
+
+// Panic is the op error for a panic that fuseutil recovered from a file
+// system method. Its errno is EIO.
+type Panic struct {
+	Value interface{}
+	Stack []byte
+}
+
+func (p *Panic) Error() string { return fmt.Sprintf("panic: %v", p.Value) }
+
+func (p *Panic) Unwrap() error { return syscall.EIO }

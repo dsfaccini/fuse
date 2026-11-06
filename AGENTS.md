@@ -39,6 +39,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - `readDevice` maps device errnos, and `fskitTransport.ReadMessage` maps
   FSKit's. `testTransport` returns its errors unmapped, so test a device errno
   through `fakeKernel`.
+- To check what the connection logs to `MountConfig.ErrorLogger` or
+  `DebugLogger`, serve through `ServeFakeKernelWithLoggers` in
+  `fake_kernel_test.go`.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
