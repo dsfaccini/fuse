@@ -53,12 +53,15 @@ func Mount(
 // force-unmounts it before it returns.
 //
 // ctx bounds the wait for the mount. When ctx ends first, MountContext
-// returns ctx.Err() at once. The mount then ends in the background: on FSKit,
-// the connection stops reading, and a mount that macFUSE completes later is
-// force-unmounted. On Linux and the macFUSE kernel extension, ctx does not
-// interrupt the mount helper or the wait for the kernel's INIT; a mount that
-// completes after ctx ended is force-unmounted. ctx has no effect once
-// MountContext has returned.
+// returns an *AbandonedMountError that wraps ctx.Err() at once. The mount then
+// ends in the background, and the Server may receive ops until it has: on
+// FSKit, the connection stops reading, and a mount that macFUSE completes
+// later is force-unmounted. On Linux and the macFUSE kernel extension, ctx
+// does not interrupt the mount helper or the wait for the kernel's INIT; a
+// mount that completes after ctx ended is force-unmounted. Call
+// AbandonedMountError.Wait before you mount at dir again, because that
+// force-unmount goes by path. ctx has no effect once MountContext has
+// returned.
 //
 // On Linux, MountContext answers the mount's first FUSE_POLL before it
 // returns, so the process can open files in its own mount through package os
@@ -73,7 +76,7 @@ func Mount(
 //
 // The hack checks permissions on the root. Unless
 // MountConfig.DisableDefaultPermissions is set, that sends the server a
-// GetInodeAttributes for the root, and MountContext returns only after the
+// GetInodeAttributes for the root, and MountContext succeeds only after the
 // server answers it. The server must not make that answer wait on anything
 // that happens after MountContext returns.
 func MountContext(

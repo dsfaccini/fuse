@@ -253,6 +253,36 @@ func TestFSKitUnmountFallsBackToDiskutil(t *testing.T) {
 	}
 }
 
+func TestFSKitUnmountRetriesADiskutilFailure(t *testing.T) {
+	recordUnmounts(t, func(int) error { return syscall.EPERM })
+	argsFile := fakeDiskutil(t)
+	// The script fails until it has run three times.
+	runs := filepath.Join(t.TempDir(), "runs")
+	script := "#!/bin/sh\necho run >> '" + runs + "'\n[ $(wc -l < '" + runs + "') -ge 3 ] || { echo 'Unmount failed: dissented' >&2; exit 1; }\nprintf '%s\\n' \"$@\" > '" + argsFile + "'\n"
+	if err := os.WriteFile(diskutilPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mfs := &MountedFileSystem{dir: "/mnt/x", backend: BackendFSKit, joinStatusAvailable: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := mfs.Unmount(ctx); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+	if _, err := os.Stat(argsFile); err != nil {
+		t.Errorf("diskutil never succeeded: %v", err)
+	}
+
+	// A diskutil that keeps failing is retried until ctx ends.
+	if err := os.WriteFile(diskutilPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 3*unmountRetryInterval)
+	defer cancel()
+	if err := mfs.Unmount(ctx); !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errDiskutilUnmount) {
+		t.Errorf("Unmount error = %v, want one that wraps context.DeadlineExceeded and the diskutil failure", err)
+	}
+}
+
 func TestKernelExtensionUnmountKeepsEPERM(t *testing.T) {
 	recordUnmounts(t, func(int) error { return syscall.EPERM })
 	argsFile := fakeDiskutil(t)

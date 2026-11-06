@@ -15,7 +15,7 @@
 package fuse
 
 // Backend is the mechanism through which the kernel reaches a file system.
-// The empty Backend is no backend.
+// Its zero value names none of them.
 type Backend string
 
 const (

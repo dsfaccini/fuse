@@ -51,16 +51,23 @@ const unmountRetryInterval = 100 * time.Millisecond
 
 // Unmount unmounts the file system through its backend:
 //
-//   - Linux: fusermount -u;
+//   - Linux: umount2(2), then fusermount -u when umount2(2) fails with EPERM,
+//     as it does without CAP_SYS_ADMIN;
 //   - the macFUSE kernel extension: unmount(2);
 //   - FSKit: unmount(2), then diskutil unmount when unmount(2) fails with
 //     EPERM, as it does for a process without access to network volumes.
 //
-// While the file system is busy, Unmount retries until ctx ends, and then
-// returns an error that wraps ctx.Err() and the last unmount error. Once Join
-// has returned, the server is gone, so Unmount forces the unmount: a lazy
-// unmount on Linux, MNT_FORCE on darwin, and diskutil unmount force on FSKit.
-// That is the way out of the state an error fatal to the connection leaves.
+// While the file system is busy, and after any diskutil failure, Unmount
+// retries until ctx ends, and then returns an error that wraps ctx.Err() and
+// the last unmount error. Once Join has returned, the server is gone, so
+// Unmount forces the unmount: a lazy unmount on Linux, MNT_FORCE on darwin,
+// and diskutil unmount force on FSKit. That is the way out of the state an
+// error fatal to the connection leaves.
+//
+// When the file system is no longer mounted, Unmount fails at once with the
+// backend's error: an *os.PathError wrapping EINVAL from unmount(2) or
+// umount2(2), or, without CAP_SYS_ADMIN on Linux, fusermount's error that the
+// mount point is not mounted.
 //
 // Unmount does not wait for Join. A /dev/fd/N mount point fails with
 // ErrExternallyManagedMountPoint, because its owner unmounts it.
@@ -73,7 +80,7 @@ func (mfs *MountedFileSystem) Unmount(ctx context.Context) error {
 		default:
 		}
 		err := unmountBackend(mfs.dir, mfs.backend, served)
-		if !errors.Is(err, syscall.EBUSY) {
+		if !errors.Is(err, syscall.EBUSY) && !errors.Is(err, errDiskutilUnmount) {
 			return err
 		}
 		select {

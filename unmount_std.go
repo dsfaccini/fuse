@@ -57,7 +57,7 @@ func diskutilUnmount(dir string, force bool) error {
 	args = append(args, abs)
 	output, err := exec.Command(diskutilPath, args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("diskutil unmount %s: %w: %s", abs, err, bytes.TrimSpace(output))
+		return fmt.Errorf("%w: %s: %w: %s", errDiskutilUnmount, abs, err, bytes.TrimSpace(output))
 	}
 	return nil
 }
