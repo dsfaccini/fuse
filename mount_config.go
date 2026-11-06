@@ -16,14 +16,22 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"runtime"
 	"strings"
+
+	"github.com/dsfaccini/fuse/internal/buffer"
 )
 
 // Optional configuration accepted by Mount.
+//
+// On every OS and backend, Mount rejects a config whose FSName, Subtype,
+// VolumeName or Options contain a comma or a backslash. A comma separates
+// mount options, and fusermount reads a backslash in fsname and subtype as an
+// escape.
 type MountConfig struct {
 	// The context from which every op read from the connetion by the sever
 	// should inherit. If nil, context.Background() will be used.
@@ -39,9 +47,23 @@ type MountConfig struct {
 	// chtimes, etc. will fail.
 	ReadOnly bool
 
-	// A logger to use for logging errors. All errors are logged, with the
-	// exception of a few blacklisted errors that are expected. If nil, no error
-	// logging is performed.
+	// A logger to use for logging errors. If nil, no error logging is
+	// performed.
+	//
+	// It receives every error a file system returns for an op, except those
+	// that are expected. The errno the kernel receives decides. It does not
+	// receive:
+	//
+	//   - ENOSYS or EINTR from any op.
+	//   - ENOENT from LookUpInode.
+	//   - ENOTEMPTY from RmDir or Rename.
+	//   - ENODATA or ERANGE from GetXattr or ListXattr.
+	//
+	// It also receives, with its stack, each panic that fuseutil recovers
+	// from a FileSystem method, and each panic from a ReadFileOp or
+	// WriteFileOp Callback. It receives each method that fuseutil saw exit
+	// through runtime.Goexit, and each BytesRead that does not fit its op's
+	// buffer. Those ops are answered with EIO.
 	ErrorLogger *log.Logger
 
 	// A logger to use for logging debug information. If nil, no debug logging is
@@ -49,7 +71,8 @@ type MountConfig struct {
 	DebugLogger *log.Logger
 
 	// A logger to use for logging fuse wire requests. If nil, no wire logging is
-	// performed.
+	// performed. The library serializes its writes to it per mount. A writer
+	// that several mounts share must be safe for concurrent use.
 	WireLogger io.Writer
 
 	// Linux only. OS X always behaves as if writeback caching is disabled.
@@ -132,7 +155,22 @@ type MountConfig struct {
 	// This field disables the use of novncache, restoring entry caching. Beware:
 	// the value of ChildInodeEntry.EntryExpiration is ignored by the kernel, and
 	// entries will be cached for an arbitrarily long time.
+	//
+	// The FSKit backend never receives novncache, so this field has no effect
+	// there.
 	EnableVnodeCaching bool
+
+	// OS X only.
+	//
+	// Normally on OS X we mount with the noappledouble option
+	// (https://github.com/osxfuse/osxfuse/wiki/Mount-options), which makes
+	// Apple Double files (._foo) and .DS_Store files inaccessible, even when the
+	// file system serves them.
+	//
+	// This field omits noappledouble, so those files stay visible and Finder may
+	// create them. The FSKit backend never receives noappledouble, so this
+	// field has no effect there.
+	EnableAppleDouble bool
 
 	// Linux only.
 	//
@@ -153,6 +191,37 @@ type MountConfig struct {
 
 	// Linux only.
 	//
+	// Negotiate FUSE_AUTO_INVAL_DATA when the kernel offers it. Each read
+	// through the page cache then first refreshes the file's attributes if
+	// they have expired [1].
+	//
+	// Without writeback caching, the kernel drops a regular file's cached
+	// pages whenever new attributes carry a changed size. With this field, it
+	// also drops them when the mtime changed.
+	//
+	// This matters to a file system that keeps the page cache across opens. It
+	// keeps the cache when it sets OpenFileOp.KeepPageCache. It also keeps the
+	// cache when it sets EnableNoOpenSupport and answers OpenFile with ENOSYS,
+	// because the kernel then keeps the cache by default [2]. A change that
+	// keeps the size but changes the mtime stops being served from stale pages
+	// once the attributes expire. A change that keeps both the size and the
+	// mtime is still served stale.
+	//
+	// With writeback caching, the default unless DisableWritebackCaching is
+	// set, the kernel keeps its own size and mtime for regular files. It never
+	// drops their pages for a change the file system reports [3]. Reads still
+	// refresh expired attributes, so each read after an expiration costs a
+	// GETATTR [4] [5].
+	//
+	// [1]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/file.c#L1155-L1174
+	// [2]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/file.c#L160
+	// [3]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/inode.c#L304-L386
+	// [4]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/dir.c#L1564-L1567
+	// [5]: https://github.com/torvalds/linux/blob/f66469d9905b39d2c260a15d7d6db450f4db67c1/fs/fuse/dir.c#L1596-L1599
+	EnableAutoInvalData bool
+
+	// Linux only.
+	//
 	// Tell the kernel to treat returning -ENOSYS on OpenDir as not needing
 	// OpenDir calls at all (Linux >= 5.1):
 	EnableNoOpendirSupport bool
@@ -169,10 +238,8 @@ type MountConfig struct {
 	// is used.
 	VolumeName string
 
-	// OS X only.
-	//
-	// The FUSE implementation to use. One of FUSEImplFuseT (default) or
-	// FUSEImplMacFUSE.
+	// Deprecated: Mount ignores FuseImpl. On OS X it mounts through macFUSE,
+	// with the kernel extension unless Options["backend"] is "fskit".
 	FuseImpl FUSEImpl
 
 	// Additional key=value options to pass unadulterated to the underlying mount
@@ -244,7 +311,8 @@ type MountConfig struct {
 	// that data will be used for a vectored read, irrespective of this flag's value.
 	UseVectoredRead bool
 
-	// Linux only.
+	// The kernel limit applies on Linux only. The reply cap below applies on
+	// every OS.
 	//
 	// If set, this specifies the maximum number of hardware pages that the
 	// FUSE message payload can use. This will be passed to the kernel during the
@@ -264,6 +332,16 @@ type MountConfig struct {
 	//
 	// If MaxPages is set but MaxWrite is unset, MaxWrite will be limited based
 	// on MaxPages (i.e., MaxPages * PageSize).
+	//
+	// Reply cap: a READDIR, READDIRPLUS, GETXATTR or LISTXATTR request that
+	// asks for a reply larger than MaxPages * PageSize gets EINVAL. For
+	// GETXATTR and LISTXATTR the cap is at least 64 KiB, or 128 KiB on darwin.
+	//
+	// On darwin the kernel extension asks for the size of the caller's buffer.
+	// It clamps READDIR and READDIRPLUS to the iosize the mount passes, 1 MiB,
+	// and their cap is at least that. It does not clamp GETXATTR or LISTXATTR,
+	// so one through a buffer larger than the cap gets EINVAL. Raise MaxPages
+	// to serve larger xattr buffers.
 	MaxPages uint16
 
 	// If set, this specifies the maximum size in bytes of a write request
@@ -278,10 +356,16 @@ type MountConfig struct {
 	MaxWrite uint32
 }
 
+// FUSEImpl is the type of MountConfig.FuseImpl. On OS X, Mount always mounts
+// through macFUSE.
+//
+// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
 type FUSEImpl uint8
 
 const (
-	FUSEImplFuseT = iota
+	// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
+	FUSEImplFuseT FUSEImpl = iota
+	// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
 	FUSEImplMacFUSE
 )
 
@@ -326,9 +410,11 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 		opts["ro"] = ""
 	}
 
-	// Handle OS X options.
+	// Handle OS X options. The FSKit module parses neither novncache nor
+	// noappledouble.
+	fskit := c.Options["backend"] == "fskit"
 	if isDarwin {
-		if !c.EnableVnodeCaching {
+		if !fskit && !c.EnableVnodeCaching {
 			opts["novncache"] = ""
 		}
 
@@ -343,7 +429,7 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 	// network-based file systems.
 	//
 	// Cf. https://github.com/osxfuse/osxfuse/wiki/Mount-options
-	if isDarwin {
+	if isDarwin && !fskit && !c.EnableAppleDouble {
 		opts["noappledouble"] = ""
 	}
 
@@ -355,18 +441,9 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 	return opts
 }
 
-func escapeOptionsKey(s string) (res string) {
-	res = s
-	res = strings.Replace(res, `\`, `\\`, -1)
-	res = strings.Replace(res, `,`, `\,`, -1)
-	return res
-}
-
 func mapToOptionsString(opts map[string]string) string {
 	var components []string
 	for k, v := range opts {
-		k = escapeOptionsKey(k)
-
 		component := k
 		if v != "" {
 			component = fmt.Sprintf("%s=%s", k, v)
@@ -381,4 +458,65 @@ func mapToOptionsString(opts map[string]string) string {
 // Create an options string suitable for passing to the mount helper.
 func (c *MountConfig) toOptionsString() string {
 	return mapToOptionsString(c.toMap())
+}
+
+// normalize returns a copy of c with its defaults filled in, or an error when
+// the kernel or the mount helper cannot take c.
+func (c *MountConfig) normalize() (MountConfig, error) {
+	if c == nil {
+		return MountConfig{}, errors.New("MountConfig must not be nil")
+	}
+	cfg := *c
+	if cfg.OpContext == nil {
+		cfg.OpContext = context.Background()
+	}
+	if err := cfg.sanitizeMaxPagesAndWrite(); err != nil {
+		return MountConfig{}, err
+	}
+	// toMap passes VolumeName only on darwin. Check it on every OS so that one
+	// rule holds.
+	if err := checkMountOption("volname", cfg.VolumeName); err != nil {
+		return MountConfig{}, err
+	}
+	for k, v := range cfg.toMap() {
+		if err := checkMountOption(k, v); err != nil {
+			return MountConfig{}, err
+		}
+	}
+	return cfg, nil
+}
+
+// checkMountOption rejects an option that would end or escape early on some
+// backend.
+func checkMountOption(k, v string) error {
+	if strings.ContainsAny(k+v, `,\`) {
+		return fmt.Errorf("mount options cannot contain commas or backslashes: %q=%q", k, v)
+	}
+	return nil
+}
+
+func (c *MountConfig) sanitizeMaxPagesAndWrite() error {
+	pageSize := uint32(buffer.GetPageSize())
+
+	// If neither are given, set them both to the default based on MaxReadSize & MaxWriteSize.
+	if c.MaxPages == 0 && c.MaxWrite == 0 {
+		c.MaxWrite = buffer.MaxWriteSize
+		maxPayload := max(uint32(buffer.MaxReadSize), uint32(buffer.MaxWriteSize))
+		c.MaxPages = uint16(maxPayload / pageSize)
+	} else if c.MaxPages != 0 && c.MaxWrite == 0 {
+		// If only MaxPages is given, set MaxWrite based on MaxPages.
+		c.MaxWrite = uint32(c.MaxPages) * pageSize
+	} else if c.MaxPages == 0 && c.MaxWrite != 0 {
+		// If only MaxWrite is given, MaxPages defaults to max(MaxWrite, MaxReadSize).
+		maxPayload := max(c.MaxWrite, uint32(buffer.MaxReadSize))
+		c.MaxPages = uint16((maxPayload + pageSize - 1) / pageSize)
+	}
+
+	// Validate: MaxPages needs to be >= MaxWrite (in bytes)
+	if uint32(c.MaxPages)*pageSize < c.MaxWrite {
+		return fmt.Errorf("MaxPages (%d pages, %d bytes) must be at least MaxWrite (%d bytes)",
+			c.MaxPages, uint32(c.MaxPages)*pageSize, c.MaxWrite)
+	}
+
+	return nil
 }

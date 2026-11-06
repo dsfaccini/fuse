@@ -280,6 +280,8 @@ type MkDirOp struct {
 	Parent InodeID
 
 	// The name of the child to create, and the mode with which to create it.
+	// Mode is os.ModeDir plus the permission and special bits, whether or not
+	// the kernel sent the directory type bit.
 	Name string
 	Mode os.FileMode
 
@@ -598,6 +600,8 @@ type ReadDirOp struct {
 	// Each entry returned exposes a directory offset to the user that may later
 	// show up in ReadDirRequest.Offset. See notes on that field for more
 	// information.
+	//
+	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
 
 	// Set by the file system: the number of bytes read into Dst.
@@ -610,6 +614,8 @@ type ReadDirOp struct {
 	// of fuse_dirent (https://tinyurl.com/mp43bu8) plus the 8-byte alignment of
 	// FUSE_DIRENT_ALIGN (https://tinyurl.com/3m3ewu7h) is less than the read
 	// size of PAGE_SIZE used by fuse_readdir (https://tinyurl.com/mrwxsfxw).
+	//
+	// The op is answered with EIO when BytesRead is negative or exceeds Dst.
 	BytesRead int
 	OpContext OpContext
 }
@@ -739,6 +745,9 @@ type ReadFileOp struct {
 	//
 	// If direct IO is enabled, semantics should match those of read(2).
 	//
+	// The op is answered with EIO when BytesRead is negative or exceeds the
+	// bytes in Data, or in Dst when Data is nil.
+	//
 	// On FSKit, a reply shorter than the size FSKit cached for the file reaches
 	// the reader padded with bytes that are not file data
 	// (https://github.com/macfuse/macfuse/issues/1231). There the library
@@ -747,15 +756,16 @@ type ReadFileOp struct {
 	// when it is answered, where the inode's size is the size in the
 	// attributes any op last returned for it, extended by any later write past
 	// it. A smaller size counts only once the kernel has accepted the reply
-	// that reports it. Direct IO does not exempt a read from this. So after a file shrinks,
-	// reads inside its old size fail with EIO until a reply reports the new
-	// size, and so does a read that was in flight when it did.
+	// that reports it. Direct IO does not exempt a read from this. So after a
+	// file shrinks, reads inside its old size fail with EIO until a reply
+	// reports the new size, and so does a read that was in flight when it did.
 	BytesRead int
 	OpContext OpContext
 
 	// If set, this function will be invoked after the operation response has been
 	// sent to the kernel and before the buffers containing the response data are
-	// freed.
+	// freed. Reply recovers a panic in it and logs the panic with its stack,
+	// where it logs an op's error.
 	Callback func()
 }
 
@@ -821,7 +831,8 @@ type WriteFileOp struct {
 
 	// If set, this function will be invoked after the operation response has been
 	// sent to the kernel and before the buffers containing the response data are
-	// freed.
+	// freed. Reply recovers a panic in it and logs the panic with its stack,
+	// where it logs an op's error.
 	Callback func()
 }
 
@@ -967,11 +978,16 @@ type GetXattrOp struct {
 
 	// The destination buffer.  If the size is too small for the
 	// value, the ERANGE error should be sent.
+	//
+	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
 
 	// Set by the file system: the number of bytes read into Dst, or
 	// the number of bytes that would have been read into Dst if Dst was
 	// big enough (return ERANGE in this case).
+	//
+	// When the op succeeds, it is answered with EIO if BytesRead is negative
+	// or exceeds Dst. A size query, where Dst is empty, is exempt.
 	BytesRead int
 	OpContext OpContext
 }
@@ -988,11 +1004,16 @@ type ListXattrOp struct {
 	//
 	// The output data should consist of a sequence of NUL-terminated strings,
 	// one for each xattr.
+	//
+	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
 
 	// Set by the file system: the number of bytes read into Dst, or
 	// the number of bytes that would have been read into Dst if Dst was
 	// big enough (return ERANGE in this case).
+	//
+	// When the op succeeds, it is answered with EIO if BytesRead is negative
+	// or exceeds Dst. A size query, where Dst is empty, is exempt.
 	BytesRead int
 	OpContext OpContext
 }

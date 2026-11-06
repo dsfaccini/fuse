@@ -115,14 +115,9 @@ func directmount(dir string, cfg *MountConfig) (*os.File, error) {
 	return dev, nil
 }
 
-// Begin the process of mounting at the given directory, returning a connection
-// to the kernel. Mounting continues in the background, and is complete when an
-// error is written to the supplied channel. The file system may need to
-// service the connection in order for mounting to complete.
-func mount(dir string, cfg *MountConfig, ready chan<- error) (*os.File, error) {
-	// On linux, mounting is never delayed.
-	ready <- nil
-
+// Mount at the given directory, returning the FUSE device. On Linux the mount
+// exists once mount returns.
+func mount(dir string, cfg *MountConfig) (*os.File, error) {
 	if cfg.DebugLogger != nil {
 		cfg.DebugLogger.Println("Parsing fuse file descriptor")
 	}
@@ -150,7 +145,7 @@ func mount(dir string, cfg *MountConfig, ready chan<- error) (*os.File, error) {
 			"--",
 			dir,
 		}
-		dev, err := fusermount(fusermountPath, argv, []string{}, true, cfg.DebugLogger)
+		dev, _, err := fusermount(fusermountPath, argv, []string{}, true, cfg.DebugLogger)
 		if err == nil {
 			return dev, nil
 		}
@@ -165,19 +160,16 @@ func mount(dir string, cfg *MountConfig, ready chan<- error) (*os.File, error) {
 	return dev, err
 }
 
-func mountTransport(
-	dir string,
-	cfg *MountConfig,
-	ready chan<- error) (connectionTransport, error) {
+func mountTransport(dir string, cfg *MountConfig) (nativeMount, error) {
 	if cfg.Options["backend"] == "fskit" {
 		return nil, fmt.Errorf("backend fskit is only available on darwin")
 	}
 
-	dev, err := mount(dir, cfg, ready)
+	dev, err := mount(dir, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return newFileTransport(dev), nil
+	return newDeviceMount(dev, BackendLinux, nil), nil
 }
 
 func parseFuseFd(dir string) (int, error) {

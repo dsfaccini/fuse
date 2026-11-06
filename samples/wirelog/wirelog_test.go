@@ -137,17 +137,23 @@ func (t *WireLogTest) RunWorkloadAndCheckLogs() {
 	ExpectEq(fileMode, lookupOp.Entry.Attributes.Mode)
 	ExpectEq("yes", entry.Extra["lookup"])
 
-	// 3. GetInodeAttributesOp
+	// 3. GetInodeAttributesOp. The kernel also asks for the root's attributes,
+	// in an order that varies.
 	entries, ok = ops["GetInodeAttributesOp"]
 	AssertTrue(ok)
-	ExpectGe(len(entries), 2)
-	entry = entries[1] // first entry is the root dir
+	var getattrOp fuseops.GetInodeAttributesOp
+	for _, e := range entries {
+		getattrOp = fuseops.GetInodeAttributesOp{}
+		loadArgs(e, &getattrOp)
+		if getattrOp.Inode == fileInode {
+			entry = e
+			break
+		}
+	}
+	AssertEq(fileInode, getattrOp.Inode)
 	ExpectEq(0, entry.Status)
 	AssertNe(nil, entry.Context)
 	AssertGt(entry.Context.FuseID, 0)
-	var getattrOp fuseops.GetInodeAttributesOp
-	loadArgs(entry, &getattrOp)
-	ExpectEq(fileInode, getattrOp.Inode)
 	ExpectEq(1, getattrOp.Attributes.Nlink)
 	ExpectEq(len(fileContents), getattrOp.Attributes.Size)
 	ExpectEq(fileMode, getattrOp.Attributes.Mode)

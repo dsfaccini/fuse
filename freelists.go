@@ -20,6 +20,12 @@ import (
 	"github.com/dsfaccini/fuse/internal/buffer"
 )
 
+// maxFreeMessages caps each freelist. A burst of concurrent ops allocates a
+// message pair per op, and the freelists keep at most this many pairs once the
+// burst ends. An in-message holds a page plus MaxWrite bytes, and an
+// out-message up to MaxPages pages of scratch.
+const maxFreeMessages = 16
+
 ////////////////////////////////////////////////////////////////////////
 // buffer.InMessage
 ////////////////////////////////////////////////////////////////////////
@@ -40,7 +46,7 @@ func (c *Connection) getInMessage() *buffer.InMessage {
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) putInMessage(x *buffer.InMessage) {
 	c.mu.Lock()
-	c.inMessages.Put(unsafe.Pointer(x))
+	c.inMessages.Put(unsafe.Pointer(x), maxFreeMessages)
 	c.mu.Unlock()
 }
 
@@ -55,16 +61,16 @@ func (c *Connection) getOutMessage() *buffer.OutMessage {
 	c.mu.Unlock()
 
 	if x == nil {
-		x = new(buffer.OutMessage)
+		x = buffer.NewOutMessage(int(maxReplySize(&c.cfg)))
 	}
-	x.Reset()
 
 	return x
 }
 
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) putOutMessage(x *buffer.OutMessage) {
+	x.Reset()
 	c.mu.Lock()
-	c.outMessages.Put(unsafe.Pointer(x))
+	c.outMessages.Put(unsafe.Pointer(x), maxFreeMessages)
 	c.mu.Unlock()
 }

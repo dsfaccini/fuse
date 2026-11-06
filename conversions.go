@@ -18,8 +18,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
-	"reflect"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -145,9 +146,13 @@ func convertInMessage(
 			return nil, errors.New("Corrupt OpBatchForget")
 		}
 
+		type entry fusekernel.BatchForgetEntryIn
+		if uintptr(in.Count) > inMsg.Len()/unsafe.Sizeof(entry{}) {
+			return nil, errors.New("Corrupt OpBatchForget")
+		}
+
 		entries := make([]fuseops.BatchForgetEntry, 0, in.Count)
 		for i := uint32(0); i < in.Count; i++ {
-			type entry fusekernel.BatchForgetEntryIn
 			ein := (*entry)(inMsg.Consume(unsafe.Sizeof(entry{})))
 			if ein == nil {
 				return nil, errors.New("Corrupt OpBatchForget")
@@ -185,13 +190,12 @@ func convertInMessage(
 			Parent: fuseops.InodeID(inMsg.Header().Nodeid),
 			Name:   string(name),
 
-			// On Linux, vfs_mkdir calls through to the inode with at most
-			// permissions and sticky bits set (https://tinyurl.com/3djx8498), and
-			// fuse passes that on directly (https://tinyurl.com/exezw647). In other
-			// words, the fact that this is a directory is implicit in the fact that
-			// the opcode is mkdir. But we want the correct mode to go through, so
-			// ensure that os.ModeDir is set.
-			Mode: ConvertFileMode(in.Mode) | os.ModeDir,
+			// Linux strips S_IFDIR from the mode (fuse_mkdir in
+			// https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/dir.c),
+			// and ConvertFileMode reads a mode without type bits as a device.
+			// The opcode already says this is a directory, so replace the type
+			// bits.
+			Mode: ConvertFileMode(in.Mode&^syscall.S_IFMT | syscall.S_IFDIR),
 			OpContext: fuseops.OpContext{
 				FuseID: inMsg.Header().Unique,
 				Pid:    inMsg.Header().Pid,
@@ -256,7 +260,7 @@ func convertInMessage(
 			return nil, errors.New("Corrupt OpSymlink")
 		}
 		i := bytes.IndexByte(names, '\x00')
-		if i < 0 {
+		if i == len(names)-1 {
 			return nil, errors.New("Corrupt OpSymlink")
 		}
 		newName, target := names[0:i], names[i+1:len(names)-1]
@@ -301,7 +305,7 @@ func convertInMessage(
 			return nil, errors.New("Corrupt OpRename")
 		}
 		i := bytes.IndexByte(names, '\x00')
-		if i < 0 {
+		if i == len(names)-1 {
 			return nil, errors.New("Corrupt OpRename")
 		}
 		oldName, newName := names[:i], names[i+1:len(names)-1]
@@ -418,16 +422,9 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		p := outMsg.Grow(readSize)
-		if p == nil {
-			return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), readdirCapFloor())); err != nil {
+			return nil, err
 		}
-
-		sh := (*reflect.SliceHeader)(unsafe.Pointer(&to.Dst))
-		sh.Data = uintptr(p)
-		sh.Len = readSize
-		sh.Cap = readSize
 
 	case fusekernel.OpReaddirplus:
 		in := (*fusekernel.ReadIn)(inMsg.Consume(fusekernel.ReadInSize(protocol)))
@@ -449,16 +446,8 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		p := outMsg.Grow(readSize)
-		if p == nil {
-			return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
-		}
-
-		if readSize > 0 {
-			to.Dst = unsafe.Slice((*byte)(p), readSize)
-		} else {
-			to.Dst = nil
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), readdirCapFloor())); err != nil {
+			return nil, err
 		}
 
 	case fusekernel.OpRelease:
@@ -500,14 +489,14 @@ func convertInMessage(
 		}
 
 		buf := inMsg.ConsumeBytes(inMsg.Len())
-		if len(buf) < int(in.Size) {
+		if uint64(len(buf)) < uint64(in.Size) {
 			return nil, errors.New("Corrupt OpWrite")
 		}
 
 		o = &fuseops.WriteFileOp{
 			Inode:  fuseops.InodeID(inMsg.Header().Nodeid),
 			Handle: fuseops.HandleID(in.Fh),
-			Data:   buf,
+			Data:   buf[:in.Size],
 			Offset: int64(in.Offset),
 			OpContext: fuseops.OpContext{
 				FuseID: inMsg.Header().Unique,
@@ -669,19 +658,8 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		if readSize > 0 {
-			p := outMsg.Grow(readSize)
-			if p == nil {
-				return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
-			}
-
-			sh := (*reflect.SliceHeader)(unsafe.Pointer(&to.Dst))
-			sh.Data = uintptr(p)
-			sh.Len = readSize
-			sh.Cap = readSize
-		} else {
-			to.Dst = nil
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrCapFloor())); err != nil {
+			return nil, err
 		}
 
 	case fusekernel.OpListxattr:
@@ -701,16 +679,8 @@ func convertInMessage(
 		}
 		o = to
 
-		readSize := int(in.Size)
-		if readSize != 0 {
-			p := outMsg.Grow(readSize)
-			if p == nil {
-				return nil, fmt.Errorf("Can't grow for %d-byte read", readSize)
-			}
-			sh := (*reflect.SliceHeader)(unsafe.Pointer(&to.Dst))
-			sh.Data = uintptr(p)
-			sh.Len = readSize
-			sh.Cap = readSize
+		if to.Dst, err = growDst(outMsg, in.Size, max(maxReplySize(config), xattrCapFloor())); err != nil {
+			return nil, err
 		}
 	case fusekernel.OpSetxattr:
 		type input fusekernel.SetxattrIn
@@ -770,6 +740,47 @@ func convertInMessage(
 	}
 
 	return o, nil
+}
+
+// readdirCapFloor returns the least cap on a READDIR or READDIRPLUS reply
+// size. The osxfuse kext asks for the caller's buffer size, up to the iosize
+// the mount passes, which is buffer.MaxWriteSize whatever MaxPages is.
+func readdirCapFloor() uint64 {
+	if runtime.GOOS == "darwin" {
+		return buffer.MaxWriteSize
+	}
+	return 0
+}
+
+// xattrCapFloor returns the least cap on a GETXATTR or LISTXATTR reply size.
+// Neither kernel bounds xattr replies by max_pages. Linux sends sizes up to
+// XATTR_SIZE_MAX and XATTR_LIST_MAX, 64 KiB. The osxfuse kext sends the
+// caller's buffer size, and handles sizes up to FUSE_REASONABLE_XATTRSIZE,
+// 128 KiB, as ordinary.
+func xattrCapFloor() uint64 {
+	if runtime.GOOS == "darwin" {
+		return 128 << 10
+	}
+	return 64 << 10
+}
+
+// maxReplySize returns the largest reply, in bytes, that config's MaxPages
+// allows.
+func maxReplySize(config *MountConfig) uint64 {
+	return min(uint64(config.MaxPages)*uint64(buffer.GetPageSize()), math.MaxInt)
+}
+
+// growDst grows outMsg by the reply size a request names, and returns the new
+// segment for the file system to fill. A size of 0 means no destination. A
+// size above limit is EINVAL.
+func growDst(outMsg *buffer.OutMessage, size uint32, limit uint64) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if uint64(size) > limit {
+		return nil, fmt.Errorf("reply size %d exceeds %d bytes: %w", size, limit, syscall.EINVAL)
+	}
+	return unsafe.Slice((*byte)(outMsg.Grow(int(size))), size), nil
 }
 
 ////////////////////////////////////////////////////////////////////////

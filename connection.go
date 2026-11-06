@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"path"
 	"runtime"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -66,6 +67,10 @@ type Connection struct {
 	errorLogger *log.Logger
 	wireLogger  io.Writer
 
+	// Serializes writes to wireLogger, which Reply makes from each op's
+	// goroutine.
+	wireLoggerMu sync.Mutex
+
 	// The kernel-facing transport and the protocol version used with it.
 	transport connectionTransport
 	protocol  fusekernel.Protocol
@@ -77,6 +82,12 @@ type Connection struct {
 	//
 	// GUARDED_BY(mu)
 	cancelFuncs map[uint64]func()
+
+	// The first error that is fatal to the connection. Once it is set, ReadOp
+	// returns it.
+	//
+	// GUARDED_BY(mu)
+	fatalErr error
 
 	// The size last reported for each inode the kernel holds, kept only when
 	// the transport pads short reads. See trackReportedSizes.
@@ -103,6 +114,13 @@ type Connection struct {
 
 	// Size of the buffer to allocate for each InMessage.
 	inMessageBufSize int
+
+	// pollHackRunning is true while Mount runs the poll hack. See poll_hack.go.
+	pollHackRunning atomic.Bool
+
+	// pollHackEntryKnown is true once the kernel has looked up the poll hack's
+	// entry. Only ReadOp touches it.
+	pollHackEntryKnown bool
 }
 
 // State that is maintained for each in-flight op. This is stuffed into the
@@ -112,6 +130,14 @@ type opState struct {
 	outMsg *buffer.OutMessage
 	op     interface{}
 	wlog   *WireLogRecord
+
+	// The request's header fields, copied because inMsg returns to the freelist
+	// when the op is answered.
+	fuseID uint64
+	opCode uint32
+
+	// Set by the op's first Reply.
+	replied *atomic.Bool
 
 	// For a ReadFileOp on a transport that pads short reads, the size recorded
 	// for its inode when it arrived.
@@ -132,7 +158,7 @@ func GetWirelog(ctx context.Context) *WireLogRecord {
 // Create a connection wrapping the supplied kernel transport. You must
 // eventually call c.close().
 //
-// The loggers may be nil.
+// cfg must come from MountConfig.normalize. The loggers may be nil.
 func newConnection(
 	cfg MountConfig,
 	debugLogger *log.Logger,
@@ -162,10 +188,6 @@ func newConnection(
 
 // Init performs the work necessary to cause the mount process to complete.
 func (c *Connection) Init() error {
-	if err := c.sanitizeMaxPagesAndWrite(); err != nil {
-		return err
-	}
-
 	c.inMessageBufSize = buffer.GetPageSize() + int(c.cfg.MaxWrite)
 
 	// Read the init op.
@@ -205,6 +227,7 @@ func (c *Connection) Init() error {
 	noOpenSupport := initOp.Flags&fusekernel.InitNoOpenSupport > 0
 	noOpendirSupport := initOp.Flags&fusekernel.InitNoOpendirSupport > 0
 	asyncDIO := initOp.Flags&fusekernel.InitAsyncDIO > 0
+	autoInvalData := initOp.Flags&fusekernel.InitAutoInvalData > 0
 
 	// Respond to the init op.
 	initOp.Library = c.protocol
@@ -247,6 +270,11 @@ func (c *Connection) Init() error {
 	// OpenFile calls at all (Linux >= 3.16):
 	if c.cfg.EnableNoOpenSupport && noOpenSupport {
 		initOp.Flags |= fusekernel.InitNoOpenSupport
+	}
+
+	// Tell the kernel to drop a file's cached pages when its mtime changes.
+	if c.cfg.EnableAutoInvalData && autoInvalData && runtime.GOOS == "linux" {
+		initOp.Flags |= fusekernel.InitAutoInvalData
 	}
 
 	// Tell the kernel to treat returning -ENOSYS on OpenDir as not needing
@@ -311,18 +339,43 @@ func (c *Connection) debugLog(
 	c.debugLogger.Println(msg)
 }
 
+// recordFatal records err as the connection's fatal error, unless one is
+// already recorded, and returns the recorded error.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) recordFatal(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.fatalErr == nil {
+		c.fatalErr = err
+	}
+	return c.fatalErr
+}
+
+// fatalError returns the connection's fatal error, or nil if there is none.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) fatalError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.fatalErr
+}
+
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) recordCancelFunc(
 	fuseID uint64,
-	f func()) {
+	f func()) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if _, ok := c.cancelFuncs[fuseID]; ok {
-		panic(fmt.Sprintf("Already have cancel func for request %v", fuseID))
+		return fmt.Errorf("Already have cancel func for request %v", fuseID)
 	}
 
 	c.cancelFuncs[fuseID] = f
+	return nil
 }
 
 // Set up state for an op that is about to be returned to the user, given its
@@ -333,7 +386,7 @@ func (c *Connection) recordCancelFunc(
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) beginOp(
 	opCode uint32,
-	fuseID uint64) context.Context {
+	fuseID uint64) (context.Context, error) {
 	// Start with the parent context.
 	ctx := c.cfg.OpContext
 
@@ -348,10 +401,13 @@ func (c *Connection) beginOp(
 	if opCode != fusekernel.OpForget {
 		var cancel func()
 		ctx, cancel = context.WithCancel(ctx)
-		c.recordCancelFunc(fuseID, cancel)
+		if err := c.recordCancelFunc(fuseID, cancel); err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
-	return ctx
+	return ctx, nil
 }
 
 // Clean up all state associated with an op to which the user has responded,
@@ -362,7 +418,7 @@ func (c *Connection) beginOp(
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) finishOp(
 	opCode uint32,
-	fuseID uint64) {
+	fuseID uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -375,12 +431,14 @@ func (c *Connection) finishOp(
 	if opCode != fusekernel.OpForget {
 		cancel, ok := c.cancelFuncs[fuseID]
 		if !ok {
-			panic(fmt.Sprintf("Unknown request ID in finishOp: %v", fuseID))
+			return fmt.Errorf("Unknown request ID in finishOp: %v", fuseID)
 		}
 
 		cancel()
 		delete(c.cancelFuncs, fuseID)
 	}
+
+	return nil
 }
 
 // LOCKS_EXCLUDED(c.mu)
@@ -413,63 +471,38 @@ func (c *Connection) handleInterrupt(fuseID uint64) {
 // Read the next message from the kernel. The message must later be destroyed
 // using destroyInMessage.
 func (c *Connection) readMessage() (*buffer.InMessage, error) {
-	// Allocate a message.
 	m := c.getInMessage()
-
-	// Loop past transient errors.
-	for {
-		// Attempt a read.
-		err := m.Init(transportReader{transport: c.transport})
-
-		// Special cases:
-		//
-		//  *  ENODEV means fuse has hung up.
-		//
-		//  *  EINTR means we should try again. (This seems to happen often on
-		//     OS X, cf. http://golang.org/issue/11180)
-		//
-		if pe, ok := err.(*os.PathError); ok {
-			switch pe.Err {
-			case syscall.ENODEV:
-				err = io.EOF
-
-			case syscall.EINTR:
-				err = nil
-				continue
-			}
-		}
-
-		if err != nil {
-			c.putInMessage(m)
-			return nil, err
-		}
-
-		return m, nil
+	if err := m.Init(c.transport); err != nil {
+		c.putInMessage(m)
+		return nil, err
 	}
+
+	return m, nil
 }
 
-// Write a buffer.OutMessage to the kernel, with writev if vectored IO is useful
-// and write if not.
+// Write a buffer.OutMessage to the kernel.
 func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
-	var err error
-	if outMsg.Sglist != nil {
-		if fusekernel.IsPlatformFuseT {
-			// writev is not atomic on macos, restrict to fuse-t platform
-			writeLock.Lock()
-			defer writeLock.Unlock()
-		}
-		err = c.transport.WritevMessage(outMsg.Sglist)
-	} else {
-		err = c.transport.WriteMessage(outMsg.OutHeaderBytes())
-	}
-	return err
+	return c.transport.SendMessage(outMsg.Parts())
 }
 
 // ReadOp consumes the next op from the kernel process, returning the op and a
 // context that should be used for work related to the op. It returns io.EOF if
 // the kernel has closed the connection.
 //
-// If err != nil, the user is responsible for later calling c.Reply with the
+// ReadOp answers the poll hack's requests itself and reads on. See Mount.
+//
+// When a request's body fails to decode, ReadOp answers the request itself and
+// reads on. The answer is EINVAL for a reply size above the cap, and EIO
+// otherwise. The cap is MaxPages pages. For xattrs it is at least 64 KiB, or
+// 128 KiB on darwin. On darwin, for directory reads it is at least the iosize
+// the mount passes.
+//
+// Any other error is fatal to the connection, and ReadOp returns it from then
+// on. Fatal errors are a failed read, a malformed message, a request ID
+// already in flight, a second Reply to one op, and an INIT that fails to
+// decode. A fatal error does not unmount the file system.
+//
+// If err == nil, the user is responsible for later calling c.Reply with the
 // returned context.
 //
 // This function delivers ops in exactly the order they are received from
@@ -479,9 +512,22 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 	// Keep going until we find a request we know how to convert.
 	for {
+		if err := c.fatalError(); err != nil {
+			return nil, nil, err
+		}
+
 		// Read the next message from the kernel.
 		inMsg, err := c.readMessage()
+		if err == io.EOF {
+			return nil, nil, err
+		}
 		if err != nil {
+			return nil, nil, c.recordFatal(fmt.Errorf("readMessage: %w", err))
+		}
+
+		// A Reply may have recorded a fatal error during the read.
+		if err := c.fatalError(); err != nil {
+			c.putInMessage(inMsg)
 			return nil, nil, err
 		}
 
@@ -489,8 +535,16 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		outMsg := c.getOutMessage()
 		op, err = convertInMessage(&c.cfg, inMsg, outMsg, c.protocol)
 		if err != nil {
-			c.putOutMessage(outMsg)
-			return nil, nil, fmt.Errorf("convertInMessage: %v", err)
+			err = fmt.Errorf("convertInMessage: %w", err)
+			opCode := inMsg.Header().Opcode
+			if dupErr := c.rejectMessage(inMsg, outMsg, err); dupErr != nil {
+				return nil, nil, c.recordFatal(dupErr)
+			}
+			// Init waits for this request, and the kernel sends it only once.
+			if opCode == fusekernel.OpInit {
+				return nil, nil, c.recordFatal(err)
+			}
+			continue
 		}
 
 		// Choose an ID for this operation for the purposes of logging, and log it.
@@ -501,16 +555,34 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		// Special case: handle interrupt requests inline.
 		if interruptOp, ok := op.(*interruptOp); ok {
 			c.handleInterrupt(interruptOp.FuseID)
+			c.putInMessage(inMsg)
+			c.putOutMessage(outMsg)
+			continue
+		}
+
+		// Special case: answer the poll hack's requests inline.
+		answered, err := c.answerPollHack(inMsg, outMsg, op)
+		if err != nil {
+			return nil, nil, c.recordFatal(err)
+		}
+		if answered {
 			continue
 		}
 
 		// Set up a context that remembers information about this op.
-		ctx := c.beginOp(inMsg.Header().Opcode, inMsg.Header().Unique)
+		ctx, err := c.beginOp(inMsg.Header().Opcode, inMsg.Header().Unique)
+		if err != nil {
+			// A reply would answer the request in flight under this ID.
+			c.putInMessage(inMsg)
+			c.putOutMessage(outMsg)
+			return nil, nil, c.recordFatal(err)
+		}
 		var wlog *WireLogRecord
 		if c.wireLogger != nil {
 			wlog = NewWireLogRecord()
 		}
-		state := opState{inMsg: inMsg, outMsg: outMsg, op: op, wlog: wlog}
+		h := inMsg.Header()
+		state := opState{inMsg: inMsg, outMsg: outMsg, op: op, wlog: wlog, fuseID: h.Unique, opCode: h.Opcode, replied: new(atomic.Bool)}
 		if c.reportedInodes != nil {
 			if read, ok := op.(*fuseops.ReadFileOp); ok {
 				state.sizeAtRead = c.reportedSize(read.Inode)
@@ -521,6 +593,58 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 		// Return the op to the user.
 		return ctx, op, nil
 	}
+}
+
+// rejectMessage answers a request whose body failed to decode with the errno
+// in err, or EIO, and recycles its messages. The kernel expects no reply to
+// FORGET, BATCH_FORGET and INTERRUPT. rejectMessage sends nothing and returns
+// an error when another request with the same ID is in flight.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) rejectMessage(
+	inMsg *buffer.InMessage,
+	outMsg *buffer.OutMessage,
+	err error) error {
+	defer func() {
+		c.putInMessage(inMsg)
+		c.putOutMessage(outMsg)
+	}()
+
+	h := inMsg.Header()
+	if c.errorLogger != nil {
+		c.errorLogger.Printf("Op 0x%08x opcode %d] -> Error: %q", h.Unique, h.Opcode, err)
+	}
+
+	switch h.Opcode {
+	case fusekernel.OpForget, fusekernel.OpBatchForget, fusekernel.OpInterrupt:
+		return nil
+	}
+
+	if err := c.checkNotInFlight(h.Unique); err != nil {
+		return err
+	}
+
+	c.kernelResponse(outMsg, h.Unique, nil, err)
+	writeErr := c.writeOutMessage(outMsg)
+	// See Reply for why ENOENT is benign.
+	if writeErr != nil && !errors.Is(writeErr, syscall.ENOENT) && c.errorLogger != nil {
+		c.errorLogger.Printf("writeMessage: %v %v", writeErr, outMsg.OutHeaderBytes())
+	}
+	return nil
+}
+
+// checkNotInFlight returns an error when the request with ID fuseID is in
+// flight, because a reply under that ID would answer it.
+//
+// LOCKS_EXCLUDED(c.mu)
+func (c *Connection) checkNotInFlight(fuseID uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.cancelFuncs[fuseID]; ok {
+		return fmt.Errorf("Already have cancel func for request %v", fuseID)
+	}
+	return nil
 }
 
 // Skip errors that happen as a matter of course, since they spook users.
@@ -538,7 +662,15 @@ func (c *Connection) shouldLogError(
 	}
 
 	// Judge the errno that kernelResponse sends, not any errno in the chain.
+	// MountConfig.ErrorLogger lists the errnos skipped here.
 	errno, _ := operror.Errno(err)
+
+	switch errno {
+	case syscall.ENOSYS, syscall.EINTR:
+		// ENOSYS means the file system does not implement the op. EINTR follows
+		// the kernel's interrupt.
+		return false
+	}
 
 	switch op.(type) {
 	case *fuseops.LookUpInodeOp:
@@ -548,13 +680,12 @@ func (c *Connection) shouldLogError(
 		if errno == syscall.ENOENT {
 			return false
 		}
-	case *fuseops.GetXattrOp, *fuseops.ListXattrOp:
-		if errno == syscall.ENOSYS || errno == syscall.ENODATA || errno == syscall.ERANGE {
+	case *fuseops.RmDirOp, *fuseops.RenameOp:
+		if errno == syscall.ENOTEMPTY {
 			return false
 		}
-	case *unknownOp:
-		// Don't bother the user with methods we intentionally don't support.
-		if errno == syscall.ENOSYS {
+	case *fuseops.GetXattrOp, *fuseops.ListXattrOp:
+		if errno == syscall.ENODATA || errno == syscall.ERANGE {
 			return false
 		}
 	}
@@ -562,15 +693,14 @@ func (c *Connection) shouldLogError(
 	return true
 }
 
-var writeLock sync.Mutex
-
 // Reply replies to an op previously read using ReadOp, with the supplied error
 // (or nil if successful). The context must be the context returned by ReadOp.
 //
 // The kernel receives the first syscall.Errno in opErr's chain, or EIO when
 // the chain has none. On FSKit, a short ReadFileOp reply becomes EIO; see
 // fuseops.ReadFileOp.BytesRead. A reply the kernel refuses with ENOENT,
-// because the request was interrupted, is not an error.
+// because the request was interrupted, is not an error. A second Reply to the
+// same op is fatal to the connection.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) Reply(ctx context.Context, opErr error) error {
@@ -585,23 +715,35 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	op := state.op
 	inMsg := state.inMsg
 	outMsg := state.outMsg
-	fuseID := inMsg.Header().Unique
+	fuseID := state.fuseID
+
+	// After the first Reply, the op's messages and even its request ID may
+	// belong to another request.
+	if !state.replied.CompareAndSwap(false, true) {
+		err := fmt.Errorf("Reply called twice for request %v", fuseID)
+		c.recordFatal(err)
+		return err
+	}
+
+	// Clean up state for this op.
+	if err := c.finishOp(state.opCode, fuseID); err != nil {
+		c.recordFatal(err)
+		return err
+	}
 
 	defer func() {
 		// Invoke any callbacks set by the FUSE server after the response to the kernel is
 		// complete and before the inMessage and outMessage memory buffers have been freed.
-		callback := c.callbackForOp(op)
-		if callback != nil {
-			callback()
-		}
+		c.runCallback(fuseID, op)
 
 		// Make sure we destroy the messages when we're done.
 		c.putInMessage(inMsg)
 		c.putOutMessage(outMsg)
 	}()
 
-	// Clean up state for this op.
-	c.finishOp(inMsg.Header().Opcode, inMsg.Header().Unique)
+	if opErr == nil {
+		opErr = checkBytesRead(outMsg, op)
+	}
 
 	// Record growth before the reply reaches the kernel, which may act on it.
 	// A shrink waits until the kernel has the reply.
@@ -616,26 +758,14 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 		opErr = c.trackReportedSizes(state, opErr)
 	}
 
-	logError := c.shouldLogError(op, opErr)
-
-	// Debug logging
-	if c.debugLogger != nil {
-		if opErr == nil {
-			c.debugLog(fuseID, 1, "-> %s", describeResponse(op))
-		} else {
-			if !logError {
-				c.debugLog(fuseID, 1, "-> Error: %q", opErr)
-			}
-		}
-	}
-
-	// Error logging
-	if logError {
-		c.errorLogger.Printf("Op 0x%08x %T] -> Error: %q", fuseID, op, opErr)
+	if opErr == nil {
+		c.debugLog(fuseID, 1, "-> %s", describeResponse(op))
+	} else {
+		c.logOpError(fuseID, op, "Error", opErr)
 	}
 
 	// Send the reply to the kernel, if one is required.
-	noResponse := c.kernelResponse(outMsg, inMsg.Header().Unique, op, opErr)
+	noResponse := c.kernelResponse(outMsg, fuseID, op, opErr)
 
 	if !noResponse {
 		err := c.writeOutMessage(outMsg)
@@ -646,7 +776,7 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 			if c.errorLogger != nil {
 				c.errorLogger.Print(writeErrMsg)
 			}
-			return fmt.Errorf(writeErrMsg)
+			return errors.New(writeErrMsg)
 		}
 		outMsg.Sglist = nil
 		if err == nil && c.reportedInodes != nil {
@@ -657,11 +787,83 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	if c.wireLogger != nil {
 		entry, err := formatWireLogEntry(op, opErr, state.wlog)
 		if err == nil {
+			c.wireLoggerMu.Lock()
 			c.wireLogger.Write(entry)
+			c.wireLoggerMu.Unlock()
 		}
 	}
 
 	return nil
+}
+
+// checkBytesRead reports a BytesRead that the op's reply buffer cannot hold.
+// kernelResponseForOp would panic on it, after the op is marked replied.
+func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
+	// convertInMessage grows m by the size of the readdir and xattr buffers.
+	grown := m.Len() - buffer.OutMessageHeaderSize
+	var n, size int
+	switch o := op.(type) {
+	case *fuseops.ReadFileOp:
+		n, size = o.BytesRead, len(o.Dst)
+		if o.Data != nil {
+			size = 0
+			for _, d := range o.Data {
+				size += len(d)
+			}
+		}
+	case *fuseops.ReadDirOp:
+		n, size = o.BytesRead, grown
+	case *fuseops.ReadDirPlusOp:
+		n, size = o.BytesRead, grown
+	case *fuseops.GetXattrOp:
+		if len(o.Dst) == 0 {
+			// A size query: BytesRead is the size, not a length within Dst.
+			return nil
+		}
+		n, size = o.BytesRead, grown
+	case *fuseops.ListXattrOp:
+		if len(o.Dst) == 0 {
+			return nil
+		}
+		n, size = o.BytesRead, grown
+	default:
+		return nil
+	}
+	if n < 0 || n > size {
+		return fmt.Errorf("%T.BytesRead is %d, outside its %d-byte buffer: %w", op, n, size, syscall.EIO)
+	}
+	return nil
+}
+
+// runCallback runs op's Callback. The op is already answered, so a panic in
+// the callback is logged instead of leaving Reply.
+func (c *Connection) runCallback(fuseID uint64, op interface{}) {
+	callback := c.callbackForOp(op)
+	if callback == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.logOpError(fuseID, op, "Callback", &operror.Panic{Value: r, Stack: debug.Stack()})
+		}
+	}()
+	callback()
+}
+
+// logOpError logs an op's error to the error logger, or to the debug logger
+// when shouldLogError skips it. An operror.Panic is logged with its stack.
+func (c *Connection) logOpError(fuseID uint64, op interface{}, label string, opErr error) {
+	p, isPanic := opErr.(*operror.Panic)
+	switch {
+	case c.shouldLogError(op, opErr) && isPanic:
+		c.errorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", fuseID, op, label, p.Value, p.Stack)
+	case c.shouldLogError(op, opErr):
+		c.errorLogger.Printf("Op 0x%08x %T] -> %s: %q", fuseID, op, label, opErr)
+	case isPanic:
+		c.debugLog(fuseID, 1, "-> %s: panic: %v\n%s", label, p.Value, p.Stack)
+	default:
+		c.debugLog(fuseID, 1, "-> %s: %q", label, opErr)
+	}
 }
 
 func (c *Connection) callbackForOp(op interface{}) func() {
@@ -671,32 +873,6 @@ func (c *Connection) callbackForOp(op interface{}) func() {
 	case *fuseops.WriteFileOp:
 		return o.Callback
 	}
-	return nil
-}
-
-func (c *Connection) sanitizeMaxPagesAndWrite() error {
-	pageSize := uint32(buffer.GetPageSize())
-
-	// If neither are given, set them both to the default based on MaxReadSize & MaxWriteSize.
-	if c.cfg.MaxPages == 0 && c.cfg.MaxWrite == 0 {
-		c.cfg.MaxWrite = buffer.MaxWriteSize
-		maxPayload := max(uint32(buffer.MaxReadSize), uint32(buffer.MaxWriteSize))
-		c.cfg.MaxPages = uint16(maxPayload / pageSize)
-	} else if c.cfg.MaxPages != 0 && c.cfg.MaxWrite == 0 {
-		// If only MaxPages is given, set MaxWrite based on MaxPages.
-		c.cfg.MaxWrite = uint32(c.cfg.MaxPages) * pageSize
-	} else if c.cfg.MaxPages == 0 && c.cfg.MaxWrite != 0 {
-		// If only MaxWrite is given, MaxPages defaults to max(MaxWrite, MaxReadSize).
-		maxPayload := max(c.cfg.MaxWrite, uint32(buffer.MaxReadSize))
-		c.cfg.MaxPages = uint16((maxPayload + pageSize - 1) / pageSize)
-	}
-
-	// Validate: MaxPages needs to be >= MaxWrite (in bytes)
-	if uint32(c.cfg.MaxPages)*pageSize < c.cfg.MaxWrite {
-		return fmt.Errorf("MaxPages (%d pages, %d bytes) must be at least MaxWrite (%d bytes)",
-			c.cfg.MaxPages, uint32(c.cfg.MaxPages)*pageSize, c.cfg.MaxWrite)
-	}
-
 	return nil
 }
 

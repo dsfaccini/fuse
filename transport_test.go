@@ -27,6 +27,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/buffer"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
@@ -36,6 +37,10 @@ type testTransport struct {
 	reads    int
 	writeErr error
 
+	// readErr is the error a read returns once messages run out. Nil means
+	// io.EOF.
+	readErr error
+
 	// Reply writes concurrently.
 	mu     sync.Mutex
 	writes [][]byte
@@ -43,6 +48,9 @@ type testTransport struct {
 
 func (t *testTransport) ReadMessage(dst []byte) (int, error) {
 	if t.reads == len(t.messages) {
+		if t.readErr != nil {
+			return 0, t.readErr
+		}
 		return 0, io.EOF
 	}
 	message := t.messages[t.reads]
@@ -53,17 +61,7 @@ func (t *testTransport) ReadMessage(dst []byte) (int, error) {
 	return copy(dst, message), nil
 }
 
-func (t *testTransport) WriteMessage(message []byte) error {
-	if t.writeErr != nil {
-		return t.writeErr
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.writes = append(t.writes, append([]byte(nil), message...))
-	return nil
-}
-
-func (t *testTransport) WritevMessage(parts [][]byte) error {
+func (t *testTransport) SendMessage(parts [][]byte) error {
 	if t.writeErr != nil {
 		return t.writeErr
 	}
@@ -86,17 +84,13 @@ func (t *testTransport) written() [][]byte {
 }
 
 func TestConnectionTransportReadsWholeMessages(t *testing.T) {
-	oldFuseT := fusekernel.IsPlatformFuseT
-	fusekernel.IsPlatformFuseT = false
-	t.Cleanup(func() { fusekernel.IsPlatformFuseT = oldFuseT })
-
 	messageA := makeTestInMessage(101)
 	messageB := makeTestInMessage(202)
 	transport := &testTransport{messages: [][]byte{messageA, messageB}}
 
 	for i, wantUnique := range []uint64{101, 202} {
 		inMessage := buffer.NewInMessage(len(messageA))
-		if err := inMessage.Init(transportReader{transport: transport}); err != nil {
+		if err := inMessage.Init(transport); err != nil {
 			t.Fatalf("Init message %d: %v", i, err)
 		}
 		if got := inMessage.Header().Unique; got != wantUnique {
@@ -122,66 +116,161 @@ func TestConnectionTransportWritesWholeReplies(t *testing.T) {
 		t.Fatalf("writeOutMessage: %v", err)
 	}
 	if len(transport.writes) != 1 {
-		t.Fatalf("WritevMessage calls = %d, want 1", len(transport.writes))
+		t.Fatalf("SendMessage calls = %d, want 1", len(transport.writes))
 	}
 	if !bytes.Equal(transport.writes[0], want) {
 		t.Errorf("written reply = %x, want %x", transport.writes[0], want)
 	}
 }
 
-// The kernel takes each write(2) to /dev/fuse as one whole message, so a short
-// write must fail instead of sending the rest as a second message.
-func TestFileTransportWritesWholeMessage(t *testing.T) {
-	var fds [2]int
-	if err := syscall.Pipe(fds[:]); err != nil {
-		t.Fatal(err)
-	}
-	r := os.NewFile(uintptr(fds[0]), "pipe-read")
-	defer r.Close()
-	// os.NewFile keeps a non-blocking descriptor non-blocking, even through
-	// Fd, so a write into a full pipe comes back short.
-	if err := syscall.SetNonblock(fds[1], true); err != nil {
-		t.Fatal(err)
-	}
-	w := os.NewFile(uintptr(fds[1]), "pipe-write")
-	defer w.Close()
+// The kernel takes each write(2) or writev(2) to /dev/fuse as one whole
+// message, so a short write must fail instead of sending the rest as a second
+// message.
+func TestFileTransportSendsWholeMessages(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		parts func([]byte) [][]byte
+	}{
+		{name: "write", parts: func(b []byte) [][]byte { return [][]byte{b} }},
+		{name: "writev", parts: func(b []byte) [][]byte { return [][]byte{b[:1], b[1:]} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var fds [2]int
+			if err := syscall.Pipe(fds[:]); err != nil {
+				t.Fatal(err)
+			}
+			r := os.NewFile(uintptr(fds[0]), "pipe-read")
+			defer r.Close()
+			// os.NewFile keeps a non-blocking descriptor non-blocking, even
+			// through Fd, so a write into a full pipe comes back short.
+			if err := syscall.SetNonblock(fds[1], true); err != nil {
+				t.Fatal(err)
+			}
+			w := os.NewFile(uintptr(fds[1]), "pipe-write")
+			defer w.Close()
 
-	transport := newFileTransport(w)
-	want := []byte("reply")
-	if err := transport.WriteMessage(want); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
-	}
-	got := make([]byte, len(want))
-	if _, err := io.ReadFull(r, got); err != nil {
-		t.Fatalf("ReadFull: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("read bytes = %q, want %q", got, want)
-	}
+			transport := newFileTransport(w)
+			want := []byte("reply")
+			if err := transport.SendMessage(test.parts(want)); err != nil {
+				t.Fatalf("SendMessage: %v", err)
+			}
+			got := make([]byte, len(want))
+			if _, err := io.ReadFull(r, got); err != nil {
+				t.Fatalf("ReadFull: %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("read bytes = %q, want %q", got, want)
+			}
 
-	// Fill the pipe, then free one page so the next write is short.
-	fill := make([]byte, 1<<16)
-	for {
-		_, err := syscall.Write(fds[1], fill)
-		if err == syscall.EAGAIN {
-			break
-		}
+			// Fill the pipe, then free one page so the next write is short.
+			fill := make([]byte, 1<<16)
+			for {
+				_, err := syscall.Write(fds[1], fill)
+				if err == syscall.EAGAIN {
+					break
+				}
+				if err != nil {
+					t.Fatalf("filling the pipe: %v", err)
+				}
+			}
+			if _, err := io.ReadFull(r, make([]byte, os.Getpagesize())); err != nil {
+				t.Fatalf("ReadFull: %v", err)
+			}
+
+			// os.File.Write would wait for the pipe to drain and finish the
+			// message. The deadline bounds that wait.
+			if err := w.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			err := transport.SendMessage(test.parts(make([]byte, 1<<20)))
+			if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Errorf("SendMessage into a nearly full pipe = %v, want a short-write error", err)
+			}
+		})
+	}
+}
+
+func TestReadDeviceRetriesEINTRAndEndsAtHangUp(t *testing.T) {
+	kernel := newFakeKernel()
+	message := makeTestInMessage(7)
+	kernel.SendErrno(syscall.EINTR)
+	kernel.Send(message)
+	kernel.SendErrno(syscall.EIO)
+	kernel.HangUp()
+
+	dst := make([]byte, 4096)
+	if n, err := readDevice(kernel, dst); err != nil || !bytes.Equal(dst[:n], message) {
+		t.Errorf("readDevice after EINTR = %x, %v; want %x", dst[:n], err, message)
+	}
+	if _, err := readDevice(kernel, dst); !errors.Is(err, syscall.EIO) {
+		t.Errorf("readDevice on EIO = %v, want EIO", err)
+	}
+	if _, err := readDevice(kernel, dst); err != io.EOF {
+		t.Errorf("readDevice after the hang-up = %v, want io.EOF", err)
+	}
+}
+
+// cannedTransport returns its message from every read and drops every send.
+type cannedTransport struct{ message []byte }
+
+func (t cannedTransport) ReadMessage(p []byte) (int, error) { return copy(p, t.message), nil }
+func (cannedTransport) SendMessage([][]byte) error          { return nil }
+func (cannedTransport) Close() error                        { return nil }
+
+// Every op takes a read, and most replies are a bare header.
+func TestConnectionReadsAndRepliesWithoutAllocating(t *testing.T) {
+	c := newTestConnection(cannedTransport{message: makeTestInMessage(1)})
+	var out buffer.OutMessage
+	out.Reset()
+	allocs := testing.AllocsPerRun(100, func() {
+		m, err := c.readMessage()
 		if err != nil {
-			t.Fatalf("filling the pipe: %v", err)
+			t.Fatalf("readMessage: %v", err)
 		}
+		c.putInMessage(m)
+		if err := c.writeOutMessage(&out); err != nil {
+			t.Fatalf("writeOutMessage: %v", err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("allocations per read and reply = %v, want 0", allocs)
 	}
-	if _, err := io.ReadFull(r, make([]byte, os.Getpagesize())); err != nil {
-		t.Fatalf("ReadFull: %v", err)
-	}
+}
 
-	// os.File.Write would wait for the pipe to drain and finish the message.
-	// The deadline bounds that wait.
-	if err := w.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
+// Replies with a payload carve it from the out-message's scratch, which
+// survives the freelist.
+func TestPayloadRepliesReuseOutMessageStorage(t *testing.T) {
+	c := newTestConnection(cannedTransport{})
+	limit := maxReplySize(&c.cfg)
+	// The ops are built once, so that only the library's allocations count.
+	lookUp, create, readDir := &fuseops.LookUpInodeOp{}, &fuseops.CreateFileOp{}, &fuseops.ReadDirOp{BytesRead: 100}
+	tests := []struct {
+		name  string
+		build func(t *testing.T, m *buffer.OutMessage)
+	}{
+		{"lookup", func(_ *testing.T, m *buffer.OutMessage) { c.kernelResponse(m, 1, lookUp, nil) }},
+		{"create", func(_ *testing.T, m *buffer.OutMessage) { c.kernelResponse(m, 1, create, nil) }},
+		{"readdir", func(t *testing.T, m *buffer.OutMessage) {
+			if _, err := growDst(m, 64<<10, limit); err != nil {
+				t.Fatalf("growDst: %v", err)
+			}
+			c.kernelResponse(m, 1, readDir, nil)
+		}},
 	}
-	err := transport.WriteMessage(make([]byte, 1<<20))
-	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Errorf("WriteMessage into a nearly full pipe = %v, want a short-write error", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				m := c.getOutMessage()
+				tt.build(t, m)
+				if err := c.writeOutMessage(m); err != nil {
+					t.Fatalf("writeOutMessage: %v", err)
+				}
+				c.putOutMessage(m)
+			})
+			if allocs != 0 {
+				t.Errorf("allocations per reply = %v, want 0", allocs)
+			}
+		})
 	}
 }
 

@@ -16,8 +16,10 @@ package fuseutil
 
 import (
 	"context"
-	"io"
+	"fmt"
+	"runtime/debug"
 	"sync"
+	"syscall"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -31,6 +33,13 @@ import (
 //
 // The FileSystem implementation should not call Connection.Reply, instead
 // returning the error with which the caller should respond.
+//
+// A panic in a method other than Destroy is recovered and answered with EIO,
+// and so is a method that calls runtime.Goexit. The panic value and its stack
+// go to MountConfig.ErrorLogger, or to DebugLogger when ErrorLogger is nil.
+// The server keeps serving other ops, except after a Goexit in ForgetInode,
+// which runs on the goroutine that reads requests. A lock the method held
+// when it panicked stays held.
 //
 // See NotImplementedFileSystem for a convenient way to embed default
 // implementations for methods you don't care about.
@@ -92,6 +101,8 @@ func NewFileSystemServer(fs FileSystem) fuse.Server {
 	}
 }
 
+var errExitedWithoutReply = fmt.Errorf("fuseutil: the method exited without returning: %w", syscall.EIO)
+
 type fileSystemServer struct {
 	fs          FileSystem
 	opsInFlight sync.WaitGroup
@@ -106,13 +117,11 @@ func (s *fileSystemServer) ServeOps(c *fuse.Connection) {
 	}()
 
 	for {
+		// ReadOp returns io.EOF on unmount. Any other error is fatal to the
+		// connection, and Join returns it.
 		ctx, op, err := c.ReadOp()
-		if err == io.EOF {
-			break
-		}
-
 		if err != nil {
-			panic(err)
+			break
 		}
 
 		s.opsInFlight.Add(1)
@@ -133,6 +142,22 @@ func (s *fileSystemServer) handleOp(
 	ctx context.Context,
 	op interface{}) {
 	defer s.opsInFlight.Done()
+
+	// A panic inside Reply comes after the op is answered, and a second Reply
+	// is fatal to the connection, so only an op that never reached Reply is
+	// answered here. recover returns nil when the method called
+	// runtime.Goexit.
+	replied := false
+	defer func() {
+		if replied {
+			return
+		}
+		if r := recover(); r != nil {
+			c.Reply(ctx, &operror.Panic{Value: r, Stack: debug.Stack()})
+		} else {
+			c.Reply(ctx, errExitedWithoutReply)
+		}
+	}()
 
 	// Dispatch to the appropriate method.
 	var err error
@@ -234,6 +259,7 @@ func (s *fileSystemServer) handleOp(
 		err = s.fs.SyncFS(ctx, typed)
 	}
 
+	replied = true
 	c.Reply(ctx, err)
 }
 

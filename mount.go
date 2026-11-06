@@ -16,101 +16,296 @@ package fuse
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Server is an interface for any type that knows how to serve ops read from a
 // connection.
 type Server interface {
-	// Read and serve ops from the supplied connection until EOF. Do not return
-	// until all operations have been responded to. Must not be called more than
-	// once.
+	// Read and serve ops from the supplied connection until ReadOp returns an
+	// error, which is io.EOF on unmount. Do not return until all operations
+	// have been responded to. Must not be called more than once.
 	ServeOps(*Connection)
 }
 
-// Mount attempts to mount a file system on the given directory, using the
-// supplied Server to serve connection requests. It blocks until the file
-// system is successfully mounted.
+// Mount is MountContext with context.Background(), so it waits for the mount
+// however long it takes. MountContext's caveat about reusing the Server after
+// a failed mount applies.
 func Mount(
 	dir string,
 	server Server,
 	config *MountConfig) (*MountedFileSystem, error) {
+	return MountContext(context.Background(), dir, server, config)
+}
+
+// MountContext attempts to mount a file system on the given directory, using
+// the supplied Server to serve connection requests. It blocks until the file
+// system is successfully mounted. It validates config before it mounts
+// anything. When the mount fails after the native mount was made, MountContext
+// force-unmounts it before it returns.
+//
+// When the native mount fails after the kernel's INIT was answered,
+// MountContext waits at most a second for the Server to stop. The Server may
+// keep serving after MountContext returns, and fuseutil's server then calls
+// Destroy once its last read fails. Do not reuse that Server for another
+// mount.
+//
+// ctx bounds the wait for the mount. When ctx ends first, MountContext
+// returns an *AbandonedMountError that wraps ctx.Err() at once. The mount then
+// ends in the background, and the Server may receive ops until it has: on
+// FSKit, the connection stops reading, and a mount that macFUSE completes
+// later is force-unmounted. On Linux and the macFUSE kernel extension, ctx
+// does not interrupt the mount helper or the wait for the kernel's INIT; a
+// mount that completes after ctx ended is force-unmounted. Call
+// AbandonedMountError.Wait before you mount at dir again, because that
+// force-unmount goes by path. ctx has no effect once MountContext has
+// returned.
+//
+// On Linux, MountContext answers the mount's first FUSE_POLL before it
+// returns, so the process can open files in its own mount through package os
+// without deadlocking. It reserves inode ID math.MaxUint64 for that: requests
+// for it never reach the server. There are two exceptions:
+//
+//   - A /dev/fd/N mount point skips the hack. The process can then deadlock on
+//     its own mount, and inode ID math.MaxUint64 stays the file system's.
+//   - When the hack fails, MountContext still returns the mount, and logs the
+//     error to MountConfig.ErrorLogger, or nowhere when that is nil. Opening
+//     the mount through package os can then deadlock.
+//
+// The hack checks permissions on the root. Unless
+// MountConfig.DisableDefaultPermissions is set, that sends the server a
+// GetInodeAttributes for the root, and MountContext succeeds only after the
+// server answers it. The server must not make that answer wait on anything
+// that happens after MountContext returns.
+func MountContext(
+	ctx context.Context,
+	dir string,
+	server Server,
+	config *MountConfig) (*MountedFileSystem, error) {
+	cfg, err := config.normalize()
+	if err != nil {
+		return nil, fmt.Errorf("mount config: %w", err)
+	}
+
 	// Sanity check: make sure the mount point exists and is a directory. This
 	// saves us from some confusing errors later on OS X.
 	if err := checkMountPoint(dir); err != nil {
 		return nil, err
 	}
-
-	// Initialize the struct.
-	mfs := &MountedFileSystem{
-		dir:                 dir,
-		joinStatusAvailable: make(chan struct{}),
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Begin the mounting process, which will continue in the background.
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Beginning the mounting kickoff process")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Beginning the mounting kickoff process")
 	}
-	ready := make(chan error, 1)
-	transport, err := mountTransport(dir, config, ready)
+	native, err := mountTransport(dir, &cfg)
 	if err != nil {
 		return nil, fmt.Errorf("mount: %w", err)
 	}
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Completed the mounting kickoff process")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Completed the mounting kickoff process")
 	}
 
-	// Choose a parent context for ops.
-	cfgCopy := *config
-	if cfgCopy.OpContext == nil {
-		cfgCopy.OpContext = context.Background()
+	type result struct {
+		mfs *MountedFileSystem
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		mfs, err := finishMount(dir, server, &cfg, native)
+		done <- result{mfs, err}
+	}()
+	select {
+	case r := <-done:
+		return r.mfs, r.err
+	case <-ctx.Done():
 	}
 
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Creating a connection object")
+	native.cancel()
+	abandoned := &AbandonedMountError{ctxErr: ctx.Err(), done: make(chan struct{})}
+	go func() {
+		defer close(abandoned.done)
+		r := <-done
+		var unmountErr *unmountFailure
+		switch {
+		case errors.As(r.err, &unmountErr):
+			abandoned.cleanupErr = unmountErr.err
+		case r.err == nil:
+			// The caller gave up on this mount and cannot unmount it.
+			if err := forceUnmount(dir, native.backend()); err != nil {
+				abandoned.cleanupErr = fmt.Errorf("unmounting the abandoned mount: %w", err)
+				return
+			}
+			r.mfs.Join(context.Background())
+		}
+	}()
+	return nil, abandoned
+}
+
+// AbandonedMountError is the error MountContext returns when its context ends
+// before the mount completes. The mount then ends in the background, and the
+// Server may receive ops until it has. Call Wait before you mount at the same
+// directory again: a mount that completes late is force-unmounted by its
+// path.
+type AbandonedMountError struct {
+	ctxErr     error
+	done       chan struct{}
+	cleanupErr error
+}
+
+func (e *AbandonedMountError) Error() string {
+	return "mount abandoned: " + e.ctxErr.Error()
+}
+
+// Unwrap returns the error of the context that ended, so errors.Is(err,
+// context.Canceled) and errors.Is(err, context.DeadlineExceeded) hold.
+func (e *AbandonedMountError) Unwrap() error { return e.ctxErr }
+
+// Wait blocks until the abandoned mount has ended: it failed, or it completed
+// and has been force-unmounted and its Server has stopped. It returns the
+// error from unmounting it, if any, or ctx.Err() when ctx ends first. Once
+// Wait returns an unmount error, the mount and its Server may remain.
+func (e *AbandonedMountError) Wait(ctx context.Context) error {
+	// A select with both cases ready picks either.
+	select {
+	case <-e.done:
+		return e.cleanupErr
+	default:
+	}
+	select {
+	case <-e.done:
+		return e.cleanupErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// unmountFailure wraps the error from force-unmounting a mount that Mount
+// will not return.
+type unmountFailure struct{ err error }
+
+func (e *unmountFailure) Error() string { return e.err.Error() }
+func (e *unmountFailure) Unwrap() error { return e.err }
+
+// finishMount reads INIT from native, starts serving, and waits for the native
+// mount's result.
+func finishMount(
+	dir string,
+	server Server,
+	cfg *MountConfig,
+	native nativeMount) (*MountedFileSystem, error) {
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Creating a connection object")
 	}
 	// Create a Connection object wrapping the transport.
 	connection, err := newConnection(
-		cfgCopy,
-		config.DebugLogger,
-		config.ErrorLogger,
-		config.WireLogger,
-		transport)
+		*cfg,
+		cfg.DebugLogger,
+		cfg.ErrorLogger,
+		cfg.WireLogger,
+		native)
 	if err != nil {
-		if config.Options["backend"] == "fskit" {
-			if mountErr := <-ready; mountErr != nil {
-				return nil, fmt.Errorf("mount (background): %w", mountErr)
-			}
+		if mountErr := native.waitMounted(); mountErr != nil {
+			return nil, fmt.Errorf("mount (background): %w", mountErr)
 		}
-		return nil, fmt.Errorf("newConnection: %v", err)
+		// The native mount exists, but nothing serves it.
+		err = fmt.Errorf("newConnection: %v", err)
+		if unmountErr := forceUnmount(dir, native.backend()); unmountErr != nil {
+			err = errors.Join(err, &unmountFailure{fmt.Errorf("unmounting the unserved mount: %w", unmountErr)})
+		}
+		return nil, err
 	}
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Successfully created the connection")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Successfully created the connection")
+	}
+
+	mfs := &MountedFileSystem{
+		dir:                 dir,
+		backend:             native.backend(),
+		joinStatusAvailable: make(chan struct{}),
 	}
 
 	// Serve the connection in the background. When done, set the join status.
-	go func() {
-		server.ServeOps(connection)
-		mfs.joinStatus = connection.close()
-		close(mfs.joinStatusAvailable)
-	}()
+	go mfs.serve(server, connection)
 
-	if config.DebugLogger != nil {
-		config.DebugLogger.Println("Waiting for mounting process to complete")
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Waiting for mounting process to complete")
 	}
 
 	// Wait for the mount process to complete.
-	if err := <-ready; err != nil {
+	if err := native.waitMounted(); err != nil {
+		// The native mount reports that nothing is mounted, so nothing is
+		// unmounted, as in macFUSE's libfuse: the mount point may be another
+		// volume. On FSKit the failure ends the reads, but ops in flight can
+		// still hold the server. Whether a failed mount(2) ends the kernel
+		// extension device's reads is unverified. So the wait is bounded;
+		// past it, the server keeps serving until its last op is answered
+		// and a read fails.
+		joinCtx, cancel := context.WithTimeout(context.Background(), failedMountJoinTimeout)
+		defer cancel()
+		mfs.Join(joinCtx)
 		return nil, fmt.Errorf("mount (background): %w", err)
 	}
 
+	// Without the hack, the mount works as it did, so a failure is only logged.
+	if err := runPollHack(dir, connection); err != nil && cfg.ErrorLogger != nil {
+		cfg.ErrorLogger.Printf("poll hack: %v; opening this mount through package os may deadlock", err)
+	}
+
 	return mfs, nil
+}
+
+// failedMountJoinTimeout bounds how long Mount waits for the server to stop
+// after the native mount fails once serving has begun.
+const failedMountJoinTimeout = time.Second
+
+// forceUnmount removes a mount that Mount made but will not return. A
+// /dev/fd/N mount point belongs to whoever opened the device, so it stays.
+func forceUnmount(dir string, backend Backend) error {
+	if strings.HasPrefix(dir, "/dev/fd/") {
+		return nil
+	}
+	return unmountBackend(dir, backend, true)
+}
+
+// nativeMount is the kernel-facing side of a mount that mountTransport
+// started. It owns the native mount's result.
+type nativeMount interface {
+	connectionTransport
+
+	// backend returns the mechanism the mount goes through.
+	backend() Backend
+
+	// waitMounted blocks until the native mount has finished, and returns its
+	// result. It may be called more than once, and after Close. FSKit and the
+	// kernel extension finish mounting only after INIT is answered, so Mount
+	// calls it once the connection has read INIT, or has failed to.
+	waitMounted() error
+
+	// cancel makes a read waiting for the kernel, and every later read, return
+	// io.EOF, where the backend can interrupt one. MountContext calls it when
+	// its context ends.
+	cancel()
+}
+
+// serve runs server until ServeOps returns, then publishes the join status:
+// the connection's fatal error, if any, joined with the error from closing it.
+func (mfs *MountedFileSystem) serve(server Server, c *Connection) {
+	server.ServeOps(c)
+	mfs.joinStatus = errors.Join(c.fatalError(), c.close())
+	close(mfs.joinStatusAvailable)
 }
 
 func checkMountPoint(dir string) error {
@@ -133,14 +328,18 @@ func checkMountPoint(dir string) error {
 	return nil
 }
 
-func fusermount(binary string, argv []string, additionalEnv []string, wait bool, debugLogger *log.Logger) (*os.File, error) {
+// fusermount runs binary, a mount helper, and returns the device it passes
+// back. With wait set, the helper has exited by then. Otherwise fusermount
+// also returns a function that waits for the helper's mount result; see
+// mountHelperResult.
+func fusermount(binary string, argv []string, additionalEnv []string, wait bool, debugLogger *log.Logger) (_ *os.File, waitHelper func() error, err error) {
 	if debugLogger != nil {
 		debugLogger.Println("Creating a socket pair")
 	}
 	// Create a socket pair.
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	fds, err := cloexecSocketpair()
 	if err != nil {
-		return nil, fmt.Errorf("Socketpair: %v", err)
+		return nil, nil, fmt.Errorf("Socketpair: %v", err)
 	}
 
 	if debugLogger != nil {
@@ -148,7 +347,6 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	}
 	// Wrap the sockets into os.File objects that we will pass off to fusermount.
 	writeFile := os.NewFile(uintptr(fds[0]), "fusermount-child-writes")
-	defer writeFile.Close()
 
 	readFile := os.NewFile(uintptr(fds[1]), "fusermount-parent-reads")
 	defer readFile.Close()
@@ -156,7 +354,7 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	if debugLogger != nil {
 		debugLogger.Println("Starting fusermount/os mount")
 	}
-	// Start fusermount/mount_macfuse/mount_osxfuse.
+	// Start fusermount or mount_macfuse.
 	cmd := exec.Command(binary, argv...)
 	cmd.Env = append(os.Environ(), "_FUSE_COMMFD=3")
 	cmd.Env = append(cmd.Env, additionalEnv...)
@@ -169,8 +367,19 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	} else {
 		err = cmd.Start()
 	}
+	// Only the helper may hold the other end, so that the reads below end
+	// when it exits.
+	writeFile.Close()
 	if err != nil {
-		return nil, fmt.Errorf("running %v: %v", binary, err)
+		return nil, nil, fmt.Errorf("running %v: %v", binary, err)
+	}
+	if !wait {
+		defer func() {
+			if err != nil {
+				// Reap the helper.
+				go cmd.Wait()
+			}
+		}()
 	}
 
 	if debugLogger != nil {
@@ -179,9 +388,15 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	// Wrap the socket file in a connection.
 	c, err := net.FileConn(readFile)
 	if err != nil {
-		return nil, fmt.Errorf("FileConn: %v", err)
+		return nil, nil, fmt.Errorf("FileConn: %v", err)
 	}
-	defer c.Close()
+	// Without wait, the helper sends its mount result on the socket later.
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			c.Close()
+		}
+	}()
 
 	if debugLogger != nil {
 		debugLogger.Println("Checking that we have a unix domain socket")
@@ -189,29 +404,31 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	// We expect to have a Unix domain socket.
 	uc, ok := c.(*net.UnixConn)
 	if !ok {
-		return nil, fmt.Errorf("Expected UnixConn, got %T", c)
+		return nil, nil, fmt.Errorf("Expected UnixConn, got %T", c)
 	}
 
 	if debugLogger != nil {
 		debugLogger.Println("Read a message from socket")
 	}
 	// Read a message.
-	buf := make([]byte, 32) // expect 1 byte
+	// Read only the byte that carries the descriptor, so that the mount
+	// result the helper sends next stays on the socket.
+	buf := make([]byte, 1)
 	oob := make([]byte, 32) // expect 24 bytes
 	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
 	if err != nil {
-		return nil, fmt.Errorf("ReadMsgUnix: %v", err)
+		return nil, nil, fmt.Errorf("ReadMsgUnix: %v", err)
 	}
 
 	// Parse the message.
 	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
 	if err != nil {
-		return nil, fmt.Errorf("ParseSocketControlMessage: %v", err)
+		return nil, nil, fmt.Errorf("ParseSocketControlMessage: %v", err)
 	}
 
 	// We expect one message.
 	if len(scms) != 1 {
-		return nil, fmt.Errorf("expected 1 SocketControlMessage; got scms = %#v", scms)
+		return nil, nil, fmt.Errorf("expected 1 SocketControlMessage; got scms = %#v", scms)
 	}
 
 	scm := scms[0]
@@ -223,16 +440,60 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	// Pull out the FD returned by fusermount
 	gotFds, err := syscall.ParseUnixRights(&scm)
 	if err != nil {
-		return nil, fmt.Errorf("syscall.ParseUnixRights: %v", err)
+		return nil, nil, fmt.Errorf("syscall.ParseUnixRights: %v", err)
 	}
 
 	if len(gotFds) != 1 {
-		return nil, fmt.Errorf("wanted 1 fd; got %#v", gotFds)
+		return nil, nil, fmt.Errorf("wanted 1 fd; got %#v", gotFds)
 	}
 
 	if debugLogger != nil {
 		debugLogger.Println("Converting FD into os.File")
 	}
 	// Turn the FD into an os.File.
-	return os.NewFile(uintptr(gotFds[0]), "/dev/fuse"), nil
+	if !wait {
+		keepConn = true
+		waitHelper = func() error {
+			defer c.Close()
+			return mountHelperResult(binary, uc, cmd)
+		}
+	}
+	return os.NewFile(uintptr(gotFds[0]), "/dev/fuse"), waitHelper, nil
+}
+
+// mountHelperResult reads the mount result that a macFUSE mount helper sends
+// on its socket once mount(2) returns, as macFUSE's libfuse does, and reaps
+// the helper. With _FUSE_COMMVERS=2 the result is a native-endian int32: 0
+// for success, an errno, or -1 for an unknown failure. A helper that sends no
+// result reports through its exit status.
+func mountHelperResult(helper string, conn io.Reader, cmd *exec.Cmd) error {
+	var status int32
+	readErr := binary.Read(conn, binary.NativeEndian, &status)
+	waitErr := cmd.Wait()
+	switch {
+	case readErr == nil && status == 0:
+		return nil
+	case readErr == nil && status > 0:
+		return fmt.Errorf("%s: mount(2): %w", helper, syscall.Errno(status))
+	case readErr == nil:
+		return fmt.Errorf("%s: mount failed with status %d", helper, status)
+	case waitErr != nil:
+		return fmt.Errorf("%s: %w", helper, waitErr)
+	}
+	return nil
+}
+
+// cloexecSocketpair returns a connected pair of Unix stream sockets that a
+// child process inherits only when it is passed one explicitly. It holds
+// syscall.ForkLock so that no fork in between inherits them.
+func cloexecSocketpair() ([2]int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return fds, err
+	}
+	syscall.CloseOnExec(fds[0])
+	syscall.CloseOnExec(fds[1])
+	return fds, nil
 }

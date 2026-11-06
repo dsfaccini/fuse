@@ -38,10 +38,6 @@ type paddingTestTransport struct {
 
 func (paddingTestTransport) padsShortReads() bool { return true }
 
-func structBytes[T any](v *T) []byte {
-	return unsafe.Slice((*byte)(unsafe.Pointer(v)), unsafe.Sizeof(*v))
-}
-
 func makeOpMessage(opcode uint32, unique, nodeid uint64, body ...[]byte) []byte {
 	header := fusekernel.InHeader{Opcode: opcode, Unique: unique, Nodeid: nodeid}
 	message := append([]byte(nil), structBytes(&header)...)
@@ -395,11 +391,7 @@ type hookTransport struct {
 
 func (h *hookTransport) padsShortReads() bool { return h.pads }
 
-func (h *hookTransport) WriteMessage(message []byte) error {
-	return h.WritevMessage([][]byte{message})
-}
-
-func (h *hookTransport) WritevMessage(parts [][]byte) error {
+func (h *hookTransport) SendMessage(parts [][]byte) error {
 	h.mu.Lock()
 	before := h.before
 	h.before = nil
@@ -408,7 +400,7 @@ func (h *hookTransport) WritevMessage(parts [][]byte) error {
 		before()
 	}
 
-	err := h.testTransport.WritevMessage(parts)
+	err := h.testTransport.SendMessage(parts)
 
 	h.mu.Lock()
 	after := h.after
