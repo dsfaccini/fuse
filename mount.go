@@ -123,17 +123,64 @@ func MountContext(
 	}
 
 	native.cancel()
+	abandoned := &AbandonedMountError{ctxErr: ctx.Err(), done: make(chan struct{})}
 	go func() {
+		defer close(abandoned.done)
 		r := <-done
-		if r.err == nil {
+		var unmountErr *unmountFailure
+		switch {
+		case errors.As(r.err, &unmountErr):
+			abandoned.cleanupErr = unmountErr.err
+		case r.err == nil:
 			// The caller gave up on this mount and cannot unmount it.
-			if err := forceUnmount(dir, native.backend()); err != nil && cfg.ErrorLogger != nil {
-				cfg.ErrorLogger.Printf("unmounting %s after MountContext gave up on it: %v", dir, err)
+			if err := forceUnmount(dir, native.backend()); err != nil {
+				abandoned.cleanupErr = fmt.Errorf("unmounting the abandoned mount: %w", err)
+				return
 			}
+			r.mfs.Join(context.Background())
 		}
 	}()
-	return nil, ctx.Err()
+	return nil, abandoned
 }
+
+// AbandonedMountError is the error MountContext returns when its context ends
+// before the mount completes. The mount then ends in the background, and the
+// Server may receive ops until it has. Call Wait before you mount at the same
+// directory again: a mount that completes late is force-unmounted by its
+// path.
+type AbandonedMountError struct {
+	ctxErr     error
+	done       chan struct{}
+	cleanupErr error
+}
+
+func (e *AbandonedMountError) Error() string {
+	return "mount abandoned: " + e.ctxErr.Error()
+}
+
+// Unwrap returns the error of the context that ended, so errors.Is(err,
+// context.Canceled) and errors.Is(err, context.DeadlineExceeded) hold.
+func (e *AbandonedMountError) Unwrap() error { return e.ctxErr }
+
+// Wait blocks until the abandoned mount has ended: it failed, or it completed
+// and has been force-unmounted and its Server has stopped. It returns the
+// error from unmounting it, if any, or ctx.Err() when ctx ends first. Once
+// Wait returns an unmount error, the mount and its Server may remain.
+func (e *AbandonedMountError) Wait(ctx context.Context) error {
+	select {
+	case <-e.done:
+		return e.cleanupErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// unmountFailure wraps the error from force-unmounting a mount that Mount
+// will not return.
+type unmountFailure struct{ err error }
+
+func (e *unmountFailure) Error() string { return e.err.Error() }
+func (e *unmountFailure) Unwrap() error { return e.err }
 
 // finishMount reads INIT from native, starts serving, and waits for the native
 // mount's result.
@@ -159,7 +206,7 @@ func finishMount(
 		// The native mount exists, but nothing serves it.
 		err = fmt.Errorf("newConnection: %v", err)
 		if unmountErr := forceUnmount(dir, native.backend()); unmountErr != nil {
-			err = errors.Join(err, fmt.Errorf("unmounting the unserved mount: %w", unmountErr))
+			err = errors.Join(err, &unmountFailure{fmt.Errorf("unmounting the unserved mount: %w", unmountErr)})
 		}
 		return nil, err
 	}
@@ -182,7 +229,17 @@ func finishMount(
 
 	// Wait for the mount process to complete.
 	if err := native.waitMounted(); err != nil {
-		return nil, fmt.Errorf("mount (background): %w", err)
+		err = fmt.Errorf("mount (background): %w", err)
+		if native.servedMountOutlivesFailure() {
+			// INIT came through this mount, so it exists. Unmounting it hangs
+			// up the connection.
+			if unmountErr := forceUnmount(dir, native.backend()); unmountErr != nil {
+				return nil, errors.Join(err, &unmountFailure{fmt.Errorf("unmounting the failed mount: %w", unmountErr)})
+			}
+		}
+		// The server stops once the connection hangs up.
+		mfs.Join(context.Background())
+		return nil, err
 	}
 
 	// Without the hack, the mount works as it did, so a failure is only logged.
@@ -220,6 +277,11 @@ type nativeMount interface {
 	// io.EOF, where the backend can interrupt one. MountContext calls it when
 	// its context ends.
 	cancel()
+
+	// servedMountOutlivesFailure reports whether a mount that answered INIT
+	// still exists when the native mount then reports failure. Otherwise the
+	// failure hangs up the connection.
+	servedMountOutlivesFailure() bool
 }
 
 // serve runs server until ServeOps returns, then publishes the join status:
@@ -259,7 +321,7 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 		debugLogger.Println("Creating a socket pair")
 	}
 	// Create a socket pair.
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	fds, err := cloexecSocketpair()
 	if err != nil {
 		return nil, nil, fmt.Errorf("Socketpair: %v", err)
 	}
@@ -269,7 +331,6 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	}
 	// Wrap the sockets into os.File objects that we will pass off to fusermount.
 	writeFile := os.NewFile(uintptr(fds[0]), "fusermount-child-writes")
-	defer writeFile.Close()
 
 	readFile := os.NewFile(uintptr(fds[1]), "fusermount-parent-reads")
 	defer readFile.Close()
@@ -290,6 +351,9 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	} else {
 		err = cmd.Start()
 	}
+	// Only the helper may hold the other end, so that the reads below end
+	// when it exits.
+	writeFile.Close()
 	if err != nil {
 		return nil, nil, fmt.Errorf("running %v: %v", binary, err)
 	}
@@ -401,4 +465,19 @@ func mountHelperResult(helper string, conn io.Reader, cmd *exec.Cmd) error {
 		return fmt.Errorf("%s: %w", helper, waitErr)
 	}
 	return nil
+}
+
+// cloexecSocketpair returns a connected pair of Unix stream sockets that a
+// child process inherits only when it is passed one explicitly. It holds
+// syscall.ForkLock so that no fork in between inherits them.
+func cloexecSocketpair() ([2]int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return fds, err
+	}
+	syscall.CloseOnExec(fds[0])
+	syscall.CloseOnExec(fds[1])
+	return fds, nil
 }

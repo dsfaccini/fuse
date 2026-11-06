@@ -187,11 +187,6 @@ func mountFSKitTransport(dir string, cfg *MountConfig) (nativeMount, error) {
 		if code := int32(result); code != 0 {
 			mountErr = FSKitMountError{Result: code}
 		}
-		if int32(result) == FSKitMountResultUnexpectedFailure {
-			// MFMount may have mounted before it failed: it returns this
-			// result when it cannot unpack the mount service's reply.
-			forceUnmount(dir, BackendFSKit)
-		}
 		t.setMountResult(mountErr)
 	}()
 
@@ -298,6 +293,11 @@ func (t *fskitTransport) interruptReads() {
 }
 
 func (t *fskitTransport) backend() Backend { return BackendFSKit }
+
+// servedMountOutlivesFailure is false: a failed MFMount has closed the channel
+// or never opened it, and setMountResult interrupts the reads. macFUSE's
+// libfuse unmounts nothing after a failed MFMount either.
+func (t *fskitTransport) servedMountOutlivesFailure() bool { return false }
 
 func (t *fskitTransport) waitMounted() error {
 	<-t.mounted

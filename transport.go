@@ -147,4 +147,8 @@ func (m *deviceMount) waitMounted() error {
 // cancel does nothing: MountContext does not interrupt a device read.
 func (m *deviceMount) cancel() {}
 
+// servedMountOutlivesFailure is true: INIT arrived through the device, so the
+// kernel mounted it, whatever the mount helper reports.
+func (m *deviceMount) servedMountOutlivesFailure() bool { return true }
+
 var _ nativeMount = (*deviceMount)(nil)

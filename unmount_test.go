@@ -50,6 +50,8 @@ func (m *cannedMount) backend() Backend   { return m.kind }
 func (m *cannedMount) waitMounted() error { return nil }
 func (m *cannedMount) cancel()            {}
 
+func (m *cannedMount) servedMountOutlivesFailure() bool { return true }
+
 func TestFailedMountForceUnmountsTheNativeMount(t *testing.T) {
 	unmounts := recordUnmounts(t, nil)
 	cfg, err := (&MountConfig{}).normalize()

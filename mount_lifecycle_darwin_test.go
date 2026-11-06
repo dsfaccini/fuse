@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -109,8 +110,9 @@ func TestMountContextGivesUpOnAStalledFSKitMount(t *testing.T) {
 		_, err := MountWithFakeMFMount(ctx, t, f, drainServer{}, MountConfig{})
 		returned <- err
 	}()
+	var err error
 	select {
-	case err := <-returned:
+	case err = <-returned:
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("MountContext error = %v, want context.DeadlineExceeded", err)
 		}
@@ -129,11 +131,52 @@ func TestMountContextGivesUpOnAStalledFSKitMount(t *testing.T) {
 
 	// MFMount succeeds late, so the mount is closed and force-unmounted.
 	close(finish)
-	waitUntil(t, "the late mount is unmounted", func() bool {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return len(f.unmounts) > 0
-	})
+	var abandoned *AbandonedMountError
+	if !errors.As(err, &abandoned) {
+		t.Fatalf("MountContext error = %v, want an AbandonedMountError", err)
+	}
+	if err := abandoned.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.unmounts) != 1 || f.unmounts[0].flags != unix.MNT_FORCE {
+		t.Errorf("unmount calls = %v, want one with MNT_FORCE", f.unmounts)
+	}
+	if f.channelCloses != 1 {
+		t.Errorf("MFChannelClose calls = %d, want 1", f.channelCloses)
+	}
+}
+
+func TestMountContextUnmountsAMountThatCompletesAfterItGaveUp(t *testing.T) {
+	f := newFakeMFMount(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	finish := make(chan struct{})
+	// INIT is answered, then the caller gives up before MFMount returns.
+	f.mount = func() int32 {
+		if !f.answerInit() {
+			t.Error("no INIT reply")
+		}
+		cancel()
+		<-finish
+		return 0
+	}
+	_, err := MountWithFakeMFMount(ctx, t, f, drainServer{}, MountConfig{})
+	var abandoned *AbandonedMountError
+	if !errors.As(err, &abandoned) || !errors.Is(err, context.Canceled) {
+		close(finish)
+		t.Fatalf("MountContext error = %v, want an AbandonedMountError wrapping context.Canceled", err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer waitCancel()
+	if err := abandoned.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Wait before MFMount returned = %v, want context.DeadlineExceeded", err)
+	}
+
+	close(finish)
+	if err := abandoned.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.unmounts) != 1 || f.unmounts[0].flags != unix.MNT_FORCE {
@@ -238,21 +281,42 @@ func fakeDiskutil(t *testing.T) string {
 }
 
 // fakeMountHelper makes the test binary act as mount_macfuse. Its value is
-// "<result>,<exit status>": the helper passes back /dev/null as the device,
-// sends result as its mount result unless result is "-", and exits.
+// "<result>,<exit status>[,init|nodevice]": the helper passes back /dev/null
+// as the device, with init a device that sends INIT and takes its reply, and
+// with nodevice no device. It then sends result as its mount result unless
+// result is "-", and exits.
 const fakeMountHelper = "FUSE_TEST_FAKE_MOUNT_HELPER"
 
 func TestFakeMacFUSEMountHelper(t *testing.T) {
-	result, exit, ok := strings.Cut(os.Getenv(fakeMountHelper), ",")
-	if !ok {
+	fields := strings.Split(os.Getenv(fakeMountHelper), ",")
+	if len(fields) < 2 {
 		t.Skip("runs only as the fake mount helper")
 	}
-	dev, err := os.Open(os.DevNull)
-	if err != nil {
-		os.Exit(100)
-	}
-	if err := unix.Sendmsg(3, []byte{0}, unix.UnixRights(int(dev.Fd())), nil, 0); err != nil {
-		os.Exit(101)
+	result, exit := fields[0], fields[1]
+	switch {
+	case len(fields) == 3 && fields[2] == "nodevice":
+	case len(fields) == 3:
+		pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			os.Exit(105)
+		}
+		if err := unix.Sendmsg(3, []byte{0}, unix.UnixRights(pair[0]), nil, 0); err != nil {
+			os.Exit(101)
+		}
+		if _, err := unix.Write(pair[1], bytes.Join(fakeInit(), nil)); err != nil {
+			os.Exit(106)
+		}
+		if _, err := unix.Read(pair[1], make([]byte, 4096)); err != nil {
+			os.Exit(107)
+		}
+	default:
+		dev, err := os.Open(os.DevNull)
+		if err != nil {
+			os.Exit(100)
+		}
+		if err := unix.Sendmsg(3, []byte{0}, unix.UnixRights(int(dev.Fd())), nil, 0); err != nil {
+			os.Exit(101)
+		}
 	}
 	if result != "-" {
 		status, err := strconv.Atoi(result)
@@ -271,7 +335,10 @@ func TestFakeMacFUSEMountHelper(t *testing.T) {
 	os.Exit(code)
 }
 
-func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
+// useFakeMacFUSEMountHelper points macfuseMountHelper at the test binary
+// running TestFakeMacFUSEMountHelper.
+func useFakeMacFUSEMountHelper(t *testing.T) {
+	t.Helper()
 	helper := filepath.Join(t.TempDir(), "mount_macfuse")
 	script := "#!/bin/sh\nexec '" + os.Args[0] + "' -test.run='^TestFakeMacFUSEMountHelper$'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
@@ -280,6 +347,51 @@ func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
 	old := macfuseMountHelper
 	macfuseMountHelper = helper
 	t.Cleanup(func() { macfuseMountHelper = old })
+}
+
+func TestMountHelperSocketsCloseOnExec(t *testing.T) {
+	fds, err := cloexecSocketpair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range fds {
+		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if flags&unix.FD_CLOEXEC == 0 {
+			t.Errorf("fd %d lacks FD_CLOEXEC", fd)
+		}
+		unix.Close(fd)
+	}
+}
+
+func TestKernelExtensionMountUnmountsAfterTheHelperFailsPastINIT(t *testing.T) {
+	useFakeMacFUSEMountHelper(t)
+	t.Setenv(fakeMountHelper, "13,0,init")
+	unmounts := recordUnmounts(t, nil)
+	dir := t.TempDir()
+	returned := make(chan error, 1)
+	go func() {
+		_, err := Mount(dir, drainServer{}, &MountConfig{})
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, syscall.EACCES) {
+			t.Errorf("Mount error = %v, want the helper's EACCES", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Mount did not return within 10s of the helper's failure")
+	}
+	want := fakeUnmount{dir, unix.MNT_FORCE}
+	if got := unmounts(); len(got) != 1 || got[0] != want {
+		t.Errorf("unmount calls = %v, want [%v]", got, want)
+	}
+}
+
+func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
+	useFakeMacFUSEMountHelper(t)
 
 	for _, test := range []struct {
 		name   string
@@ -309,6 +421,11 @@ func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
 		// The result wins over the exit status.
 		{name: "mounted", helper: "0,3"},
 		{name: "mounted, no result", helper: "-,0"},
+		{
+			name:   "no device",
+			helper: "-,3,nodevice",
+			check:  func(err error) bool { return err != nil && strings.Contains(err.Error(), "ReadMsgUnix") },
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv(fakeMountHelper, test.helper)
@@ -317,7 +434,7 @@ func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
 			// The device is /dev/null, so INIT fails.
 			_, err := Mount(dir, drainServer{}, &MountConfig{})
 			if test.check != nil {
-				if !test.check(err) || !strings.HasPrefix(err.Error(), "mount (background): ") {
+				if !test.check(err) {
 					t.Errorf("Mount error = %v, want the helper's failure", err)
 				}
 				if got := unmounts(); len(got) != 0 {
