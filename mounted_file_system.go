@@ -52,6 +52,9 @@ const (
 	unmountRetryMaxInterval = 2 * time.Second
 )
 
+// unmountRetryAfter starts Unmount's wait before a retry. Tests replace it.
+var unmountRetryAfter = time.After
+
 // Unmount unmounts the file system through its backend:
 //
 //   - Linux: umount2(2), then fusermount -u when umount2(2) fails with EPERM,
@@ -90,7 +93,7 @@ func (mfs *MountedFileSystem) Unmount(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("unmount %s: %w; last attempt: %w", mfs.dir, ctx.Err(), err)
-		case <-time.After(wait):
+		case <-unmountRetryAfter(wait):
 		}
 		wait = min(2*wait, unmountRetryMaxInterval)
 	}

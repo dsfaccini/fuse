@@ -39,7 +39,8 @@ type Server interface {
 }
 
 // Mount is MountContext with context.Background(), so it waits for the mount
-// however long it takes.
+// however long it takes. MountContext's caveat about reusing the Server after
+// a failed mount applies.
 func Mount(
 	dir string,
 	server Server,
@@ -52,6 +53,12 @@ func Mount(
 // system is successfully mounted. It validates config before it mounts
 // anything. When the mount fails after the native mount was made, MountContext
 // force-unmounts it before it returns.
+//
+// When the native mount fails after the kernel's INIT was answered,
+// MountContext waits at most a second for the Server to stop. The Server may
+// keep serving after MountContext returns, and fuseutil's server then calls
+// Destroy once its last read fails. Do not reuse that Server for another
+// mount.
 //
 // ctx bounds the wait for the mount. When ctx ends first, MountContext
 // returns an *AbandonedMountError that wraps ctx.Err() at once. The mount then
@@ -241,10 +248,11 @@ func finishMount(
 	if err := native.waitMounted(); err != nil {
 		// The native mount reports that nothing is mounted, so nothing is
 		// unmounted, as in macFUSE's libfuse: the mount point may be another
-		// volume. On FSKit the failure ends the reads, so the server stops.
-		// Whether a failed mount(2) ends the kernel extension device's reads
-		// is unverified, so the wait is bounded; past it, the serve goroutine
-		// and the device stay until a read fails.
+		// volume. On FSKit the failure ends the reads, but ops in flight can
+		// still hold the server. Whether a failed mount(2) ends the kernel
+		// extension device's reads is unverified. So the wait is bounded;
+		// past it, the server keeps serving until its last op is answered
+		// and a read fails.
 		joinCtx, cancel := context.WithTimeout(context.Background(), failedMountJoinTimeout)
 		defer cancel()
 		mfs.Join(joinCtx)

@@ -117,15 +117,33 @@ func TestUnmountGivesUpWhenContextEnds(t *testing.T) {
 }
 
 func TestUnmountBacksOff(t *testing.T) {
-	unmounts := recordUnmounts(t, func(int) error { return syscall.EBUSY })
-	mfs := &MountedFileSystem{dir: "/mnt/busy", backend: testBackend, joinStatusAvailable: make(chan struct{})}
-	// Retries at 100, 300, 700 and 1500ms fit in 2s; a fixed 100ms wait
-	// would make about 20.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	recordUnmounts(t, func(int) error { return syscall.EBUSY })
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	const ms = time.Millisecond
+	want := []time.Duration{100 * ms, 200 * ms, 400 * ms, 800 * ms, 1600 * ms, 2000 * ms, 2000 * ms}
+	var waits []time.Duration
+	old := unmountRetryAfter
+	unmountRetryAfter = func(d time.Duration) <-chan time.Time {
+		waits = append(waits, d)
+		if len(waits) == len(want) {
+			cancel()
+		}
+		ready := make(chan time.Time, 1)
+		ready <- time.Time{}
+		return ready
+	}
+	t.Cleanup(func() { unmountRetryAfter = old })
+	mfs := &MountedFileSystem{dir: "/mnt/busy", backend: testBackend, joinStatusAvailable: make(chan struct{})}
 	mfs.Unmount(ctx)
-	if got := len(unmounts()); got > 6 {
-		t.Errorf("unmount calls in 2s = %d, want at most 6", got)
+	if len(waits) < len(want) {
+		t.Fatalf("waits = %v, want at least %d", waits, len(want))
+	}
+	for i, w := range want {
+		if waits[i] != w {
+			t.Errorf("waits = %v, want them to start with %v", waits[:len(want)], want)
+			break
+		}
 	}
 }
 
