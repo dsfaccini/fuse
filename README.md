@@ -48,9 +48,6 @@ For `BackendFSKit`, `Mount` checks before it mounts:
 `local` option. It cannot see whether macFUSE's file system extension is
 enabled. `Mount` reports that as an `FSKitMountError`.
 
-`MountConfig.Options["backend"] = "fskit"` is a deprecated spelling of
-`BackendFSKit`.
-
 This package owes its inspiration and most of its kernel-related code to
 [bazil.org/fuse][bazil].
 

@@ -291,7 +291,7 @@ func mountFSKitTransport(dir string, cfg *MountConfig) (nativeMount, error) {
 		return nil, err
 	}
 
-	mountOptions, err := syscall.BytePtrFromString(fskitMountOptions(cfg))
+	mountOptions, err := syscall.BytePtrFromString(cfg.toOptionsString())
 	if err != nil {
 		return nil, fmt.Errorf("FSKit mount options: %w", err)
 	}
@@ -351,13 +351,6 @@ func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
 		interruptNative: func() { purego.SyscallN(api.channelInterrupt, channel) },
 		releaseNative:   func() { purego.SyscallN(api.release, channel) },
 	}
-}
-
-// fskitMountOptions returns the option string MFMount receives for cfg.
-func fskitMountOptions(cfg *MountConfig) string {
-	options := cfg.toMap()
-	delete(options, "backend")
-	return mapToOptionsString(options)
 }
 
 func validateFSKitMount(dir string, cfg *MountConfig) error {

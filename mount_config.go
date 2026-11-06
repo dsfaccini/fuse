@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"runtime"
 	"strings"
 
@@ -244,11 +243,8 @@ type MountConfig struct {
 	// The mechanism to mount through. The zero value is the platform's
 	// default: BackendLinux on Linux, BackendMacFUSEKernelExtension on darwin.
 	// darwin also has BackendFSKit; see FSKitAvailable for what it needs.
-	// Mount rejects a backend the platform lacks.
-	//
-	// Options["backend"] = "fskit" is a deprecated spelling of BackendFSKit.
-	// When Backend is set too, Backend wins. Either way, Mount does not pass
-	// that option on to the mount.
+	// Mount rejects a backend the platform lacks, and a config that sets
+	// Options["backend"].
 	Backend Backend
 
 	// Additional key=value options to pass unadulterated to the underlying mount
@@ -463,12 +459,8 @@ func (c *MountConfig) normalize() (MountConfig, error) {
 		return MountConfig{}, errors.New("MountConfig must not be nil")
 	}
 	cfg := *c
-	if cfg.Options["backend"] == "fskit" {
-		if cfg.Backend == "" {
-			cfg.Backend = BackendFSKit
-		}
-		cfg.Options = maps.Clone(cfg.Options)
-		delete(cfg.Options, "backend")
+	if _, ok := cfg.Options["backend"]; ok {
+		return MountConfig{}, errors.New(`Options["backend"] does not choose the backend; set MountConfig.Backend`)
 	}
 	if cfg.OpContext == nil {
 		cfg.OpContext = context.Background()

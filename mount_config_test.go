@@ -15,7 +15,6 @@
 package fuse
 
 import (
-	"maps"
 	"runtime"
 	"strings"
 	"testing"
@@ -34,19 +33,8 @@ func TestMountConfigBackend(t *testing.T) {
 		{name: "kernel extension", cfg: MountConfig{Backend: BackendMacFUSEKernelExtension}, want: BackendMacFUSEKernelExtension, wantErr: !darwin},
 		{name: "FSKit", cfg: MountConfig{Backend: BackendFSKit}, want: BackendFSKit, wantErr: !darwin},
 		{name: "unknown", cfg: MountConfig{Backend: "kext"}, wantErr: true},
-		{
-			name: "deprecated option",
-			cfg:  MountConfig{Options: map[string]string{"backend": "fskit", "local": ""}},
-			want: BackendFSKit, wantErr: !darwin,
-		},
-		{
-			name: "field wins over the deprecated option",
-			cfg:  MountConfig{Backend: BackendMacFUSEKernelExtension, Options: map[string]string{"backend": "fskit"}},
-			want: BackendMacFUSEKernelExtension, wantErr: !darwin,
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			options := maps.Clone(test.cfg.Options)
 			cfg, err := test.cfg.normalize()
 			if test.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "is not available on "+runtime.GOOS) {
@@ -59,18 +47,6 @@ func TestMountConfigBackend(t *testing.T) {
 			}
 			if cfg.Backend != test.want {
 				t.Errorf("Backend = %q, want %q", cfg.Backend, test.want)
-			}
-			mountOptions := cfg.toMap()
-			if _, ok := mountOptions["backend"]; ok {
-				t.Errorf("mount options %v pass the backend option on", mountOptions)
-			}
-			for k := range options {
-				if _, ok := mountOptions[k]; !ok && k != "backend" {
-					t.Errorf("mount options %v dropped %s", mountOptions, k)
-				}
-			}
-			if !maps.Equal(test.cfg.Options, options) {
-				t.Errorf("normalize changed the caller's Options to %v, want %v", test.cfg.Options, options)
 			}
 		})
 	}

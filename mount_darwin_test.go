@@ -1,23 +1,6 @@
 package fuse
 
-import (
-	"errors"
-	"path/filepath"
-	"testing"
-)
-
-// Backend wins over Options["backend"]. The mount helper is missing, and the
-// test init denies MFMount, so nothing mounts, whichever backend Mount picks.
-func TestMountBackendWinsOverTheDeprecatedOption(t *testing.T) {
-	oldHelper := macfuseMountHelper
-	macfuseMountHelper = filepath.Join(t.TempDir(), "mount_macfuse")
-	t.Cleanup(func() { macfuseMountHelper = oldHelper })
-
-	config := &MountConfig{Backend: BackendMacFUSEKernelExtension, Options: map[string]string{"backend": "fskit"}}
-	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, errMacFUSENotFound) {
-		t.Errorf("Mount = %v, want %v from the kernel extension's mount helper", err, errMacFUSENotFound)
-	}
-}
+import "testing"
 
 func TestMacFUSEKernelExtensionLoadedReadsItsSysctl(t *testing.T) {
 	old := macfuseKernelExtensionSysctl
