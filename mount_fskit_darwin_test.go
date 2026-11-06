@@ -82,10 +82,69 @@ func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
 	}
 }
 
+// fakeMacFUSEBundle makes a macfuse.fs bundle that reports version, and
+// returns the path of its MFMount framework, which does not exist.
+func fakeMacFUSEBundle(t *testing.T, version string) string {
+	t.Helper()
+	contents := filepath.Join(t.TempDir(), "macfuse.fs", "Contents")
+	if err := os.MkdirAll(contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.macfuse.filesystems.fs.macfuse</string>
+	<key>CFBundleShortVersionString</key>
+	<string>` + version + `</string>
+	<key>CFBundleVersion</key>
+	<string>9.9.9</string>
+</dict>
+</plist>
+`
+	if err := os.WriteFile(filepath.Join(contents, "Info.plist"), []byte(plist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(contents, "Frameworks", "MFMount.framework", "Versions", "A", "MFMount")
+}
+
 func TestLoadFSKitAPIReportsMissingFramework(t *testing.T) {
-	_, err := loadFSKitAPI(filepath.Join(t.TempDir(), "MFMount"))
-	if !errors.Is(err, ErrFSKitUnavailable) {
-		t.Fatalf("loadFSKitAPI error = %v, want ErrFSKitUnavailable", err)
+	for _, path := range []string{
+		filepath.Join(t.TempDir(), "MFMount"),
+		fakeMacFUSEBundle(t, "5.5.0"),
+	} {
+		if _, err := loadFSKitAPI(path); !errors.Is(err, ErrFSKitUnavailable) {
+			t.Errorf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", path, err)
+		}
+	}
+}
+
+func TestCheckMacFUSEVersion(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		ok      bool
+	}{
+		{version: "4.9.9"},
+		{version: "5.4"},
+		{version: "5.4.99"},
+		{version: "5.5", ok: true},
+		{version: "5.5.0", ok: true},
+		{version: "5.5.1", ok: true},
+		{version: "5.10.0", ok: true},
+		{version: "6.0", ok: true},
+		{version: "five"},
+	} {
+		err := checkMacFUSEVersion(fakeMacFUSEBundle(t, test.version))
+		if test.ok {
+			if err != nil {
+				t.Errorf("macFUSE %s: %v, want it accepted", test.version, err)
+			}
+			continue
+		}
+		if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), test.version) {
+			t.Errorf("macFUSE %s: %v, want ErrFSKitUnavailable naming the version", test.version, err)
+		}
 	}
 }
 
@@ -152,6 +211,14 @@ func TestMountReturnsTypedFSKitErrors(t *testing.T) {
 		if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
 			t.Errorf("%s: Mount without MFMount error = %v, want ErrFSKitUnavailable", name, err)
 		}
+
+		// The framework is missing, so even a skipped version check mounts
+		// nothing.
+		setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.4.0"), "26.0")
+		_, err = Mount(t.TempDir(), nil, config)
+		if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), "macFUSE 5.4.0 is installed") {
+			t.Errorf("%s: Mount on macFUSE 5.4.0 error = %v, want ErrFSKitUnavailable naming 5.4.0", name, err)
+		}
 	}
 }
 
@@ -168,6 +235,11 @@ func TestFSKitAvailableChecksTheOSAndTheFramework(t *testing.T) {
 	setFSKitTestSystem(t, missingFramework, "26.0")
 	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) {
 		t.Errorf("FSKitAvailable without MFMount = %v, want ErrFSKitUnavailable", err)
+	}
+
+	setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.4.0"), "26.0")
+	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), "macFUSE 5.4.0 is installed") {
+		t.Errorf("FSKitAvailable on macFUSE 5.4.0 = %v, want ErrFSKitUnavailable naming 5.4.0", err)
 	}
 }
 

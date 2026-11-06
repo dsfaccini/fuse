@@ -15,10 +15,13 @@
 package fuse
 
 import (
+	"encoding/xml"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,8 +87,9 @@ func cacheFSKitAPI(load func(string) (*fskitAPI, error)) func() (*fskitAPI, erro
 }
 
 // FSKitAvailable reports whether this machine has what an FSKit mount without
-// the local option needs before MFMount runs: macOS 26 or later, and macFUSE's
-// MFMount framework loaded from its install path. It mounts nothing. A mount
+// the local option needs before MFMount runs: macOS 26 or later, macFUSE 5.5
+// or later, and macFUSE's MFMount framework loaded from its install path. It
+// mounts nothing. A mount
 // with the local option needs only macOS 15.4, which FSKitAvailable does not
 // check for.
 //
@@ -114,6 +118,9 @@ func FSKitAvailable() error {
 const fskitSendVectors = 16
 
 func loadFSKitAPI(path string) (*fskitAPI, error) {
+	if err := checkMacFUSEVersion(path); err != nil {
+		return nil, err
+	}
 	lib, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFSKitUnavailable, err)
@@ -151,6 +158,75 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 		return nil, err
 	}
 	return api, nil
+}
+
+// fskitMinimumMacFUSE is the oldest macFUSE whose FSKit backend this package
+// mounts through. ErrFSKitUnavailable names it.
+var fskitMinimumMacFUSE = []int{5, 5, 0}
+
+// checkMacFUSEVersion refuses the macFUSE that holds the framework at path
+// when it is older than fskitMinimumMacFUSE. It reads the macfuse.fs bundle's
+// CFBundleShortVersionString, which is "5.5.0" on macFUSE 5.5.0.
+func checkMacFUSEVersion(path string) error {
+	bundle, _, found := strings.Cut(path, "/Contents/")
+	if !found {
+		return fmt.Errorf("%w: %s is not inside a macFUSE bundle", ErrFSKitUnavailable, path)
+	}
+	version, err := bundleShortVersion(filepath.Join(bundle, "Contents", "Info.plist"))
+	if err != nil {
+		return fmt.Errorf("%w: reading the macFUSE version: %v", ErrFSKitUnavailable, err)
+	}
+	var parts []int
+	for _, field := range strings.Split(version, ".") {
+		part, err := strconv.Atoi(field)
+		if err != nil {
+			return fmt.Errorf("%w: invalid macFUSE version %q", ErrFSKitUnavailable, version)
+		}
+		parts = append(parts, part)
+	}
+	for len(parts) < len(fskitMinimumMacFUSE) {
+		parts = append(parts, 0)
+	}
+	if slices.Compare(parts, fskitMinimumMacFUSE) < 0 {
+		return fmt.Errorf("%w: macFUSE %s is installed", ErrFSKitUnavailable, version)
+	}
+	return nil
+}
+
+// bundleShortVersion returns CFBundleShortVersionString from the XML property
+// list at infoPlist.
+func bundleShortVersion(infoPlist string) (string, error) {
+	f, err := os.Open(infoPlist)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	decoder := xml.NewDecoder(f)
+	var key string
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return "", fmt.Errorf("%s has no CFBundleShortVersionString", infoPlist)
+		}
+		if err != nil {
+			return "", fmt.Errorf("parsing %s: %w", infoPlist, err)
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "key" && start.Name.Local != "string" {
+			continue
+		}
+		var text string
+		if err := decoder.DecodeElement(&text, &start); err != nil {
+			return "", fmt.Errorf("parsing %s: %w", infoPlist, err)
+		}
+		if start.Name.Local == "string" && key == "CFBundleShortVersionString" {
+			return strings.TrimSpace(text), nil
+		}
+		key = ""
+		if start.Name.Local == "key" {
+			key = text
+		}
+	}
 }
 
 // dlInfo is libSystem's Dl_info.

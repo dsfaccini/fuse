@@ -24,9 +24,9 @@ import (
 // or enables macFUSE's file system extension. Test for it with errors.Is.
 //
 // Mount with BackendFSKit and FSKitAvailable return an error that matches it
-// when the macFUSE MFMount framework, or a function this package needs from
-// it, cannot be loaded. An FSKitMountError with result 1 through 4 matches it
-// too.
+// when the installed macFUSE is older than 5.5, or when its MFMount framework,
+// or a function this package needs from it, cannot be loaded. An
+// FSKitMountError with result 1 through 4 matches it too.
 var ErrFSKitUnavailable = errors.New("macFUSE FSKit backend is unavailable; install macFUSE 5.5 or later")
 
 // FSKitMountError results. They mirror MFMountResult in macFUSE's MFMount
