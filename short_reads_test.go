@@ -920,6 +920,86 @@ func TestDirentPlusNamelenPastReply(t *testing.T) {
 	}
 }
 
+// Reply checks BytesRead before the size tracker reads it, so a READDIRPLUS
+// reply past its buffer is answered with EIO and records nothing.
+func TestBytesReadPastBufferRecordsNothing(t *testing.T) {
+	o := newOpTestConnection(t, true)
+	in := fusekernel.ReadIn{Size: 4096}
+	h := o.do(fusekernel.OpReaddirplus, 1, func(op interface{}) error {
+		d := op.(*fuseops.ReadDirPlusOp)
+		copy(d.Dst, direntPlus(2, 300, "f"))
+		d.BytesRead = len(d.Dst) + 1
+		return nil
+	}, structBytes(&in))
+	if syscall.Errno(-h.Error) != syscall.EIO {
+		t.Errorf("readdirplus reply errno = %d, want EIO", -h.Error)
+	}
+	if errno, n := o.read(2, 0, 512, 46); errno != 0 || n != 46 {
+		t.Errorf("read = errno %d with %d bytes, want 46 bytes: the failed readdirplus recorded a size", errno, n)
+	}
+}
+
+// A file system may replace Dst with a shorter slice. A BytesRead past it is
+// answered with EIO on every transport, and records nothing.
+func TestBytesReadPastReplacedDst(t *testing.T) {
+	entry := direntPlus(2, 300, "f")
+	for _, opcode := range []uint32{fusekernel.OpReaddir, fusekernel.OpReaddirplus} {
+		for _, pads := range []bool{false, true} {
+			t.Run(fmt.Sprintf("opcode %d, pads short reads %v", opcode, pads), func(t *testing.T) {
+				o := newOpTestConnection(t, pads)
+				in := fusekernel.ReadIn{Size: 4096}
+				h := o.do(opcode, 1, func(op interface{}) error {
+					d, ok := op.(*fuseops.ReadDirOp)
+					if !ok {
+						d = &op.(*fuseops.ReadDirPlusOp).ReadDirOp
+					}
+					copy(d.Dst, entry)
+					d.Dst = d.Dst[:8]
+					d.BytesRead = len(entry)
+					return nil
+				}, structBytes(&in))
+				if syscall.Errno(-h.Error) != syscall.EIO {
+					t.Errorf("reply errno = %d, want EIO", -h.Error)
+				}
+				if errno, n := o.read(2, 0, 512, 46); errno != 0 || n != 46 {
+					t.Errorf("read = errno %d with %d bytes, want 46 bytes: the failed reply recorded a size", errno, n)
+				}
+			})
+		}
+	}
+}
+
+// Callbacks run once Reply has released sizeReplyMu.
+func TestCallbacksRunWithSizeReplyMuFree(t *testing.T) {
+	o := newOpTestConnection(t, true)
+	o.lookUp(2, 200)
+	called := 0
+	callback := func() {
+		called++
+		if !o.c.sizeReplyMu.TryLock() {
+			t.Error("a callback ran while a reply held sizeReplyMu")
+			return
+		}
+		o.c.sizeReplyMu.Unlock()
+	}
+
+	write := fusekernel.WriteIn{Offset: 0, Size: 10}
+	o.do(fusekernel.OpWrite, 2, func(op interface{}) error {
+		op.(*fuseops.WriteFileOp).Callback = callback
+		return nil
+	}, structBytes(&write), make([]byte, 10))
+	read := fusekernel.ReadIn{Size: 512}
+	o.do(fusekernel.OpRead, 2, func(op interface{}) error {
+		r := op.(*fuseops.ReadFileOp)
+		r.BytesRead = 200
+		r.Callback = callback
+		return nil
+	}, structBytes(&read))
+	if called != 2 {
+		t.Errorf("callbacks run = %d, want 2", called)
+	}
+}
+
 func TestNegativeEntryNotRecorded(t *testing.T) {
 	o := newOpTestConnection(t, true)
 	o.lookUp(0, 200)

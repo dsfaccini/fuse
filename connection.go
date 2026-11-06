@@ -731,6 +731,8 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 		return err
 	}
 
+	// Deferred before sizeReplyMu is taken below, so the callback runs after
+	// the lock is released.
 	defer func() {
 		// Invoke any callbacks set by the FUSE server after the response to the kernel is
 		// complete and before the inMessage and outMessage memory buffers have been freed.
@@ -796,8 +798,9 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	return nil
 }
 
-// checkBytesRead reports a BytesRead that the op's reply buffer cannot hold.
-// kernelResponseForOp would panic on it, after the op is marked replied.
+// checkBytesRead reports a BytesRead that the op's reply buffer, or its Dst,
+// cannot hold. kernelResponseForOp or the size tracker would panic on it,
+// after the op is marked replied.
 func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
 	// convertInMessage grows m by the size of the readdir and xattr buffers.
 	grown := m.Len() - buffer.OutMessageHeaderSize
@@ -811,10 +814,12 @@ func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
 				size += len(d)
 			}
 		}
+	// The reply is the grown segment, and the size tracker parses Dst, which
+	// a file system may have replaced.
 	case *fuseops.ReadDirOp:
-		n, size = o.BytesRead, grown
+		n, size = o.BytesRead, min(grown, len(o.Dst))
 	case *fuseops.ReadDirPlusOp:
-		n, size = o.BytesRead, grown
+		n, size = o.BytesRead, min(grown, len(o.Dst))
 	case *fuseops.GetXattrOp:
 		if len(o.Dst) == 0 {
 			// A size query: BytesRead is the size, not a length within Dst.
