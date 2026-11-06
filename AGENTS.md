@@ -45,10 +45,10 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test
   that reaches them replaces those first: `recordUnmounts` in
   `unmount_test.go` records the unmount(2) calls and answers them.
-- To test the macFUSE kernel extension path without a mount, point
-  `macfuseMountHelper` at a script that runs the test binary as
-  `TestFakeMacFUSEMountHelper`. See
-  `TestKernelExtensionMountReportsTheHelperResult`.
+- To test the macFUSE kernel extension path without a mount, call
+  `useFakeMacFUSEMountHelper`. It points `macfuseMountHelper` at the test
+  binary running `TestFakeMacFUSEMountHelper`, which `fakeMountHelper`
+  scripts: the device it passes back, its mount result and its exit status.
 
 ## Validate a change
 
