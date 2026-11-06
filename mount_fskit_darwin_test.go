@@ -73,11 +73,11 @@ func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
 }
 
 func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
-	options := fskitMountOptions(&MountConfig{Backend: BackendFSKit})
+	options := (&MountConfig{Backend: BackendFSKit}).toOptionsString()
 	for _, option := range strings.Split(options, ",") {
 		name, _, _ := strings.Cut(option, "=")
 		switch name {
-		case "novncache", "noappledouble", "iosize", "backend":
+		case "novncache", "noappledouble", "iosize":
 			t.Errorf("FSKit mount options %q include %s", options, name)
 		}
 	}
@@ -207,29 +207,26 @@ func TestMountReturnsTypedFSKitErrors(t *testing.T) {
 	if _, err := loadFSKitAPI(missingFramework); !errors.Is(err, ErrFSKitUnavailable) {
 		t.Fatalf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", missingFramework, err)
 	}
-	for name, config := range map[string]*MountConfig{
-		"Backend":           {Backend: BackendFSKit},
-		"deprecated option": {Options: map[string]string{"backend": "fskit"}},
-	} {
-		setFSKitTestSystem(t, missingFramework, "15.7")
-		_, err := Mount(t.TempDir(), nil, config)
-		var mountErr FSKitMountError
-		if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
-			t.Errorf("%s: Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", name, err, FSKitMountResultUnsupportedOSVersion)
-		}
+	config := &MountConfig{Backend: BackendFSKit}
 
-		setFSKitTestSystem(t, missingFramework, "26.0")
-		if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
-			t.Errorf("%s: Mount without MFMount error = %v, want ErrFSKitUnavailable", name, err)
-		}
+	setFSKitTestSystem(t, missingFramework, "15.7")
+	_, err := Mount(t.TempDir(), nil, config)
+	var mountErr FSKitMountError
+	if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
+		t.Errorf("Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", err, FSKitMountResultUnsupportedOSVersion)
+	}
 
-		// The framework is missing, so even a skipped version check mounts
-		// nothing.
-		setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.4.0"), "26.0")
-		_, err = Mount(t.TempDir(), nil, config)
-		if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), "macFUSE 5.4.0 is installed") {
-			t.Errorf("%s: Mount on macFUSE 5.4.0 error = %v, want ErrFSKitUnavailable naming 5.4.0", name, err)
-		}
+	setFSKitTestSystem(t, missingFramework, "26.0")
+	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("Mount without MFMount error = %v, want ErrFSKitUnavailable", err)
+	}
+
+	// The framework is missing, so even a skipped version check mounts
+	// nothing.
+	setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.4.0"), "26.0")
+	_, err = Mount(t.TempDir(), nil, config)
+	if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), "macFUSE 5.4.0 is installed") {
+		t.Errorf("Mount on macFUSE 5.4.0 error = %v, want ErrFSKitUnavailable naming 5.4.0", err)
 	}
 }
 

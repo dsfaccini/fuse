@@ -150,13 +150,15 @@ func TestMountRejectsInvalidConfigBeforeMounting(t *testing.T) {
 		{name: "comma in VolumeName", config: &fuse.MountConfig{VolumeName: "x,allow_other"}, want: separator},
 		{name: "comma in option value", config: &fuse.MountConfig{Options: map[string]string{"opt": "x,allow_other"}}, want: separator},
 		{name: "comma in option key", config: &fuse.MountConfig{Options: map[string]string{"x,allow_other": ""}}, want: separator},
-		{name: "comma on FSKit", config: &fuse.MountConfig{FSName: "fs:x,allow_other", Options: map[string]string{"backend": "fskit"}}, want: separator},
+		{name: "comma on FSKit", config: &fuse.MountConfig{FSName: "fs:x,allow_other", Backend: fuse.BackendFSKit}, want: separator},
 		{name: "backslash in FSName", config: &fuse.MountConfig{FSName: `fs:x\`}, want: separator},
 		{name: "backslash in Subtype", config: &fuse.MountConfig{Subtype: `x\`}, want: separator},
 		{name: "backslash in option value", config: &fuse.MountConfig{Options: map[string]string{"opt": `x\`}}, want: separator},
 		{name: "backslash in option key", config: &fuse.MountConfig{Options: map[string]string{`x\`: ""}}, want: separator},
 		{name: "MaxWrite above MaxPages", config: &fuse.MountConfig{MaxPages: 1, MaxWrite: 1 << 20}, want: "must be at least MaxWrite"},
 		{name: "unknown backend", config: &fuse.MountConfig{Backend: "kext"}, want: `backend "kext" is not available`},
+		{name: "backend option", config: &fuse.MountConfig{Options: map[string]string{"backend": "fskit"}}, want: "MountConfig.Backend"},
+		{name: "empty backend option", config: &fuse.MountConfig{Options: map[string]string{"backend": ""}}, want: "MountConfig.Backend"},
 	} {
 		_, err := fuse.Mount(missing, nil, test.config)
 		if err == nil || !strings.Contains(err.Error(), test.want) {
