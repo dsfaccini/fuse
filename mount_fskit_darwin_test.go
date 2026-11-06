@@ -389,19 +389,6 @@ func TestFSKitTransportSendsConcurrently(t *testing.T) {
 	wg.Wait()
 }
 
-// drainServer answers every op with ENOSYS until the connection ends.
-type drainServer struct{}
-
-func (drainServer) ServeOps(c *Connection) {
-	for {
-		ctx, _, err := c.ReadOp()
-		if err != nil {
-			return
-		}
-		c.Reply(ctx, syscall.ENOSYS)
-	}
-}
-
 func TestMountWrapsFSKitMountResult(t *testing.T) {
 	for _, test := range []struct {
 		name      string

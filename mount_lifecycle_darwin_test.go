@@ -396,7 +396,7 @@ func TestMountHelperSocketsCloseOnExec(t *testing.T) {
 	}
 }
 
-func TestKernelExtensionMountUnmountsAfterTheHelperFailsPastINIT(t *testing.T) {
+func TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT(t *testing.T) {
 	useFakeMacFUSEMountHelper(t)
 	t.Setenv(fakeMountHelper, "13,0,init")
 	unmounts := recordUnmounts(t, nil)
@@ -414,9 +414,10 @@ func TestKernelExtensionMountUnmountsAfterTheHelperFailsPastINIT(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Mount did not return within 10s of the helper's failure")
 	}
-	want := fakeUnmount{dir, unix.MNT_FORCE}
-	if got := unmounts(); len(got) != 1 || got[0] != want {
-		t.Errorf("unmount calls = %v, want [%v]", got, want)
+	// mount(2) failed, so nothing of this mount is at dir, which may be
+	// another volume.
+	if got := unmounts(); len(got) != 0 {
+		t.Errorf("unmount calls = %v, want none", got)
 	}
 }
 
@@ -462,7 +463,17 @@ func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
 			unmounts := recordUnmounts(t, nil)
 			dir := t.TempDir()
 			// The device is /dev/null, so INIT fails.
-			_, err := Mount(dir, drainServer{}, &MountConfig{})
+			returned := make(chan error, 1)
+			go func() {
+				_, err := Mount(dir, drainServer{}, &MountConfig{})
+				returned <- err
+			}()
+			var err error
+			select {
+			case err = <-returned:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Mount did not return within 10s")
+			}
 			if test.check != nil {
 				if !test.check(err) {
 					t.Errorf("Mount error = %v, want the helper's failure", err)

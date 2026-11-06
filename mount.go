@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Server is an interface for any type that knows how to serve ops read from a
@@ -170,6 +171,12 @@ func (e *AbandonedMountError) Unwrap() error { return e.ctxErr }
 // error from unmounting it, if any, or ctx.Err() when ctx ends first. Once
 // Wait returns an unmount error, the mount and its Server may remain.
 func (e *AbandonedMountError) Wait(ctx context.Context) error {
+	// A select with both cases ready picks either.
+	select {
+	case <-e.done:
+		return e.cleanupErr
+	default:
+	}
 	select {
 	case <-e.done:
 		return e.cleanupErr
@@ -232,17 +239,16 @@ func finishMount(
 
 	// Wait for the mount process to complete.
 	if err := native.waitMounted(); err != nil {
-		err = fmt.Errorf("mount (background): %w", err)
-		if native.servedMountOutlivesFailure() {
-			// INIT came through this mount, so it exists. Unmounting it hangs
-			// up the connection.
-			if unmountErr := forceUnmount(dir, native.backend()); unmountErr != nil {
-				return nil, errors.Join(err, &unmountFailure{fmt.Errorf("unmounting the failed mount: %w", unmountErr)})
-			}
-		}
-		// The server stops once the connection hangs up.
-		mfs.Join(context.Background())
-		return nil, err
+		// The native mount reports that nothing is mounted, so nothing is
+		// unmounted, as in macFUSE's libfuse: the mount point may be another
+		// volume. On FSKit the failure ends the reads, so the server stops.
+		// Whether a failed mount(2) ends the kernel extension device's reads
+		// is unverified, so the wait is bounded; past it, the serve goroutine
+		// and the device stay until a read fails.
+		joinCtx, cancel := context.WithTimeout(context.Background(), failedMountJoinTimeout)
+		defer cancel()
+		mfs.Join(joinCtx)
+		return nil, fmt.Errorf("mount (background): %w", err)
 	}
 
 	// Without the hack, the mount works as it did, so a failure is only logged.
@@ -252,6 +258,10 @@ func finishMount(
 
 	return mfs, nil
 }
+
+// failedMountJoinTimeout bounds how long Mount waits for the server to stop
+// after the native mount fails once serving has begun.
+const failedMountJoinTimeout = time.Second
 
 // forceUnmount removes a mount that Mount made but will not return. A
 // /dev/fd/N mount point belongs to whoever opened the device, so it stays.
@@ -280,11 +290,6 @@ type nativeMount interface {
 	// io.EOF, where the backend can interrupt one. MountContext calls it when
 	// its context ends.
 	cancel()
-
-	// servedMountOutlivesFailure reports whether a mount that answered INIT
-	// still exists when the native mount then reports failure. Otherwise the
-	// failure hangs up the connection.
-	servedMountOutlivesFailure() bool
 }
 
 // serve runs server until ServeOps returns, then publishes the join status:

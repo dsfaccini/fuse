@@ -45,9 +45,12 @@ func (mfs *MountedFileSystem) Backend() Backend {
 	return mfs.backend
 }
 
-// unmountRetryInterval is how long Unmount waits before it retries an unmount
-// that failed because the file system was busy.
-const unmountRetryInterval = 100 * time.Millisecond
+// Unmount waits unmountRetryInterval before its first retry, and doubles the
+// wait before each later one, up to unmountRetryMaxInterval.
+const (
+	unmountRetryInterval    = 100 * time.Millisecond
+	unmountRetryMaxInterval = 2 * time.Second
+)
 
 // Unmount unmounts the file system through its backend:
 //
@@ -58,7 +61,7 @@ const unmountRetryInterval = 100 * time.Millisecond
 //     EPERM, as it does for a process without access to network volumes.
 //
 // While the file system is busy, and after any diskutil failure, Unmount
-// retries until ctx ends, and then returns an error that wraps ctx.Err() and
+// retries with a growing wait until ctx ends, and then returns an error that wraps ctx.Err() and
 // the last unmount error. Once Join has returned, the server is gone, so
 // Unmount forces the unmount: a lazy unmount on Linux, MNT_FORCE on darwin,
 // and diskutil unmount force on FSKit. That is the way out of the state an
@@ -72,6 +75,7 @@ const unmountRetryInterval = 100 * time.Millisecond
 // Unmount does not wait for Join. A /dev/fd/N mount point fails with
 // ErrExternallyManagedMountPoint, because its owner unmounts it.
 func (mfs *MountedFileSystem) Unmount(ctx context.Context) error {
+	wait := unmountRetryInterval
 	for {
 		var served bool
 		select {
@@ -86,8 +90,9 @@ func (mfs *MountedFileSystem) Unmount(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("unmount %s: %w; last attempt: %w", mfs.dir, ctx.Err(), err)
-		case <-time.After(unmountRetryInterval):
+		case <-time.After(wait):
 		}
+		wait = min(2*wait, unmountRetryMaxInterval)
 	}
 }
 

@@ -328,13 +328,13 @@ func TestFakeMount(t *testing.T) { MountWithFakeMFMount(t) }`,
 // test does not exempt an FSKit test from its gate: it must still start with
 // SkipUnlessFSKitProbeEnabled.
 var mountFailureTests = map[string]string{
-	"TestNonexistentMountPoint":                                   "checkMountPoint rejects the directory",
-	"TestMountContextReturnsAtOnceWhenContextEnded":               "the context has ended",
-	"TestMountReturnsTypedFSKitErrors":                            "the FSKit preflight fails",
-	"TestMountRejectsInvalidConfigBeforeMounting":                 "config validation fails",
-	"TestMountUsesMacFUSEForEveryFuseImpl":                        "the macFUSE mount helper is missing",
-	"TestKernelExtensionMountReportsTheHelperResult":              "the fake mount helper passes back /dev/null",
-	"TestKernelExtensionMountUnmountsAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
+	"TestNonexistentMountPoint":                                          "checkMountPoint rejects the directory",
+	"TestMountContextReturnsAtOnceWhenContextEnded":                      "the context has ended",
+	"TestMountReturnsTypedFSKitErrors":                                   "the FSKit preflight fails",
+	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation fails",
+	"TestMountUsesMacFUSEForEveryFuseImpl":                               "the macFUSE mount helper is missing",
+	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
+	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
 }
 
 // fakeMounts call Mount through the fake MFMount, which mounts nothing. Each

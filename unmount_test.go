@@ -50,8 +50,6 @@ func (m *cannedMount) backend() Backend   { return m.kind }
 func (m *cannedMount) waitMounted() error { return nil }
 func (m *cannedMount) cancel()            {}
 
-func (m *cannedMount) servedMountOutlivesFailure() bool { return true }
-
 func TestFailedMountForceUnmountsTheNativeMount(t *testing.T) {
 	unmounts := recordUnmounts(t, nil)
 	cfg, err := (&MountConfig{}).normalize()
@@ -118,6 +116,70 @@ func TestUnmountGivesUpWhenContextEnds(t *testing.T) {
 	}
 }
 
+func TestUnmountBacksOff(t *testing.T) {
+	unmounts := recordUnmounts(t, func(int) error { return syscall.EBUSY })
+	mfs := &MountedFileSystem{dir: "/mnt/busy", backend: testBackend, joinStatusAvailable: make(chan struct{})}
+	// Retries at 100, 300, 700 and 1500ms fit in 2s; a fixed 100ms wait
+	// would make about 20.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	mfs.Unmount(ctx)
+	if got := len(unmounts()); got > 6 {
+		t.Errorf("unmount calls in 2s = %d, want at most 6", got)
+	}
+}
+
+func TestAbandonedMountWaitReportsAFinishedCleanup(t *testing.T) {
+	cleanupErr := errors.New("cleanup")
+	e := &AbandonedMountError{ctxErr: context.Canceled, done: make(chan struct{}), cleanupErr: cleanupErr}
+	close(e.done)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 1000 {
+		if err := e.Wait(ctx); err != cleanupErr {
+			t.Fatalf("Wait with an ended context after cleanup = %v, want the cleanup error", err)
+		}
+	}
+}
+
+func TestFailedMountStopsWaitingForAServerThatKeepsReading(t *testing.T) {
+	cfg, err := (&MountConfig{}).normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// INIT is answered, then the native mount fails, and the reads never end.
+	k := newFakeKernel()
+	k.Send(fakeInit()...)
+	native := &failingMount{fakeKernel: k}
+	t.Cleanup(k.HangUp)
+	unmounts := recordUnmounts(t, nil)
+	returned := make(chan error, 1)
+	go func() {
+		_, err := finishMount("/mnt/failed", drainServer{}, &cfg, native)
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, errFailingMount) {
+			t.Errorf("finishMount error = %v, want the native mount's failure", err)
+		}
+	case <-time.After(failedMountJoinTimeout + 5*time.Second):
+		t.Fatal("finishMount waited on a server that keeps reading")
+	}
+	if got := unmounts(); len(got) != 0 {
+		t.Errorf("unmount calls = %v, want none after the native mount failed", got)
+	}
+}
+
+var errFailingMount = errors.New("native mount failed")
+
+// failingMount is a native mount that fails after INIT, over a fake kernel.
+type failingMount struct{ *fakeKernel }
+
+func (m *failingMount) backend() Backend   { return testBackend }
+func (m *failingMount) waitMounted() error { return errFailingMount }
+func (m *failingMount) cancel()            {}
+
 func TestUnmountForcesOnceJoinHasReturned(t *testing.T) {
 	unmounts := recordUnmounts(t, nil)
 	mfs := &MountedFileSystem{dir: "/mnt/dead", backend: testBackend, joinStatusAvailable: make(chan struct{})}
@@ -132,5 +194,18 @@ func TestUnmountForcesOnceJoinHasReturned(t *testing.T) {
 	want := fakeUnmount{"/mnt/dead", testForceUnmountFlag}
 	if got := unmounts(); len(got) != 1 || got[0] != want {
 		t.Errorf("unmount calls = %v, want [%v]", got, want)
+	}
+}
+
+// drainServer answers every op with ENOSYS until the connection ends.
+type drainServer struct{}
+
+func (drainServer) ServeOps(c *Connection) {
+	for {
+		ctx, _, err := c.ReadOp()
+		if err != nil {
+			return
+		}
+		c.Reply(ctx, syscall.ENOSYS)
 	}
 }

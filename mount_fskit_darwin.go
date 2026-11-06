@@ -294,11 +294,6 @@ func (t *fskitTransport) interruptReads() {
 
 func (t *fskitTransport) backend() Backend { return BackendFSKit }
 
-// servedMountOutlivesFailure is false: a failed MFMount has closed the channel
-// or never opened it, and setMountResult interrupts the reads. macFUSE's
-// libfuse unmounts nothing after a failed MFMount either.
-func (t *fskitTransport) servedMountOutlivesFailure() bool { return false }
-
 func (t *fskitTransport) waitMounted() error {
 	<-t.mounted
 	return t.mountErr
