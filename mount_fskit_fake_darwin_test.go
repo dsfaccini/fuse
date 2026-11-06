@@ -46,6 +46,10 @@ type fakeMFMount struct {
 	unmounts      []fakeUnmount
 	unmountResult func(dir string, flags int) error
 
+	// beforeRead runs as MFChannelCopyNextMessage starts, before it waits.
+	// Nil does nothing.
+	beforeRead func()
+
 	// sendResult turns a send of n bytes into MFChannelSendMessage's result
 	// and errno. Nil reports all n bytes sent.
 	sendResult func(n int) (int, syscall.Errno)
@@ -247,6 +251,9 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 		}),
 		channelCopyNextMessage: purego.NewCallback(func(channel uintptr) uintptr {
 			f := activeFakeMFMount.Load()
+			if f.beforeRead != nil {
+				f.beforeRead()
+			}
 			r := f.kernel.read()
 			if r.errno != 0 {
 				setErrno(r.errno)

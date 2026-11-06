@@ -38,9 +38,9 @@ type fakeKernel struct {
 	cond   *sync.Cond
 	reads  []fakeRead
 	hungUp bool
-	// interrupted makes the next read, or the one blocked now, fail with
-	// EINTR.
-	interrupted bool
+	// interrupts counts Interrupt calls. A read fails with EINTR when it
+	// changes while the read waits.
+	interrupts int
 	replies     chan []byte
 }
 
@@ -78,25 +78,25 @@ func (k *fakeKernel) HangUp() {
 	k.mu.Unlock()
 }
 
-// Interrupt makes the read blocked now, or the next one, fail with EINTR
-// once.
+// Interrupt makes the reads waiting now fail with EINTR, as
+// MFChannelInterrupt does. A later read waits as usual.
 func (k *fakeKernel) Interrupt() {
 	k.mu.Lock()
-	k.interrupted = true
+	k.interrupts++
 	k.cond.Broadcast()
 	k.mu.Unlock()
 }
 
-// read blocks until a read is queued, the read is interrupted, or the kernel
-// hangs up.
+// read blocks until a read is queued, the kernel hangs up, or Interrupt runs.
+// A queued read or a hang-up wins over an interrupt.
 func (k *fakeKernel) read() fakeRead {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for len(k.reads) == 0 && !k.hungUp && !k.interrupted {
+	interrupts := k.interrupts
+	for len(k.reads) == 0 && !k.hungUp && k.interrupts == interrupts {
 		k.cond.Wait()
 	}
-	if k.interrupted {
-		k.interrupted = false
+	if len(k.reads) == 0 && !k.hungUp {
 		return fakeRead{errno: syscall.EINTR}
 	}
 	if len(k.reads) == 0 {

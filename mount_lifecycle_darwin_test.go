@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -85,6 +86,21 @@ func TestMountContextGivesUpOnAStalledFSKitMount(t *testing.T) {
 	f.mount = func() int32 {
 		<-finish
 		return 0
+	}
+	// The read for INIT starts to wait only after the first interrupt, which
+	// therefore misses it.
+	var firstRead sync.Once
+	f.beforeRead = func() {
+		firstRead.Do(func() {
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+				f.mu.Lock()
+				interrupted := f.channelInterrupts > 0
+				f.mu.Unlock()
+				if interrupted {
+					return
+				}
+			}
+		})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
