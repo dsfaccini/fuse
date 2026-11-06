@@ -156,6 +156,7 @@ func TestMountRejectsInvalidConfigBeforeMounting(t *testing.T) {
 		{name: "backslash in option value", config: &fuse.MountConfig{Options: map[string]string{"opt": `x\`}}, want: separator},
 		{name: "backslash in option key", config: &fuse.MountConfig{Options: map[string]string{`x\`: ""}}, want: separator},
 		{name: "MaxWrite above MaxPages", config: &fuse.MountConfig{MaxPages: 1, MaxWrite: 1 << 20}, want: "must be at least MaxWrite"},
+		{name: "unknown backend", config: &fuse.MountConfig{Backend: "kext"}, want: `backend "kext" is not available`},
 	} {
 		_, err := fuse.Mount(missing, nil, test.config)
 		if err == nil || !strings.Contains(err.Error(), test.want) {

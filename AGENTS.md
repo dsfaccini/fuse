@@ -15,7 +15,7 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `mounttest.SkipUnlessFSKitProbeEnabled`. A test that calls
   `MountWithFakeMFMount` takes no gate, because the fake MFMount never reaches
   FSKit. The scanner checks the FSKit gate only for calls to
-  `mountFSKitTransport`, not for `Mount` with the `fskit` backend.
+  `mountFSKitTransport`, not for `Mount` with `BackendFSKit`.
 - `TestMountingTestsAreGated` in `internal/mounttest` enforces the gate. Its
   failure names the fix.
 - That test matches names without type checking, so it can miss a mount
@@ -50,6 +50,13 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Mount`'s config validation without a mount, pass a mount point that
   does not exist. `Mount` validates the config before it checks the mount
   point. A regression then fails with ENOENT instead of mounting.
+- On darwin, make FSKit unreachable in every ungated test that calls `Mount`
+  or `MountContext` on a mount point that exists, other than through
+  `MountWithFakeMFMount`. Call `setFSKitTestSystem` with a framework path that
+  does not exist, as `TestMountReturnsTypedFSKitErrors` and
+  `useFakeMacFUSEMountHelper` do. Without it, a regression that routes the
+  test to `BackendFSKit` mounts through the installed macFUSE. A mutation you
+  make to check the test counts as such a regression.
 - `Mount` force-unmounts a native mount it will not return, and
   `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
   `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test

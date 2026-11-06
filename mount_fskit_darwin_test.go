@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -71,7 +72,7 @@ func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
 }
 
 func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
-	options := fskitMountOptions(&MountConfig{Options: map[string]string{"backend": "fskit"}})
+	options := fskitMountOptions(&MountConfig{Backend: BackendFSKit})
 	for _, option := range strings.Split(options, ",") {
 		name, _, _ := strings.Cut(option, "=")
 		switch name {
@@ -136,18 +137,128 @@ func TestMountReturnsTypedFSKitErrors(t *testing.T) {
 	if _, err := loadFSKitAPI(missingFramework); !errors.Is(err, ErrFSKitUnavailable) {
 		t.Fatalf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", missingFramework, err)
 	}
-	config := &MountConfig{Options: map[string]string{"backend": "fskit"}}
+	for name, config := range map[string]*MountConfig{
+		"Backend":           {Backend: BackendFSKit},
+		"deprecated option": {Options: map[string]string{"backend": "fskit"}},
+	} {
+		setFSKitTestSystem(t, missingFramework, "15.7")
+		_, err := Mount(t.TempDir(), nil, config)
+		var mountErr FSKitMountError
+		if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
+			t.Errorf("%s: Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", name, err, FSKitMountResultUnsupportedOSVersion)
+		}
+
+		setFSKitTestSystem(t, missingFramework, "26.0")
+		if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
+			t.Errorf("%s: Mount without MFMount error = %v, want ErrFSKitUnavailable", name, err)
+		}
+	}
+}
+
+func TestFSKitAvailableChecksTheOSAndTheFramework(t *testing.T) {
+	missingFramework := filepath.Join(t.TempDir(), "MFMount")
 
 	setFSKitTestSystem(t, missingFramework, "15.7")
-	_, err := Mount(t.TempDir(), nil, config)
+	err := FSKitAvailable()
 	var mountErr FSKitMountError
-	if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
-		t.Errorf("Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", err, FSKitMountResultUnsupportedOSVersion)
+	if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion || !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("FSKitAvailable on macOS 15.7 = %v, want FSKitMountError with result %d", err, FSKitMountResultUnsupportedOSVersion)
 	}
 
 	setFSKitTestSystem(t, missingFramework, "26.0")
-	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
-		t.Errorf("Mount without MFMount error = %v, want ErrFSKitUnavailable", err)
+	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("FSKitAvailable without MFMount = %v, want ErrFSKitUnavailable", err)
+	}
+}
+
+// A process sees macFUSE once it is installed, and loads it once.
+func TestFSKitAvailableRetriesOnlyAFailure(t *testing.T) {
+	setFSKitTestSystem(t, fskitFrameworkPath, "26.0")
+	var loads int
+	fskitAPILoader = cacheFSKitAPI(func(string) (*fskitAPI, error) {
+		loads++
+		if loads == 1 {
+			return nil, ErrFSKitUnavailable
+		}
+		return &fskitAPI{}, nil
+	})
+	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Fatalf("first FSKitAvailable = %v, want ErrFSKitUnavailable", err)
+	}
+	for range 2 {
+		if err := FSKitAvailable(); err != nil {
+			t.Errorf("FSKitAvailable after macFUSE loads = %v, want nil", err)
+		}
+	}
+	if loads != 2 {
+		t.Errorf("loads = %d, want 2: one failure, then one success reused", loads)
+	}
+}
+
+// redirectedMFMount makes TestLoadFSKitAPIRefusesARedirectedFramework load
+// MFMount in a process that DYLD_FRAMEWORK_PATH redirects.
+const redirectedMFMount = "FUSE_TEST_REDIRECTED_MFMOUNT"
+
+// dyld honors DYLD_FRAMEWORK_PATH in a process without the hardened runtime,
+// such as a test binary, so dlopen can load a copy of MFMount from elsewhere.
+func TestLoadFSKitAPIRefusesARedirectedFramework(t *testing.T) {
+	if os.Getenv(redirectedMFMount) == "1" {
+		_, err := loadFSKitAPI(fskitFrameworkPath)
+		if err != nil && strings.Contains(err.Error(), "instead of "+fskitFrameworkPath) {
+			return
+		}
+		lib, openErr := purego.Dlopen(fskitFrameworkPath, purego.RTLD_NOW|purego.RTLD_LOCAL)
+		if openErr != nil {
+			t.Fatalf("loadFSKitAPI error = %v, and dlopen failed: %v", err, openErr)
+		}
+		mount, _ := purego.Dlsym(lib, "MFMount")
+		if loaded, _ := imagePath(mount); loaded == fskitFrameworkPath {
+			t.Skip("dyld ignored DYLD_FRAMEWORK_PATH")
+		}
+		t.Fatalf("loadFSKitAPI error = %v, want a refusal of the redirected framework", err)
+	}
+
+	framework := filepath.Dir(filepath.Dir(filepath.Dir(fskitFrameworkPath)))
+	if _, err := os.Stat(framework); err != nil {
+		// CI installs macFUSE, so there a missing framework is a failure.
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			t.Fatalf("macFUSE MFMount framework not installed: %v", err)
+		}
+		t.Skipf("macFUSE MFMount framework not installed: %v", err)
+	}
+	// The copy keeps the bundle, whose resources its code signature covers.
+	redirect := t.TempDir()
+	if out, err := exec.Command("cp", "-R", framework, redirect).CombinedOutput(); err != nil {
+		t.Fatalf("copying %s: %v: %s", framework, err, out)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLoadFSKitAPIRefusesARedirectedFramework$", "-test.v")
+	cmd.Env = append(os.Environ(), redirectedMFMount+"=1", "DYLD_FRAMEWORK_PATH="+redirect)
+	out, err := cmd.CombinedOutput()
+	switch {
+	case err != nil:
+		t.Fatalf("redirected load: %v\n%s", err, out)
+	case bytes.Contains(out, []byte("--- SKIP")):
+		t.Skipf("redirected load skipped:\n%s", out)
+	case !bytes.Contains(out, []byte("--- PASS")):
+		t.Fatalf("redirected load ran no test:\n%s", out)
+	}
+}
+
+// FSKit drops notifications, so the Notifier sends none there.
+func TestFSKitNotifierReturnsENOSYSWithoutSending(t *testing.T) {
+	n := NewNotifier()
+	server := newStartedServer()
+	k := ServeFakeFSKit(t, NewServerWithNotifier(n, server))
+	server.wait(t)
+
+	if err := notifyWithin(t, func() error { return n.InvalidateInode(7, 0, 0) }); !errors.Is(err, syscall.ENOSYS) {
+		t.Errorf("InvalidateInode = %v, want ENOSYS", err)
+	}
+	if err := notifyWithin(t, func() error { return n.InvalidateEntry(1, "x") }); !errors.Is(err, syscall.ENOSYS) {
+		t.Errorf("InvalidateEntry = %v, want ENOSYS", err)
+	}
+	if got := k.UnreadReplies(); got != 0 {
+		t.Errorf("the connection sent %d messages, want none", got)
 	}
 }
 

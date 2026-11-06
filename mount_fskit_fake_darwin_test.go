@@ -16,7 +16,6 @@ package fuse
 
 import (
 	"context"
-	"maps"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -176,11 +175,7 @@ func MountWithFakeMFMount(ctx context.Context, t *testing.T, f *fakeMFMount, ser
 	oldLoader := fskitAPILoader
 	fskitAPILoader = func() (*fskitAPI, error) { return fakeMFMountAPI(), nil }
 	t.Cleanup(func() { fskitAPILoader = oldLoader })
-	cfg.Options = maps.Clone(cfg.Options)
-	if cfg.Options == nil {
-		cfg.Options = map[string]string{}
-	}
-	cfg.Options["backend"] = "fskit"
+	cfg.Backend = BackendFSKit
 	return MountContext(ctx, t.TempDir(), server, &cfg)
 }
 

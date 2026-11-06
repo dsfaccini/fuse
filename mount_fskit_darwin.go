@@ -27,6 +27,7 @@ import (
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+	"golang.org/x/sys/unix"
 )
 
 // fskitFrameworkPath is the install name of macFUSE's MFMount framework, which
@@ -82,6 +83,32 @@ func cacheFSKitAPI(load func(string) (*fskitAPI, error)) func() (*fskitAPI, erro
 	}
 }
 
+// FSKitAvailable reports whether this machine has what an FSKit mount without
+// the local option needs before MFMount runs: macOS 26 or later, and macFUSE's
+// MFMount framework loaded from its install path. It mounts nothing. A mount
+// with the local option needs only macOS 15.4, which FSKitAvailable does not
+// check for.
+//
+// An error that matches ErrFSKitUnavailable means the user must act on this
+// machine. FSKitAvailable cannot see whether macFUSE's file system extension
+// is enabled: Mount reports that as an FSKitMountError, which matches
+// ErrFSKitUnavailable too.
+//
+// It loads the framework as Mount does: once a load succeeds, it is kept for
+// the life of the process. A failed load is retried on the next call, so a
+// running process sees macFUSE once it is installed.
+func FSKitAvailable() error {
+	version, err := fskitOSProductVersion()
+	if err != nil {
+		return fmt.Errorf("reading macOS version for FSKit: %w", err)
+	}
+	if err := validateFSKitOSVersion(version, false); err != nil {
+		return err
+	}
+	_, err = fskitAPILoader()
+	return err
+}
+
 // fskitSendVectors is how many finished sends' iovec slices a transport keeps
 // for reuse. A send that finds none kept allocates one.
 const fskitSendVectors = 16
@@ -111,7 +138,46 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 			return nil, fmt.Errorf("%w: %v", ErrFSKitUnavailable, err)
 		}
 	}
+	// dyld honors DYLD_FRAMEWORK_PATH and similar variables for a process
+	// without the hardened runtime, so dlopen can load another image than
+	// the one at path. Its initializers have run by now; the check keeps the
+	// transport from calling into it.
+	loaded, err := imagePath(api.mount)
+	if err == nil && loaded != path {
+		err = fmt.Errorf("dyld loaded MFMount from %s instead of %s; a DYLD_ environment variable may redirect it", loaded, path)
+	}
+	if err != nil {
+		purego.Dlclose(lib)
+		return nil, err
+	}
 	return api, nil
+}
+
+// dlInfo is libSystem's Dl_info.
+type dlInfo struct {
+	fname *byte
+	fbase uintptr
+	sname *byte
+	saddr uintptr
+}
+
+// imagePath returns the path of the loaded image that holds addr, with
+// symlinks resolved.
+func imagePath(addr uintptr) (string, error) {
+	libSystem, err := purego.Dlopen("/usr/lib/libSystem.B.dylib", purego.RTLD_NOW|purego.RTLD_LOCAL)
+	if err != nil {
+		return "", err
+	}
+	defer purego.Dlclose(libSystem)
+	dladdr, err := purego.Dlsym(libSystem, "dladdr")
+	if err != nil {
+		return "", err
+	}
+	var info dlInfo
+	if found, _, _ := purego.SyscallN(dladdr, addr, uintptr(unsafe.Pointer(&info))); int32(found) == 0 || info.fname == nil {
+		return "", fmt.Errorf("dladdr found no image that holds %#x", addr)
+	}
+	return unix.BytePtrToString(info.fname), nil
 }
 
 type fskitTransport struct {
@@ -293,6 +359,11 @@ func (t *fskitTransport) interruptReads() {
 }
 
 func (t *fskitTransport) backend() Backend { return BackendFSKit }
+
+// supportsNotifications reports false: macFUSE's FSKit backend does not
+// support the FUSE notification API
+// (https://github.com/macfuse/macfuse/wiki/FUSE-Backends).
+func (t *fskitTransport) supportsNotifications() bool { return false }
 
 func (t *fskitTransport) waitMounted() error {
 	<-t.mounted

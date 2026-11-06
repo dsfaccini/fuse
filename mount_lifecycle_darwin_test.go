@@ -366,9 +366,10 @@ func TestFakeMacFUSEMountHelper(t *testing.T) {
 }
 
 // useFakeMacFUSEMountHelper points macfuseMountHelper at the test binary
-// running TestFakeMacFUSEMountHelper.
+// running TestFakeMacFUSEMountHelper, and makes FSKit unreachable.
 func useFakeMacFUSEMountHelper(t *testing.T) {
 	t.Helper()
+	setFSKitTestSystem(t, filepath.Join(t.TempDir(), "MFMount"), "26.0")
 	helper := filepath.Join(t.TempDir(), "mount_macfuse")
 	script := "#!/bin/sh\nexec '" + os.Args[0] + "' -test.run='^TestFakeMacFUSEMountHelper$'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
