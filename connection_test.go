@@ -921,3 +921,77 @@ func TestReplySerializesWireLogWrites(t *testing.T) {
 		t.Errorf("wire log writes = %d, want %d", got, n)
 	}
 }
+
+func TestFreelistsKeepAtMostMaxFreeMessages(t *testing.T) {
+	c := newTestConnection(nil)
+	for range maxFreeMessages + 3 {
+		c.putInMessage(buffer.NewInMessage(c.inMessageBufSize))
+		c.putOutMessage(c.getOutMessage())
+	}
+	// getOutMessage found the freelist empty each time.
+	in, out := drainFreelists(c)
+	if len(in) != maxFreeMessages || len(out) != 1 {
+		t.Errorf("freelists hold %d in and %d out messages, want %d and 1", len(in), len(out), maxFreeMessages)
+	}
+
+	for range maxFreeMessages + 3 {
+		c.putOutMessage(buffer.NewOutMessage(0))
+	}
+	if _, out := drainFreelists(c); len(out) != maxFreeMessages {
+		t.Errorf("out-message freelist holds %d, want %d", len(out), maxFreeMessages)
+	}
+}
+
+// A freed message must not keep the slices a file system appended, so
+// putOutMessage resets it before it enters the freelist.
+func TestPutOutMessageResetsIt(t *testing.T) {
+	c := newTestConnection(nil)
+	m := c.getOutMessage()
+	m.OutHeader().Unique = 7
+	m.Append([]byte("data"))
+	c.putOutMessage(m)
+
+	got := (*buffer.OutMessage)(c.outMessages.Get())
+	if got != m {
+		t.Fatal("the freelist does not hold the freed message")
+	}
+	if got.Len() != buffer.OutMessageHeaderSize || got.Sglist != nil || *got.OutHeader() != (fusekernel.OutHeader{}) {
+		t.Errorf("freed message has Len %d, Sglist %q and header %+v, want a bare zero header", got.Len(), got.Sglist, *got.OutHeader())
+	}
+}
+
+func TestInitNegotiatesAutoInvalData(t *testing.T) {
+	tests := []struct {
+		name    string
+		enable  bool
+		offered bool
+	}{
+		{"enabled and offered", true, true},
+		{"enabled, not offered", true, false},
+		{"offered, not enabled", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
+			if tt.offered {
+				in.Flags = uint32(fusekernel.InitAutoInvalData)
+			}
+			transport := &testTransport{messages: [][]byte{testMessage(fusekernel.OpInit, 1, structBytes(&in))}}
+			c := newTestConnection(transport)
+			c.cfg.EnableAutoInvalData = tt.enable
+			if err := c.Init(); err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			if len(transport.writes) != 1 {
+				t.Fatalf("Init sent %d replies, want 1", len(transport.writes))
+			}
+			var out fusekernel.InitOut
+			copy(structBytes(&out), transport.writes[0][buffer.OutMessageHeaderSize:])
+
+			want := tt.enable && tt.offered && runtime.GOOS == "linux"
+			if got := out.Flags&uint32(fusekernel.InitAutoInvalData) != 0; got != want {
+				t.Errorf("InitOut.Flags has FUSE_AUTO_INVAL_DATA: %v, want %v", got, want)
+			}
+		})
+	}
+}

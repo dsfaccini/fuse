@@ -26,6 +26,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/buffer"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
@@ -221,6 +222,43 @@ func TestConnectionReadsAndRepliesWithoutAllocating(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Errorf("allocations per read and reply = %v, want 0", allocs)
+	}
+}
+
+// Replies with a payload carve it from the out-message's scratch, which
+// survives the freelist.
+func TestPayloadRepliesReuseOutMessageStorage(t *testing.T) {
+	c := newTestConnection(cannedTransport{})
+	limit := maxReplySize(&c.cfg)
+	// The ops are built once, so that only the library's allocations count.
+	lookUp, create, readDir := &fuseops.LookUpInodeOp{}, &fuseops.CreateFileOp{}, &fuseops.ReadDirOp{BytesRead: 100}
+	tests := []struct {
+		name  string
+		build func(t *testing.T, m *buffer.OutMessage)
+	}{
+		{"lookup", func(_ *testing.T, m *buffer.OutMessage) { c.kernelResponse(m, 1, lookUp, nil) }},
+		{"create", func(_ *testing.T, m *buffer.OutMessage) { c.kernelResponse(m, 1, create, nil) }},
+		{"readdir", func(t *testing.T, m *buffer.OutMessage) {
+			if _, err := growDst(m, 64<<10, limit); err != nil {
+				t.Fatalf("growDst: %v", err)
+			}
+			c.kernelResponse(m, 1, readDir, nil)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				m := c.getOutMessage()
+				tt.build(t, m)
+				if err := c.writeOutMessage(m); err != nil {
+					t.Fatalf("writeOutMessage: %v", err)
+				}
+				c.putOutMessage(m)
+			})
+			if allocs != 0 {
+				t.Errorf("allocations per reply = %v, want 0", allocs)
+			}
+		})
 	}
 }
 

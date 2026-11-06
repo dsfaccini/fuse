@@ -34,7 +34,10 @@ func (fl *Freelist) Get() unsafe.Pointer {
 	return p
 }
 
-// Contribute an element back to the freelist.
-func (fl *Freelist) Put(p unsafe.Pointer) {
-	fl.list = append(fl.list, p)
+// Contribute an element back to the freelist, unless it already holds limit
+// elements.
+func (fl *Freelist) Put(p unsafe.Pointer, limit int) {
+	if len(fl.list) < limit {
+		fl.list = append(fl.list, p)
+	}
 }

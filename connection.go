@@ -200,6 +200,7 @@ func (c *Connection) Init() error {
 	noOpenSupport := initOp.Flags&fusekernel.InitNoOpenSupport > 0
 	noOpendirSupport := initOp.Flags&fusekernel.InitNoOpendirSupport > 0
 	asyncDIO := initOp.Flags&fusekernel.InitAsyncDIO > 0
+	autoInvalData := initOp.Flags&fusekernel.InitAutoInvalData > 0
 
 	// Respond to the init op.
 	initOp.Library = c.protocol
@@ -242,6 +243,11 @@ func (c *Connection) Init() error {
 	// OpenFile calls at all (Linux >= 3.16):
 	if c.cfg.EnableNoOpenSupport && noOpenSupport {
 		initOp.Flags |= fusekernel.InitNoOpenSupport
+	}
+
+	// Tell the kernel to drop a file's cached pages when its mtime changes.
+	if c.cfg.EnableAutoInvalData && autoInvalData && runtime.GOOS == "linux" {
+		initOp.Flags |= fusekernel.InitAutoInvalData
 	}
 
 	// Tell the kernel to treat returning -ENOSYS on OpenDir as not needing

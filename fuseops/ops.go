@@ -600,6 +600,8 @@ type ReadDirOp struct {
 	// Each entry returned exposes a directory offset to the user that may later
 	// show up in ReadDirRequest.Offset. See notes on that field for more
 	// information.
+	//
+	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
 
 	// Set by the file system: the number of bytes read into Dst.
@@ -957,6 +959,8 @@ type GetXattrOp struct {
 
 	// The destination buffer.  If the size is too small for the
 	// value, the ERANGE error should be sent.
+	//
+	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
 
 	// Set by the file system: the number of bytes read into Dst, or
@@ -978,6 +982,8 @@ type ListXattrOp struct {
 	//
 	// The output data should consist of a sequence of NUL-terminated strings,
 	// one for each xattr.
+	//
+	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
 
 	// Set by the file system: the number of bytes read into Dst, or
