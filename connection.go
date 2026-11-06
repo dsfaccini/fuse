@@ -59,8 +59,8 @@ var contextKey interface{} = contextKeyType(0)
 // Reading a page at a time is a drag. Ask for a larger size.
 const maxReadahead = 1 << 20
 
-// Connection represents a connection to the fuse kernel process. It is used to
-// receive and reply to requests from the kernel.
+// Connection represents a connection to the kernel through a mount's backend.
+// It is used to receive and reply to requests from the kernel.
 type Connection struct {
 	cfg         MountConfig
 	debugLogger *log.Logger
@@ -485,9 +485,9 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 	return c.transport.SendMessage(outMsg.Parts())
 }
 
-// ReadOp consumes the next op from the kernel process, returning the op and a
-// context that should be used for work related to the op. It returns io.EOF if
-// the kernel has closed the connection.
+// ReadOp consumes the next op from the kernel, returning the op and a context
+// that should be used for work related to the op. It returns io.EOF if the
+// kernel has closed the connection.
 //
 // ReadOp answers the poll hack's requests itself and reads on. See Mount.
 //
@@ -505,8 +505,8 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 // If err == nil, the user is responsible for later calling c.Reply with the
 // returned context.
 //
-// This function delivers ops in exactly the order they are received from
-// /dev/fuse. It must not be called multiple times concurrently.
+// This function delivers ops in exactly the order the backend delivers them.
+// It must not be called multiple times concurrently.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {

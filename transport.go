@@ -39,9 +39,9 @@ type connectionTransport interface {
 	Close() error
 }
 
-// shortReadPadder is implemented by a transport that delivers a READ reply
-// shorter than the size it cached for the file padded to that size, with bytes
-// that are not file data. The connection then replies EIO to such a read; see
+// shortReadPadder is implemented by a transport on which the connection
+// replies EIO to a READ reply shorter than both the read and the inode's
+// reported size (https://github.com/macfuse/macfuse/issues/1231); see
 // Connection.trackReportedSizes.
 type shortReadPadder interface {
 	padsShortReads() bool

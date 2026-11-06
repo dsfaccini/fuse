@@ -28,10 +28,12 @@
 //     MountedFileSystem.Unmount, which unmounts it through its Backend.
 //
 // Make sure to see the examples in the sub-packages of samples/, which double
-// as tests for this package: http://godoc.org/github.com/dsfaccini/fuse/samples
+// as tests for this package: https://pkg.go.dev/github.com/dsfaccini/fuse/samples
 //
-// In order to use this package to mount file systems on OS X, the system must
-// have macFUSE installed (see https://macfuse.github.io/). Do note that there
-// are several OS X-specific oddities; grep through the documentation for more
-// info.
+// MountConfig.Backend picks how the kernel reaches the file system. On Linux
+// that is the kernel's FUSE module. On macOS it is macFUSE
+// (https://macfuse.github.io/), through its kernel extension by default, or
+// through its FSKit backend. See FSKitAvailable for what the FSKit backend
+// needs. Do note that there are several macOS-specific oddities; grep through
+// the documentation for more info.
 package fuse
