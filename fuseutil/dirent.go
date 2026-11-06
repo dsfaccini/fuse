@@ -124,37 +124,15 @@ func WriteDirent(buf []byte, d Dirent) (n int) {
 // expected in fuseops.ReadDirPlusOp.Dst returning the number of bytes written.
 // Return zero if the entry would not fit.
 func WriteDirentPlus(buf []byte, d DirentPlus) (n int) {
-	type fuse_entry_out struct {
-		nodeid           uint64
-		generation       uint64
-		entry_valid      uint64
-		attr_valid       uint64
-		entry_valid_nsec uint32
-		attr_valid_nsec  uint32
-		attr             fusekernel.Attr
-	}
-
-	// We want to write bytes with the layout of fuse_direntplus
-	// (http://shortn/_LNqd8uXg2p) in host order. The struct must be aligned
-	// according to FUSE_DIRENT_ALIGN (https://tinyurl.com/3m3ewu7h), which
-	// dictates 8-byte alignment.
-	type fuse_direntplus struct {
-		entry_out fuse_entry_out
-		dirent    fuse_dirent
-	}
-
+	// We want to write bytes with the layout of fuse_direntplus in host order:
+	// a fuse_entry_out, a fuse_dirent, then the name. The struct must be
+	// aligned according to FUSE_DIRENT_ALIGN (https://tinyurl.com/3m3ewu7h),
+	// which dictates 8-byte alignment. fusekernel.EntryOut has the host's
+	// size: macFUSE's fuse_attr carries btime and flags, so its
+	// fuse_entry_out is 16 bytes longer than Linux's.
+	const entryOutSize = unsafe.Sizeof(fusekernel.EntryOut{})
 	const direntPlusAlignment = 8
-
-	// size of fuse_attr
-	const fuseAttrSize = 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4
-
-	// size of fuse_entry_out without fuse_attr
-	const fuseEntryOutSize = 8 + 8 + 8 + 8 + 4 + 4
-
-	// size of fuse_dirent
-	const fuseDirentSize = 8 + 8 + 4 + 4
-
-	const direntPlusHeaderSize = fuseAttrSize + fuseEntryOutSize + fuseDirentSize
+	const direntPlusHeaderSize = int(entryOutSize) + fusekernel.DirentSize
 
 	// Compute the number of bytes of padding we'll need to maintain alignment
 	// for the next entry.
@@ -164,7 +142,7 @@ func WriteDirentPlus(buf []byte, d DirentPlus) (n int) {
 	}
 
 	// Do we have enough room?
-	totalLen := int(direntPlusHeaderSize) + len(d.Dirent.Name) + padLen
+	totalLen := direntPlusHeaderSize + len(d.Dirent.Name) + padLen
 	if totalLen > len(buf) {
 		return 0
 	}
@@ -178,42 +156,43 @@ func WriteDirentPlus(buf []byte, d DirentPlus) (n int) {
 	}
 
 	// Write the header.
-	dp := fuse_direntplus{
-		entry_out: fuse_entry_out{
-			nodeid:           uint64(d.Entry.Child),
-			generation:       uint64(d.Entry.Generation),
-			entry_valid:      entryValid,
-			attr_valid:       attrValid,
-			entry_valid_nsec: entryValidNsec,
-			attr_valid_nsec:  attrValidNsec,
-			attr: fusekernel.Attr{
-				Ino:  uint64(d.Entry.Child),
-				Size: d.Entry.Attributes.Size,
-				// round up to the nearest 512 boundary (In POSIX a "block" is a unit of 512 bytes)
-				Blocks:    (d.Entry.Attributes.Size + 512 - 1) / 512,
-				Atime:     uint64(d.Entry.Attributes.Atime.UnixNano() / 1e9),
-				Mtime:     uint64(d.Entry.Attributes.Mtime.UnixNano() / 1e9),
-				Ctime:     uint64(d.Entry.Attributes.Ctime.UnixNano() / 1e9),
-				AtimeNsec: uint32(d.Entry.Attributes.Atime.UnixNano() % 1e9),
-				MtimeNsec: uint32(d.Entry.Attributes.Mtime.UnixNano() % 1e9),
-				CtimeNsec: uint32(d.Entry.Attributes.Ctime.UnixNano() % 1e9),
-				Mode:      mode,
-				Nlink:     d.Entry.Attributes.Nlink,
-				Rdev:      rdev,
-				Uid:       d.Entry.Attributes.Uid,
-				Gid:       d.Entry.Attributes.Gid,
-			},
-		},
-
-		dirent: fuse_dirent{
-			ino:     uint64(d.Dirent.Inode),
-			off:     uint64(d.Dirent.Offset),
-			namelen: uint32(len(d.Dirent.Name)),
-			type_:   uint32(d.Dirent.Type),
+	entryOut := fusekernel.EntryOut{
+		Nodeid:         uint64(d.Entry.Child),
+		Generation:     uint64(d.Entry.Generation),
+		EntryValid:     entryValid,
+		AttrValid:      attrValid,
+		EntryValidNsec: entryValidNsec,
+		AttrValidNsec:  attrValidNsec,
+		Attr: fusekernel.Attr{
+			Ino:  uint64(d.Entry.Child),
+			Size: d.Entry.Attributes.Size,
+			// round up to the nearest 512 boundary (In POSIX a "block" is a unit of 512 bytes)
+			Blocks:    (d.Entry.Attributes.Size + 512 - 1) / 512,
+			Atime:     uint64(d.Entry.Attributes.Atime.UnixNano() / 1e9),
+			Mtime:     uint64(d.Entry.Attributes.Mtime.UnixNano() / 1e9),
+			Ctime:     uint64(d.Entry.Attributes.Ctime.UnixNano() / 1e9),
+			AtimeNsec: uint32(d.Entry.Attributes.Atime.UnixNano() % 1e9),
+			MtimeNsec: uint32(d.Entry.Attributes.Mtime.UnixNano() % 1e9),
+			CtimeNsec: uint32(d.Entry.Attributes.Ctime.UnixNano() % 1e9),
+			Mode:      mode,
+			Nlink:     d.Entry.Attributes.Nlink,
+			Rdev:      rdev,
+			Uid:       d.Entry.Attributes.Uid,
+			Gid:       d.Entry.Attributes.Gid,
 		},
 	}
+	crtime := d.Entry.Attributes.Crtime.UnixNano()
+	entryOut.Attr.SetCrtime(uint64(crtime/1e9), uint32(crtime%1e9))
 
-	n += copy(buf[n:], (*[direntPlusHeaderSize]byte)(unsafe.Pointer(&dp))[:])
+	dirent := fusekernel.Dirent{
+		Ino:     uint64(d.Dirent.Inode),
+		Off:     uint64(d.Dirent.Offset),
+		Namelen: uint32(len(d.Dirent.Name)),
+		Type:    uint32(d.Dirent.Type),
+	}
+
+	n += copy(buf[n:], (*[entryOutSize]byte)(unsafe.Pointer(&entryOut))[:])
+	n += copy(buf[n:], (*[fusekernel.DirentSize]byte)(unsafe.Pointer(&dirent))[:])
 
 	// Write the name afterward.
 	n += copy(buf[n:], d.Dirent.Name)
