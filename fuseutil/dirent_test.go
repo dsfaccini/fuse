@@ -15,8 +15,10 @@
 package fuseutil
 
 import (
+	"bytes"
 	"encoding/binary"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -33,6 +35,10 @@ import (
 // macFUSE's fuse_attr adds btime, btimensec and flags_darwin under __APPLE__.
 // That moves FUSE_NAME_OFFSET_DIRENTPLUS from 152 to 168.
 var darwin = runtime.GOOS == "darwin"
+
+// fuseNameMax is FUSE_NAME_MAX, PATH_MAX - 1, from
+// https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/fs/fuse/fuse_i.h
+const fuseNameMax = 4095
 
 func direntPlusNameOffset() int {
 	if darwin {
@@ -106,13 +112,16 @@ func parseDirentPlus(t *testing.T, buf []byte) []kernelDirentPlus {
 		}
 
 		reclen := (nameOffset + namelen + 7) &^ 7
-		if namelen == 0 || namelen > 1024 {
+		if namelen == 0 || namelen > fuseNameMax {
 			t.Fatalf("namelen = %d; the kernel answers EIO", namelen)
 		}
 		if reclen > len(buf) {
 			break
 		}
 		e.name = string(f.b[:namelen])
+		if strings.Contains(e.name, "/") {
+			t.Fatalf("name %q has a /; the kernel answers EIO", e.name)
+		}
 		for i, c := range buf[nameOffset+namelen : reclen] {
 			if c != 0 {
 				t.Errorf("%q: padding byte %d = %#x, want 0", e.name, i, c)
@@ -151,8 +160,7 @@ func TestWriteDirentPlusMatchesKernelLayout(t *testing.T) {
 		return a
 	}
 
-	buf := make([]byte, 4096)
-	var n int
+	var written []byte
 	var want []kernelDirentPlus
 	for i, name := range []string{"a", "file", "seven77", "eight888", "nine99999"} {
 		child := fuseops.InodeID(10 + i)
@@ -164,18 +172,19 @@ func TestWriteDirentPlusMatchesKernelLayout(t *testing.T) {
 		if got := WriteDirentPlus(make([]byte, reclen-1), d); got != 0 {
 			t.Errorf("%q into %d bytes: wrote %d, want 0", name, reclen-1, got)
 		}
-		got := WriteDirentPlus(buf[n:], d)
-		if got != reclen {
-			t.Errorf("%q: wrote %d bytes, want %d", name, got, reclen)
+		// 0xff shows any byte WriteDirentPlus leaves unwritten.
+		entry := bytes.Repeat([]byte{0xff}, reclen)
+		if got := WriteDirentPlus(entry, d); got != reclen {
+			t.Errorf("%q into %d bytes: wrote %d, want %d", name, reclen, got, reclen)
 		}
-		n += got
+		written = append(written, entry...)
 		want = append(want, kernelDirentPlus{
 			nodeid: uint64(child), generation: 9, attr: wantAttr(uint64(child)),
 			ino: uint64(child), off: uint64(i + 1), typ: syscall.DT_REG, name: name,
 		})
 	}
 
-	got := parseDirentPlus(t, buf[:n])
+	got := parseDirentPlus(t, written)
 	if len(got) != len(want) {
 		t.Fatalf("parsed %d entries, want %d", len(got), len(want))
 	}

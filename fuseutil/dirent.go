@@ -65,14 +65,6 @@ type DirentPlus struct {
 	Entry fuseops.ChildInodeEntry
 }
 
-type fuse_dirent struct {
-	ino     uint64
-	off     uint64
-	namelen uint32
-	type_   uint32
-	name    [0]byte
-}
-
 // Write the supplied directory entry into the given buffer in the format
 // expected in fuseops.ReadFileOp.Data, returning the number of bytes written.
 // Return zero if the entry would not fit.
@@ -83,7 +75,7 @@ func WriteDirent(buf []byte, d Dirent) (n int) {
 	// dictates 8-byte alignment.
 
 	const direntAlignment = 8
-	const direntSize = 8 + 8 + 4 + 4
+	const direntSize = fusekernel.DirentSize
 
 	// Compute the number of bytes of padding we'll need to maintain alignment
 	// for the next entry.
@@ -99,11 +91,11 @@ func WriteDirent(buf []byte, d Dirent) (n int) {
 	}
 
 	// Write the header.
-	de := fuse_dirent{
-		ino:     uint64(d.Inode),
-		off:     uint64(d.Offset),
-		namelen: uint32(len(d.Name)),
-		type_:   uint32(d.Type),
+	de := fusekernel.Dirent{
+		Ino:     uint64(d.Inode),
+		Off:     uint64(d.Offset),
+		Namelen: uint32(len(d.Name)),
+		Type:    uint32(d.Type),
 	}
 
 	n += copy(buf[n:], (*[direntSize]byte)(unsafe.Pointer(&de))[:])
