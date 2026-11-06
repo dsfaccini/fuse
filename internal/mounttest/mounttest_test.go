@@ -328,10 +328,13 @@ func TestFakeMount(t *testing.T) { MountWithFakeMFMount(t) }`,
 // test does not exempt an FSKit test from its gate: it must still start with
 // SkipUnlessFSKitProbeEnabled.
 var mountFailureTests = map[string]string{
-	"TestNonexistentMountPoint":                   "checkMountPoint rejects the directory",
-	"TestMountReturnsTypedFSKitErrors":            "the FSKit preflight fails",
-	"TestMountRejectsInvalidConfigBeforeMounting": "config validation fails",
-	"TestMountUsesMacFUSEForEveryFuseImpl":        "the macFUSE mount helper is missing",
+	"TestNonexistentMountPoint":                                          "checkMountPoint rejects the directory",
+	"TestMountContextReturnsAtOnceWhenContextEnded":                      "the context has ended",
+	"TestMountReturnsTypedFSKitErrors":                                   "the FSKit preflight fails",
+	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation fails",
+	"TestMountUsesMacFUSEForEveryFuseImpl":                               "the macFUSE mount helper is missing",
+	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
+	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
 }
 
 // fakeMounts call Mount through the fake MFMount, which mounts nothing. Each
@@ -341,10 +344,10 @@ var fakeMounts = map[string]string{
 	"MountWithFakeMFMount": ".",
 }
 
-// mountCallees mount when called: Mount directly, mountFSKitTransport under
+// mountCallees mount when called: Mount and MountContext directly, mountFSKitTransport under
 // the FSKit probe, ogletest's RunTests through suites that mount in SetUp, and
 // SetUp on samples.SampleTest and samples.SubprocessTest.
-var mountCallees = []string{"Mount", "mountFSKitTransport", "RunTests", "SetUp"}
+var mountCallees = []string{"Mount", "MountContext", "mountFSKitTransport", "RunTests", "SetUp"}
 
 // fskitMountCallees mount through FSKit. Only the FSKit probe's gate may guard
 // them, so that FUSE_RUN_MOUNT_TESTS never starts an FSKit mount.

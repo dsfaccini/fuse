@@ -47,6 +47,15 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To test `Mount`'s config validation without a mount, pass a mount point that
   does not exist. `Mount` validates the config before it checks the mount
   point. A regression then fails with ENOENT instead of mounting.
+- `Mount` force-unmounts a native mount it will not return, and
+  `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
+  `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test
+  that reaches them replaces those first: `recordUnmounts` in
+  `unmount_test.go` records the unmount(2) calls and answers them.
+- To test the macFUSE kernel extension path without a mount, call
+  `useFakeMacFUSEMountHelper`. It points `macfuseMountHelper` at the test
+  binary running `TestFakeMacFUSEMountHelper`, which `fakeMountHelper`
+  scripts: the device it passes back, its mount result and its exit status.
 
 ## Validate a change
 
@@ -120,14 +129,17 @@ covers the change.
 
 - Use the fake MFMount in `mount_fskit_fake_darwin_test.go`. Its functions are
   purego callbacks, so the transport makes its real purego calls.
-- `newFakeMFMount` activates a fake for one test. Its cleanup fails the test
-  unless the channel and every message are released exactly once.
+- `newFakeMFMount` activates a fake for one test, and records unmount(2) in
+  `fakeMFMount.unmounts` instead of running it. Its cleanup fails the test
+  unless every message is released once, and the channel once per reference:
+  `MFChannelCreate`'s, plus one per `MFRetain`.
 - Test transport methods on the transport that `fakeMFMount.transport` returns.
-- For behavior that only `Mount` reaches, call `MountWithFakeMFMount`. Set
-  `fakeMFMount.mount` to script what MFMount does and returns.
-- Call `Mount` with a fake through `MountWithFakeMFMount` only. The gate
-  scanner exempts that name in the repo root and flags any other path to
-  `Mount`.
+- For behavior that only `Mount` reaches, call `MountWithFakeMFMount`, which
+  calls `MountContext` with the context you pass. Set `fakeMFMount.mount` to
+  script what MFMount does and returns.
+- Call `Mount` or `MountContext` with a fake through `MountWithFakeMFMount`
+  only. The gate scanner exempts that name in the repo root and flags any
+  other path to either.
 - Queue requests with `fakeMFMount.kernel.Send` and read replies with
   `NextReply`. A request is a list of body buffers. FSKit sends a WRITE's
   payload in a buffer of its own.

@@ -18,6 +18,10 @@ import "errors"
 
 var ErrExternallyManagedMountPoint = errors.New("externally managed mount point, skipping unmount")
 
+// errDiskutilUnmount wraps a failed diskutil unmount. Its output gives no
+// stable sign of a busy volume, so MountedFileSystem.Unmount retries it.
+var errDiskutilUnmount = errors.New("diskutil unmount")
+
 // Unmount attempts to unmount the file system whose mount point is the
 // supplied directory.
 // For external mountpoints (like /dev/fd/N), it returns ErrExternallyManagedMountPoint

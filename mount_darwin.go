@@ -37,36 +37,31 @@ func convertMountArgs(cfg *MountConfig) ([]string, []string) {
 }
 
 // Mount at the given directory through the macFUSE kernel extension,
-// returning its device.
-func mount(
-	dir string,
-	cfg *MountConfig,
-	ready chan<- error) (*os.File, error) {
+// returning its device and a function that waits for the mount helper and
+// returns its result. The helper finishes mounting after it hands over the
+// device.
+func mount(dir string, cfg *MountConfig) (*os.File, func() error, error) {
 	if _, err := os.Stat(macfuseMountHelper); os.IsNotExist(err) {
-		return nil, errMacFUSENotFound
+		return nil, nil, errMacFUSENotFound
 	}
 
-	ready <- nil
 	argv, env := convertMountArgs(cfg)
 	argv = append(argv, dir)
-	dev, err := fusermount(macfuseMountHelper, argv, env, false, cfg.DebugLogger)
+	dev, wait, err := fusermount(macfuseMountHelper, argv, env, false, cfg.DebugLogger)
 	if err != nil {
-		return nil, fmt.Errorf("callMount: %v", err)
+		return nil, nil, fmt.Errorf("callMount: %v", err)
 	}
-	return dev, nil
+	return dev, wait, nil
 }
 
-func mountTransport(
-	dir string,
-	cfg *MountConfig,
-	ready chan<- error) (connectionTransport, error) {
+func mountTransport(dir string, cfg *MountConfig) (nativeMount, error) {
 	if cfg.Options["backend"] == "fskit" {
-		return mountFSKitTransport(dir, cfg, ready)
+		return mountFSKitTransport(dir, cfg)
 	}
 
-	dev, err := mount(dir, cfg, ready)
+	dev, wait, err := mount(dir, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return newFileTransport(dev), nil
+	return newDeviceMount(dev, BackendMacFUSEKernelExtension, wait), nil
 }

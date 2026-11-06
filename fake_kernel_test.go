@@ -34,11 +34,14 @@ import (
 // connectionTransport it stands in for /dev/fuse, read the way fileTransport
 // reads it; on darwin it is also the channel behind the fake MFMount.
 type fakeKernel struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	reads   []fakeRead
-	hungUp  bool
-	replies chan []byte
+	mu     sync.Mutex
+	cond   *sync.Cond
+	reads  []fakeRead
+	hungUp bool
+	// interrupts counts Interrupt calls. A read fails with EINTR when it
+	// changes while the read waits.
+	interrupts int
+	replies    chan []byte
 }
 
 // fakeRead is one read of the channel: a request's body buffers, or an errno.
@@ -75,12 +78,26 @@ func (k *fakeKernel) HangUp() {
 	k.mu.Unlock()
 }
 
-// read blocks until a read is queued or the kernel hangs up.
+// Interrupt makes the reads waiting now fail with EINTR, as
+// MFChannelInterrupt does. A later read waits as usual.
+func (k *fakeKernel) Interrupt() {
+	k.mu.Lock()
+	k.interrupts++
+	k.cond.Broadcast()
+	k.mu.Unlock()
+}
+
+// read blocks until a read is queued, the kernel hangs up, or Interrupt runs.
+// A queued read or a hang-up wins over an interrupt.
 func (k *fakeKernel) read() fakeRead {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for len(k.reads) == 0 && !k.hungUp {
+	interrupts := k.interrupts
+	for len(k.reads) == 0 && !k.hungUp && k.interrupts == interrupts {
 		k.cond.Wait()
+	}
+	if len(k.reads) == 0 && !k.hungUp {
+		return fakeRead{errno: syscall.EINTR}
 	}
 	if len(k.reads) == 0 {
 		return fakeRead{errno: syscall.ENODEV}

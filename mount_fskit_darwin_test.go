@@ -16,6 +16,7 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -162,14 +163,15 @@ func TestFSKitTransportCloseWaitsForMountPublication(t *testing.T) {
 			var closes, releases atomic.Int32
 			closeErr := errors.New("native close error")
 			transport := &fskitTransport{
+				mounted: make(chan struct{}),
 				closeNative: func() error {
 					closes.Add(1)
 					return closeErr
 				},
-				releaseNative: func() { releases.Add(1) },
+				interruptNative: func() {},
+				releaseNative:   func() { releases.Add(1) },
 			}
 			// The native call has returned, but its result is not published yet.
-			transport.mountDone.Add(1)
 			results := make(chan error, 2)
 			for range 2 {
 				go func() { results <- transport.Close() }()
@@ -185,8 +187,11 @@ func TestFSKitTransportCloseWaitsForMountPublication(t *testing.T) {
 			if closed || closes.Load() != 0 || releases.Load() != 0 {
 				t.Error("Close blocked pending INIT traffic or touched the native channel before mount publication")
 			}
-			transport.setMountResult(test.succeeded)
-			transport.mountDone.Done()
+			var mountErr error
+			if !test.succeeded {
+				mountErr = FSKitMountError{Result: FSKitMountResultUnexpectedFailure}
+			}
+			transport.setMountResult(mountErr)
 			var wantErr error
 			var wantCloses int32
 			if test.succeeded {
@@ -213,10 +218,12 @@ func TestFSKitTransportCloseDrainsOperationsBeforeRelease(t *testing.T) {
 	closed := make(chan struct{})
 	released := make(chan struct{})
 	transport := &fskitTransport{
+		mounted:        make(chan struct{}),
 		mountSucceeded: true,
 		closeNative:    func() error { close(closed); return nil },
 		releaseNative:  func() { close(released) },
 	}
+	close(transport.mounted)
 	transport.operations.Add(1)
 	result := make(chan error, 1)
 	go func() { result <- transport.Close() }()
@@ -382,19 +389,6 @@ func TestFSKitTransportSendsConcurrently(t *testing.T) {
 	wg.Wait()
 }
 
-// drainServer answers every op with ENOSYS until the connection ends.
-type drainServer struct{}
-
-func (drainServer) ServeOps(c *Connection) {
-	for {
-		ctx, _, err := c.ReadOp()
-		if err != nil {
-			return
-		}
-		c.Reply(ctx, syscall.ENOSYS)
-	}
-}
-
 func TestMountWrapsFSKitMountResult(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -415,7 +409,7 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 				f.kernel.HangUp()
 				return test.result
 			}
-			_, err := MountWithFakeMFMount(t, f, drainServer{}, MountConfig{})
+			_, err := MountWithFakeMFMount(context.Background(), t, f, drainServer{}, MountConfig{})
 			// artifact-fs finds the result with errors.As to decide whether
 			// to fall back to the kernel extension.
 			var mountErr FSKitMountError
@@ -435,6 +429,11 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 			defer f.mu.Unlock()
 			if f.channelCloses != 0 {
 				t.Errorf("MFChannelClose calls = %d, want 0: MFMount closes the channel when it fails", f.channelCloses)
+			}
+			// As in macFUSE's libfuse, a failed MFMount unmounts nothing:
+			// the mount point may be another volume.
+			if len(f.unmounts) != 0 {
+				t.Errorf("unmount calls = %v, want none", f.unmounts)
 			}
 		})
 	}
