@@ -973,6 +973,9 @@ type GetXattrOp struct {
 	// Set by the file system: the number of bytes read into Dst, or
 	// the number of bytes that would have been read into Dst if Dst was
 	// big enough (return ERANGE in this case).
+	//
+	// When the op succeeds, it is answered with EIO if BytesRead is negative
+	// or exceeds Dst. A size query, where Dst is empty, is exempt.
 	BytesRead int
 	OpContext OpContext
 }
@@ -996,6 +999,9 @@ type ListXattrOp struct {
 	// Set by the file system: the number of bytes read into Dst, or
 	// the number of bytes that would have been read into Dst if Dst was
 	// big enough (return ERANGE in this case).
+	//
+	// When the op succeeds, it is answered with EIO if BytesRead is negative
+	// or exceeds Dst. A size query, where Dst is empty, is exempt.
 	BytesRead int
 	OpContext OpContext
 }

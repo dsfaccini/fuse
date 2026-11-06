@@ -36,8 +36,10 @@ import (
 //
 // A panic in a method other than Destroy is recovered and answered with EIO,
 // and so is a method that calls runtime.Goexit. The panic value and its stack
-// go to MountConfig.ErrorLogger. The server keeps serving other ops, but a
-// lock the method held when it panicked stays held.
+// go to MountConfig.ErrorLogger, or to DebugLogger when ErrorLogger is nil.
+// The server keeps serving other ops, except after a Goexit in ForgetInode,
+// which runs on the goroutine that reads requests. A lock the method held
+// when it panicked stays held.
 //
 // See NotImplementedFileSystem for a convenient way to embed default
 // implementations for methods you don't care about.

@@ -189,6 +189,12 @@ func TestBytesReadOutsideItsBufferIsAnsweredWithEIO(t *testing.T) {
 		{"readdir past Dst", request(fusekernel.OpReaddir, child, readIn), func(op any) {
 			op.(*fuseops.ReadDirOp).BytesRead = 17
 		}},
+		{"readdirplus past Dst", request(fusekernel.OpReaddirplus, child, readIn), func(op any) {
+			op.(*fuseops.ReadDirPlusOp).BytesRead = 17
+		}},
+		{"listxattr past Dst", request(fusekernel.OpListxattr, child, fuse.NativeBytes(&fusekernel.ListxattrIn{Size: 16})), func(op any) {
+			op.(*fuseops.ListXattrOp).BytesRead = 17
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -205,4 +211,37 @@ func TestBytesReadOutsideItsBufferIsAnsweredWithEIO(t *testing.T) {
 			checkNoMoreLogs(t, lines)
 		})
 	}
+}
+
+func TestBytesReadThatFillsItsBufferIsAnswered(t *testing.T) {
+	readIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Size: 16})
+	zeroIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Size: 0})
+	full := []byte("0123456789abcdef")
+	k, lines := servePanicking(t, func(op any) error {
+		switch o := op.(type) {
+		case *fuseops.ReadFileOp:
+			o.BytesRead = copy(o.Dst, full)
+		case *fuseops.ReadDirOp:
+			o.BytesRead = len(o.Dst)
+		case *fuseops.ReadDirPlusOp:
+			o.BytesRead = len(o.Dst)
+		}
+		return nil
+	})
+	tests := []struct {
+		name    string
+		request [][]byte
+		reply   []byte
+	}{
+		{"read", request(fusekernel.OpRead, child, readIn), full},
+		{"zero-size read", request(fusekernel.OpRead, child, zeroIn), nil},
+		{"readdir", request(fusekernel.OpReaddir, child, readIn), make([]byte, 16)},
+		{"zero-size readdir", request(fusekernel.OpReaddir, child, zeroIn), nil},
+		{"readdirplus", request(fusekernel.OpReaddirplus, child, readIn), make([]byte, 16)},
+	}
+	for _, tt := range tests {
+		k.Send(tt.request...)
+		t.Run(tt.name, func(t *testing.T) { checkReply(t, k.NextReply(t), 0, tt.reply) })
+	}
+	checkNoMoreLogs(t, lines)
 }
