@@ -99,9 +99,10 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
   through `sudo`, `Mount` mounts directly.
 - `linux-mount` fails when no test that `mounttest.SkipUnlessEnabled` let run
   passed. It finds those tests by the line the gate logs.
-- `macos` installs macFUSE for `TestLoadFSKitAPIResolvesInstalledFramework`.
-  That test loads the installed MFMount framework. It fails when
-  `GITHUB_ACTIONS=true` and the framework is missing, and skips elsewhere.
+- `macos` installs macFUSE 5.5.0 from its GitHub release, pinned by
+  SHA-256. `requireInstalledMFMount` guards the tests that load the installed
+  MFMount framework. They fail when `GITHUB_ACTIONS=true` and macFUSE is
+  missing or older than 5.5, and skip elsewhere.
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
   here.

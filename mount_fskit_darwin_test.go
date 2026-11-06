@@ -148,14 +148,26 @@ func TestCheckMacFUSEVersion(t *testing.T) {
 	}
 }
 
-func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
-	if _, err := os.Stat(fskitFrameworkPath); err != nil {
-		// CI installs macFUSE, so there a missing framework is a failure.
-		if os.Getenv("GITHUB_ACTIONS") == "true" {
-			t.Fatalf("macFUSE MFMount framework not installed: %v", err)
-		}
-		t.Skipf("macFUSE MFMount framework not installed: %v", err)
+// requireInstalledMFMount skips the test unless macFUSE 5.5 or later is
+// installed. CI installs it, so there a missing or older macFUSE fails the
+// test.
+func requireInstalledMFMount(t *testing.T) {
+	t.Helper()
+	err := checkMacFUSEVersion(fskitFrameworkPath)
+	if err == nil {
+		_, err = os.Stat(fskitFrameworkPath)
 	}
+	switch {
+	case err == nil:
+	case os.Getenv("GITHUB_ACTIONS") == "true":
+		t.Fatalf("macFUSE 5.5 or later not installed: %v", err)
+	default:
+		t.Skipf("macFUSE 5.5 or later not installed: %v", err)
+	}
+}
+
+func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
+	requireInstalledMFMount(t)
 	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {
 		t.Fatalf("loadFSKitAPI(%q): %v", fskitFrameworkPath, err)
 	}
@@ -290,14 +302,8 @@ func TestLoadFSKitAPIRefusesARedirectedFramework(t *testing.T) {
 		t.Fatalf("loadFSKitAPI error = %v, want a refusal of the redirected framework", err)
 	}
 
+	requireInstalledMFMount(t)
 	framework := filepath.Dir(filepath.Dir(filepath.Dir(fskitFrameworkPath)))
-	if _, err := os.Stat(framework); err != nil {
-		// CI installs macFUSE, so there a missing framework is a failure.
-		if os.Getenv("GITHUB_ACTIONS") == "true" {
-			t.Fatalf("macFUSE MFMount framework not installed: %v", err)
-		}
-		t.Skipf("macFUSE MFMount framework not installed: %v", err)
-	}
 	// The copy keeps the bundle, whose resources its code signature covers.
 	redirect := t.TempDir()
 	if out, err := exec.Command("cp", "-R", framework, redirect).CombinedOutput(); err != nil {
