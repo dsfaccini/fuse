@@ -16,6 +16,7 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -162,14 +163,15 @@ func TestFSKitTransportCloseWaitsForMountPublication(t *testing.T) {
 			var closes, releases atomic.Int32
 			closeErr := errors.New("native close error")
 			transport := &fskitTransport{
+				mounted: make(chan struct{}),
 				closeNative: func() error {
 					closes.Add(1)
 					return closeErr
 				},
-				releaseNative: func() { releases.Add(1) },
+				interruptNative: func() {},
+				releaseNative:   func() { releases.Add(1) },
 			}
 			// The native call has returned, but its result is not published yet.
-			transport.mountDone.Add(1)
 			results := make(chan error, 2)
 			for range 2 {
 				go func() { results <- transport.Close() }()
@@ -185,8 +187,11 @@ func TestFSKitTransportCloseWaitsForMountPublication(t *testing.T) {
 			if closed || closes.Load() != 0 || releases.Load() != 0 {
 				t.Error("Close blocked pending INIT traffic or touched the native channel before mount publication")
 			}
-			transport.setMountResult(test.succeeded)
-			transport.mountDone.Done()
+			var mountErr error
+			if !test.succeeded {
+				mountErr = FSKitMountError{Result: FSKitMountResultUnexpectedFailure}
+			}
+			transport.setMountResult(mountErr)
 			var wantErr error
 			var wantCloses int32
 			if test.succeeded {
@@ -213,10 +218,12 @@ func TestFSKitTransportCloseDrainsOperationsBeforeRelease(t *testing.T) {
 	closed := make(chan struct{})
 	released := make(chan struct{})
 	transport := &fskitTransport{
+		mounted:        make(chan struct{}),
 		mountSucceeded: true,
 		closeNative:    func() error { close(closed); return nil },
 		releaseNative:  func() { close(released) },
 	}
+	close(transport.mounted)
 	transport.operations.Add(1)
 	result := make(chan error, 1)
 	go func() { result <- transport.Close() }()
@@ -415,7 +422,7 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 				f.kernel.HangUp()
 				return test.result
 			}
-			_, err := MountWithFakeMFMount(t, f, drainServer{}, MountConfig{})
+			_, err := MountWithFakeMFMount(context.Background(), t, f, drainServer{}, MountConfig{})
 			// artifact-fs finds the result with errors.As to decide whether
 			// to fall back to the kernel extension.
 			var mountErr FSKitMountError

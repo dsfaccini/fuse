@@ -41,26 +41,39 @@ type fakeMFMount struct {
 	// mount hangs up the kernel.
 	mount func() int32
 
+	// unmounts records the unmount(2) calls that Mount and Unmount make while
+	// the fake is active, and unmountResult answers them. Nil succeeds.
+	unmounts      []fakeUnmount
+	unmountResult func(dir string, flags int) error
+
 	// sendResult turns a send of n bytes into MFChannelSendMessage's result
 	// and errno. Nil reports all n bytes sent.
 	sendResult func(n int) (int, syscall.Errno)
 
-	mu              sync.Mutex
-	initReply       []byte
-	channelCreated  bool
-	channelCloses   int
-	channelReleases int
-	released        chan struct{} // closed by the first channel MFRelease
-	messages        map[uintptr]*fakeMessage
-	lastMessage     uintptr
-	unknownReleases int
-	pinner          runtime.Pinner
+	mu                sync.Mutex
+	initReply         []byte
+	channelCreated    bool
+	channelCloses     int
+	channelInterrupts int
+	channelRetains    int
+	channelReleases   int
+	released          chan struct{} // closed by the channel MFRelease that drops the last reference
+	messages          map[uintptr]*fakeMessage
+	lastMessage       uintptr
+	unknownReleases   int
+	pinner            runtime.Pinner
 }
 
 // fakeMessage is a live MFMessageRef.
 type fakeMessage struct {
 	buffers [][]byte
 	iovecs  []syscall.Iovec
+}
+
+// fakeUnmount is one unmount(2) call.
+type fakeUnmount struct {
+	dir   string
+	flags int
 }
 
 // fakeChannel is the MFChannelRef that the fake hands out.
@@ -89,6 +102,17 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 	// transport under GC.
 	gcPercent := debug.SetGCPercent(-1)
 	t.Cleanup(func() { debug.SetGCPercent(gcPercent) })
+	oldUnmount := unmountSyscall
+	unmountSyscall = func(dir string, flags int) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.unmounts = append(f.unmounts, fakeUnmount{dir, flags})
+		if f.unmountResult != nil {
+			return f.unmountResult(dir, flags)
+		}
+		return nil
+	}
+	t.Cleanup(func() { unmountSyscall = oldUnmount })
 	t.Cleanup(func() {
 		f.mu.Lock()
 		created := f.channelCreated
@@ -104,8 +128,8 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if created && f.channelReleases != 1 {
-			t.Errorf("channel MFRelease calls = %d, want 1", f.channelReleases)
+		if created && f.channelReleases != 1+f.channelRetains {
+			t.Errorf("channel MFRelease calls = %d, want 1 plus %d MFRetain calls", f.channelReleases, f.channelRetains)
 		}
 		if len(f.messages) != 0 {
 			t.Errorf("%d messages never released", len(f.messages))
@@ -137,15 +161,15 @@ func (f *fakeMFMount) transport(t *testing.T) *fskitTransport {
 	api := fakeMFMountAPI()
 	channel, _, _ := purego.SyscallN(api.channelCreate)
 	tr := newFSKitTransport(api, channel)
-	tr.setMountResult(true)
+	tr.setMountResult(nil)
 	t.Cleanup(func() { tr.Close() })
 	return tr
 }
 
-// MountWithFakeMFMount calls Mount with the fskit backend while f stands in
-// for MFMount, so it mounts nothing. The mount gate scanner exempts it by
-// name.
-func MountWithFakeMFMount(t *testing.T, f *fakeMFMount, server Server, cfg MountConfig) (*MountedFileSystem, error) {
+// MountWithFakeMFMount calls MountContext with the fskit backend while f
+// stands in for MFMount, so it mounts nothing. The mount gate scanner exempts
+// it by name.
+func MountWithFakeMFMount(ctx context.Context, t *testing.T, f *fakeMFMount, server Server, cfg MountConfig) (*MountedFileSystem, error) {
 	t.Helper()
 	if activeFakeMFMount.Load() != f {
 		t.Fatal("MountWithFakeMFMount needs the active fake MFMount")
@@ -159,7 +183,7 @@ func MountWithFakeMFMount(t *testing.T, f *fakeMFMount, server Server, cfg Mount
 		cfg.Options = map[string]string{}
 	}
 	cfg.Options["backend"] = "fskit"
-	return Mount(t.TempDir(), server, &cfg)
+	return MountContext(ctx, t.TempDir(), server, &cfg)
 }
 
 // ServeFakeFSKit mounts server through Mount and a fake MFMount, and returns
@@ -169,7 +193,7 @@ func MountWithFakeMFMount(t *testing.T, f *fakeMFMount, server Server, cfg Mount
 func ServeFakeFSKit(t *testing.T, server Server) *fakeKernel {
 	t.Helper()
 	f := newFakeMFMount(t)
-	mfs, err := MountWithFakeMFMount(t, f, server, MountConfig{})
+	mfs, err := MountWithFakeMFMount(context.Background(), t, f, server, MountConfig{})
 	if err != nil {
 		t.Fatalf("Mount: %v", err)
 	}
@@ -278,6 +302,23 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 			}
 			return uintptr(sent)
 		}),
+		channelInterrupt: purego.NewCallback(func(channel uintptr) uintptr {
+			f := activeFakeMFMount.Load()
+			f.mu.Lock()
+			f.channelInterrupts++
+			f.mu.Unlock()
+			f.kernel.Interrupt()
+			return 1
+		}),
+		retain: purego.NewCallback(func(ref uintptr) uintptr {
+			f := activeFakeMFMount.Load()
+			if ref == fakeChannel {
+				f.mu.Lock()
+				f.channelRetains++
+				f.mu.Unlock()
+			}
+			return ref
+		}),
 		channelClose: purego.NewCallback(func(channel uintptr) uintptr {
 			f := activeFakeMFMount.Load()
 			f.mu.Lock()
@@ -293,7 +334,7 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 			switch {
 			case ref == fakeChannel:
 				f.channelReleases++
-				if f.channelReleases == 1 {
+				if f.channelReleases == 1+f.channelRetains {
 					close(f.released)
 				}
 			case f.messages[ref] != nil:

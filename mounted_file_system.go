@@ -16,13 +16,17 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"syscall"
+	"time"
 )
 
 // MountedFileSystem represents the status of a mount operation, with a method
 // that waits for unmounting.
 type MountedFileSystem struct {
-	dir string
+	dir     string
+	backend Backend
 
 	// The result to return from Join. Not valid until the channel is closed.
 	joinStatus          error
@@ -35,6 +39,51 @@ func (mfs *MountedFileSystem) Dir() string {
 	return mfs.dir
 }
 
+// Backend returns the mechanism through which the kernel reaches the file
+// system.
+func (mfs *MountedFileSystem) Backend() Backend {
+	return mfs.backend
+}
+
+// unmountRetryInterval is how long Unmount waits before it retries an unmount
+// that failed because the file system was busy.
+const unmountRetryInterval = 100 * time.Millisecond
+
+// Unmount unmounts the file system through its backend:
+//
+//   - Linux: fusermount -u;
+//   - the macFUSE kernel extension: unmount(2);
+//   - FSKit: unmount(2), then diskutil unmount when unmount(2) fails with
+//     EPERM, as it does for a process without access to network volumes.
+//
+// While the file system is busy, Unmount retries until ctx ends, and then
+// returns an error that wraps ctx.Err() and the last unmount error. Once Join
+// has returned, the server is gone, so Unmount forces the unmount: a lazy
+// unmount on Linux, MNT_FORCE on darwin, and diskutil unmount force on FSKit.
+// That is the way out of the state an error fatal to the connection leaves.
+//
+// Unmount does not wait for Join. A /dev/fd/N mount point fails with
+// ErrExternallyManagedMountPoint, because its owner unmounts it.
+func (mfs *MountedFileSystem) Unmount(ctx context.Context) error {
+	for {
+		var served bool
+		select {
+		case <-mfs.joinStatusAvailable:
+			served = true
+		default:
+		}
+		err := unmountBackend(mfs.dir, mfs.backend, served)
+		if !errors.Is(err, syscall.EBUSY) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("unmount %s: %w; last attempt: %w", mfs.dir, ctx.Err(), err)
+		case <-time.After(unmountRetryInterval):
+		}
+	}
+}
+
 // Join blocks until a mounted file system has been unmounted. It does not
 // return successfully until all ops read from the connection have been
 // responded to (i.e. the file system server has finished processing all
@@ -45,8 +94,8 @@ func (mfs *MountedFileSystem) Dir() string {
 // called multiple times.
 //
 // After an error that is fatal to the connection, Join returns while the file
-// system may still be mounted, with every request to it failing. Unmount it
-// before you mount at the same directory again.
+// system may still be mounted, with every request to it failing. Call
+// Unmount before you mount at the same directory again.
 func (mfs *MountedFileSystem) Join(ctx context.Context) error {
 	select {
 	case <-mfs.joinStatusAvailable:

@@ -34,11 +34,14 @@ import (
 // connectionTransport it stands in for /dev/fuse, read the way fileTransport
 // reads it; on darwin it is also the channel behind the fake MFMount.
 type fakeKernel struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	reads   []fakeRead
-	hungUp  bool
-	replies chan []byte
+	mu     sync.Mutex
+	cond   *sync.Cond
+	reads  []fakeRead
+	hungUp bool
+	// interrupted makes the next read, or the one blocked now, fail with
+	// EINTR.
+	interrupted bool
+	replies     chan []byte
 }
 
 // fakeRead is one read of the channel: a request's body buffers, or an errno.
@@ -75,12 +78,26 @@ func (k *fakeKernel) HangUp() {
 	k.mu.Unlock()
 }
 
-// read blocks until a read is queued or the kernel hangs up.
+// Interrupt makes the read blocked now, or the next one, fail with EINTR
+// once.
+func (k *fakeKernel) Interrupt() {
+	k.mu.Lock()
+	k.interrupted = true
+	k.cond.Broadcast()
+	k.mu.Unlock()
+}
+
+// read blocks until a read is queued, the read is interrupted, or the kernel
+// hangs up.
 func (k *fakeKernel) read() fakeRead {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for len(k.reads) == 0 && !k.hungUp {
+	for len(k.reads) == 0 && !k.hungUp && !k.interrupted {
 		k.cond.Wait()
+	}
+	if k.interrupted {
+		k.interrupted = false
+		return fakeRead{errno: syscall.EINTR}
 	}
 	if len(k.reads) == 0 {
 		return fakeRead{errno: syscall.ENODEV}

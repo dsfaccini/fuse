@@ -105,3 +105,46 @@ func (t *fileTransport) Close() error {
 }
 
 var _ connectionTransport = (*fileTransport)(nil)
+
+// deviceMount is a mount served through a FUSE device.
+type deviceMount struct {
+	fileTransport
+	kind Backend
+
+	// mounted is closed once the native mount has finished, and mountErr
+	// then holds its result.
+	mounted  chan struct{}
+	mountErr error
+}
+
+// newDeviceMount returns the mount served through dev. wait blocks until the
+// native mount has finished and returns its result. Nil means dev's mount has
+// finished.
+func newDeviceMount(dev *os.File, kind Backend, wait func() error) *deviceMount {
+	m := &deviceMount{
+		fileTransport: fileTransport{file: dev},
+		kind:          kind,
+		mounted:       make(chan struct{}),
+	}
+	if wait == nil {
+		close(m.mounted)
+		return m
+	}
+	go func() {
+		m.mountErr = wait()
+		close(m.mounted)
+	}()
+	return m
+}
+
+func (m *deviceMount) backend() Backend { return m.kind }
+
+func (m *deviceMount) waitMounted() error {
+	<-m.mounted
+	return m.mountErr
+}
+
+// cancel does nothing: a read of the device cannot be interrupted.
+func (m *deviceMount) cancel() {}
+
+var _ nativeMount = (*deviceMount)(nil)

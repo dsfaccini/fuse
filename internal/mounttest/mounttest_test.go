@@ -341,10 +341,10 @@ var fakeMounts = map[string]string{
 	"MountWithFakeMFMount": ".",
 }
 
-// mountCallees mount when called: Mount directly, mountFSKitTransport under
+// mountCallees mount when called: Mount and MountContext directly, mountFSKitTransport under
 // the FSKit probe, ogletest's RunTests through suites that mount in SetUp, and
 // SetUp on samples.SampleTest and samples.SubprocessTest.
-var mountCallees = []string{"Mount", "mountFSKitTransport", "RunTests", "SetUp"}
+var mountCallees = []string{"Mount", "MountContext", "mountFSKitTransport", "RunTests", "SetUp"}
 
 // fskitMountCallees mount through FSKit. Only the FSKit probe's gate may guard
 // them, so that FUSE_RUN_MOUNT_TESTS never starts an FSKit mount.

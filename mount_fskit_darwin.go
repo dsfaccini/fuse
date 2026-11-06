@@ -52,6 +52,8 @@ type fskitAPI struct {
 	messageGetBodyBuffers  uintptr
 	channelSendMessage     uintptr
 	channelClose           uintptr
+	channelInterrupt       uintptr
+	retain                 uintptr
 	release                uintptr
 }
 
@@ -99,6 +101,8 @@ func loadFSKitAPI(path string) (*fskitAPI, error) {
 		{"MFMessageGetBodyBuffers", &api.messageGetBodyBuffers},
 		{"MFChannelSendMessage", &api.channelSendMessage},
 		{"MFChannelClose", &api.channelClose},
+		{"MFChannelInterrupt", &api.channelInterrupt},
+		{"MFRetain", &api.retain},
 		{"MFRelease", &api.release},
 	} {
 		if *symbol.addr, err = purego.Dlsym(lib, symbol.name); err != nil {
@@ -116,22 +120,28 @@ type fskitTransport struct {
 	// transport sends without allocating and without a lock across the send.
 	vectors chan []syscall.Iovec
 
-	mu             sync.Mutex
-	channel        uintptr
-	closed         bool
-	mountSucceeded bool
-	operations     sync.WaitGroup
-	mountDone      sync.WaitGroup
-	closeOnce      sync.Once
-	closeErr       error
-	closeNative    func() error
-	releaseNative  func()
+	// mounted is closed once MFMount has returned and its result is
+	// published, and mountErr then holds that result.
+	mounted  chan struct{}
+	mountErr error
+
+	mu      sync.Mutex
+	channel uintptr
+	closed  bool
+	// cancelled is set once cancel runs or MFMount fails. A read that EINTR
+	// interrupts then returns io.EOF instead of retrying, so the read waiting
+	// for INIT ends.
+	cancelled       bool
+	mountSucceeded  bool
+	operations      sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
+	closeNative     func() error
+	interruptNative func()
+	releaseNative   func()
 }
 
-func mountFSKitTransport(
-	dir string,
-	cfg *MountConfig,
-	ready chan<- error) (connectionTransport, error) {
+func mountFSKitTransport(dir string, cfg *MountConfig) (nativeMount, error) {
 	if err := validateFSKitMount(dir, cfg); err != nil {
 		return nil, err
 	}
@@ -155,9 +165,12 @@ func mountFSKitTransport(
 	}
 	t := newFSKitTransport(api, channel)
 
-	t.mountDone.Add(1)
+	// The mount's reference keeps the channel alive for MFMount and for
+	// setMountResult, so that Close need not wait for an MFMount that
+	// MountContext gave up on.
+	purego.SyscallN(api.retain, channel)
 	go func() {
-		defer t.mountDone.Done()
+		defer purego.SyscallN(api.release, channel)
 
 		// Report failures through the result code instead of macFUSE dialogs.
 		const quiet = 1
@@ -171,8 +184,7 @@ func mountFSKitTransport(
 		if code := int32(result); code != 0 {
 			mountErr = FSKitMountError{Result: code}
 		}
-		t.setMountResult(mountErr == nil)
-		ready <- mountErr
+		t.setMountResult(mountErr)
 	}()
 
 	return t, nil
@@ -182,6 +194,7 @@ func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
 	return &fskitTransport{
 		api:     api,
 		vectors: make(chan []syscall.Iovec, fskitSendVectors),
+		mounted: make(chan struct{}),
 		channel: channel,
 		closeNative: func() error {
 			closed, _, errno := purego.SyscallN(api.channelClose, channel)
@@ -190,7 +203,8 @@ func newFSKitTransport(api *fskitAPI, channel uintptr) *fskitTransport {
 			}
 			return nil
 		},
-		releaseNative: func() { purego.SyscallN(api.release, channel) },
+		interruptNative: func() { purego.SyscallN(api.channelInterrupt, channel) },
+		releaseNative:   func() { purego.SyscallN(api.release, channel) },
 	}
 }
 
@@ -238,15 +252,52 @@ func validateFSKitOSVersion(version string, local bool) error {
 	return nil
 }
 
-func (t *fskitTransport) setMountResult(succeeded bool) {
+// setMountResult publishes MFMount's result. When Close has already run, it
+// did not wait for the result, so a successful mount's channel is closed here.
+// A failed mount interrupts the read waiting for INIT.
+func (t *fskitTransport) setMountResult(err error) {
 	t.mu.Lock()
-	t.mountSucceeded = succeeded
+	t.mountSucceeded = err == nil
+	closeLate := t.closed && err == nil
+	if err != nil {
+		t.cancelled = true
+	}
 	t.mu.Unlock()
+	if closeLate {
+		t.closeNative()
+	}
+	if err != nil {
+		t.interruptNative()
+	}
+	t.mountErr = err
+	close(t.mounted)
+}
+
+func (t *fskitTransport) backend() Backend { return BackendFSKit }
+
+func (t *fskitTransport) waitMounted() error {
+	<-t.mounted
+	return t.mountErr
+}
+
+// cancel interrupts the read waiting for INIT, and makes it and every later
+// read return io.EOF.
+func (t *fskitTransport) cancel() {
+	t.mu.Lock()
+	t.cancelled = true
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.operations.Add(1)
+	t.mu.Unlock()
+	defer t.operations.Done()
+	t.interruptNative()
 }
 
 func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 	t.mu.Lock()
-	if t.closed {
+	if t.closed || t.cancelled {
 		t.mu.Unlock()
 		return 0, io.EOF
 	}
@@ -260,6 +311,13 @@ func (t *fskitTransport) ReadMessage(p []byte) (int, error) {
 		if message == 0 {
 			errno := callErrno(callErr)
 			if errno == syscall.EINTR {
+				// Signals interrupt reads too, so only cancel ends one.
+				t.mu.Lock()
+				cancelled := t.cancelled
+				t.mu.Unlock()
+				if cancelled {
+					return 0, io.EOF
+				}
 				continue
 			}
 			if errno == syscall.ENODEV {
@@ -369,8 +427,15 @@ func (t *fskitTransport) SendMessage(parts [][]byte) error {
 func (t *fskitTransport) Close() error {
 	t.closeOnce.Do(func() {
 		// MFMount owns channel closure on failure. Keep INIT traffic available
-		// until its native result is published before claiming close ownership.
-		t.mountDone.Wait()
+		// until its native result is published before claiming close
+		// ownership, unless the mount was cancelled: then MFMount may never
+		// return, and setMountResult closes a mount that succeeds late.
+		t.mu.Lock()
+		cancelled := t.cancelled
+		t.mu.Unlock()
+		if !cancelled {
+			<-t.mounted
+		}
 		t.mu.Lock()
 		t.closed = true
 		succeeded := t.mountSucceeded
@@ -384,4 +449,4 @@ func (t *fskitTransport) Close() error {
 	return t.closeErr
 }
 
-var _ connectionTransport = (*fskitTransport)(nil)
+var _ nativeMount = (*fskitTransport)(nil)

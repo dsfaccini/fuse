@@ -466,8 +466,7 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 		return err
 	}
 
-	ready := make(chan error, 1)
-	transport, err := mountFSKitTransport(m.dir, &cfg, ready)
+	transport, err := mountFSKitTransport(m.dir, &cfg)
 	if err != nil {
 		return err
 	}
@@ -490,7 +489,7 @@ func (m *probeMount) startFSKit(cfg MountConfig) error {
 	}
 	returned := make(chan mountReturn, 1)
 	go func() {
-		err := <-ready
+		err := native.waitMounted()
 		_, attached, _ := mountedVolume(m.dir)
 		returned <- mountReturn{err, attached, m.pt.replied.Load()}
 	}()
@@ -568,7 +567,10 @@ func (m *probeMount) teardown() {
 	// before unmounting.
 	mfmountReturned := true
 	if m.pt != nil {
-		mfmountReturned = waitGroupWithin(&m.pt.native.mountDone, probeMountWait)
+		mfmountReturned = within(probeMountWait, func() error {
+			<-m.pt.native.mounted
+			return nil
+		}) == nil
 	}
 	gone := true
 	if _, mounted, err := mountedVolume(m.dir); mounted || err != nil {
@@ -636,14 +638,6 @@ func (m *probeMount) within(what string, d time.Duration, f func() error) error 
 		m.stop(fmt.Sprintf("%s on %s did not return within %v", what, m.name, d))
 	}
 	return err
-}
-
-// waitGroupWithin waits up to d for wg.
-func waitGroupWithin(wg *sync.WaitGroup, d time.Duration) bool {
-	return within(d, func() error {
-		wg.Wait()
-		return nil
-	}) == nil
 }
 
 func (m *probeMount) report(item, result string, details map[string]string) {
@@ -1923,8 +1917,10 @@ func (pt *probeTransport) Close() error {
 	if closedByProbe {
 		// MFChannelClose must not run twice on one channel. MFMount's result
 		// would mark the mount as succeeded, so wait for it first.
-		pt.native.mountDone.Wait()
-		pt.native.setMountResult(false)
+		<-pt.native.mounted
+		pt.native.mu.Lock()
+		pt.native.mountSucceeded = false
+		pt.native.mu.Unlock()
 	}
 	return pt.native.Close()
 }
