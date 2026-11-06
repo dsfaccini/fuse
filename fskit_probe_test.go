@@ -26,7 +26,10 @@ const fskitProbeMounts = 5
 
 // TestFSKitProbe measures how macFUSE's FSKit backend treats the FUSE
 // protocol. It serves an in-memory file system through this package's
-// Connection and makes at most 5 FSKit mounts, one after another:
+// Connection and makes at most 5 FSKit mounts, one after another. Its
+// transport does not report that FSKit pads short reads, so the Connection's
+// EIO reply to a short READ stays off and the macfuse#1231 cases measure
+// FSKit, not that guard:
 //
 //  1. base, artifact-fs's mount config. Access to the mount point, entry and
 //     attr TTLs, negative entries, whether LOOKUP attributes replace a cached

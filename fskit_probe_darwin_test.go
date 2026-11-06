@@ -1035,8 +1035,9 @@ func isEmptyReply(reply probeEvent) bool { return reply.size <= int64(buffer.Out
 // reply to a LOOKUP of name+"_link", a second name for the same inode. FSKit
 // sends that LOOKUP for the root directory, not for the file. Each stat runs
 // on its own goroutine, and the READ is answered after a bounded wait for
-// each, so a stat FSKit holds cannot stall the measurement. A stat of the file's own name, after the LOOKUP
-// reply, shows whether FSKit applied the new size before the READ reply.
+// each, so a stat FSKit holds cannot stall the measurement. A stat of the
+// file's own name, after the LOOKUP reply, shows whether FSKit applied the
+// new size before the READ reply.
 //
 // It returns the result and whether the server sent the new size before it
 // answered the READ.
@@ -2526,5 +2527,14 @@ func TestFSKitProbeLinkLookupSendsNewSizeWhileReadHeld(t *testing.T) {
 	}
 	if got := len(reply) - buffer.OutMessageHeaderSize; got != 1024 {
 		t.Errorf("READ reply carries %d bytes, want 1024", got)
+	}
+}
+
+// The macfuse#1231 cases measure FSKit only while the Connection's short-read
+// guard is off for the probe's transport.
+func TestFSKitProbeBypassesShortReadGuard(t *testing.T) {
+	var transport connectionTransport = &probeTransport{native: &fskitTransport{}}
+	if p, ok := transport.(shortReadPadder); ok && p.padsShortReads() {
+		t.Error("probeTransport reports that it pads short reads, so the Connection would answer the macfuse#1231 cases with EIO instead of FSKit")
 	}
 }
