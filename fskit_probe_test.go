@@ -26,19 +26,24 @@ const fskitProbeMounts = 5
 
 // TestFSKitProbe measures how macFUSE's FSKit backend treats the FUSE
 // protocol. It serves an in-memory file system through this package's
-// Connection and makes at most 5 FSKit mounts, one after another:
+// Connection and makes at most 5 FSKit mounts, one after another. Its
+// transport does not report that FSKit pads short reads, so the Connection's
+// EIO reply to a short READ stays off and the macfuse#1231 cases measure
+// FSKit, not that guard:
 //
 //  1. base, artifact-fs's mount config. Access to the mount point, entry and
 //     attr TTLs, negative entries, whether LOOKUP attributes replace a cached
-//     vnode's, whether FUSE_INTERRUPT is sent, the macfuse#1231 regression,
-//     the READ padding timing with a shrink and with a growth, opening a mode
-//     0 file, write sizes, and Join after a clean unmount. macOS can keep an
-//     entry past its TTL (https://github.com/macfuse/macfuse/issues/1207), so
-//     the LOOKUP attributes case may report unknown. The shrink run of the
-//     padding timing decides what a reader gets when a GETATTR reply that
-//     shrinks the file reaches FSKit while a READ it sent earlier is
-//     unanswered. That ordering decides the open short-read guard in
-//     https://github.com/dsfaccini/fuse/pull/5.
+//     vnode's, whether FUSE_INTERRUPT is sent, macfuse#1231 on the first read
+//     of an uncached file and on a second read after the file's data shrank
+//     under an unchanged size, the READ padding timing with a shrink and with
+//     a growth, opening a mode 0 file, write sizes, and Join after a clean
+//     unmount. macOS can keep an entry past its TTL
+//     (https://github.com/macfuse/macfuse/issues/1207), so the LOOKUP
+//     attributes case may report unknown. The padding timing reports which
+//     size a reader gets when a LOOKUP reply that changes the file's size
+//     reaches FSKit while a READ it sent earlier is unanswered: the size when
+//     FSKit sent the READ, or the new size. The shrink run decides the open
+//     short-read guard in https://github.com/dsfaccini/fuse/pull/5.
 //  2. local, base plus the local option. Access to the mount point, and Join
 //     after a clean unmount.
 //  3. options, base with DisableDefaultPermissions, MaxWrite 128 KiB and the
@@ -59,12 +64,12 @@ const fskitProbeMounts = 5
 //
 // Each result is one log line: "FSKIT_PROBE " and a JSON object with item,
 // mount, result and details. A result the run does not settle is "unknown"
-// and does not fail the test. Only the macfuse#1231 case fails on a measured
-// result: it passes while the read of a short READ reply returns the reported
-// size, and fails once the read returns only the reply or fails with EIO. A
-// failed mount, measurements that stop early, a server panic and a mount left
-// behind also fail the test, and so does a second run in one process, such as
-// -count=2.
+// and does not fail the test. Only the two macfuse#1231 cases fail on a
+// measured result: each passes while the read of a short READ reply returns
+// the reported size, and fails once the read returns only the reply or fails
+// with EIO. A failed mount, measurements that stop early, a server panic and a
+// mount left behind also fail the test, and so does a second run in one
+// process, such as -count=2.
 //
 // The probe runs only on David's go-ahead in his own words, because macFUSE's
 // FSKit extension switches itself off after a series of mounts
