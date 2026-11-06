@@ -16,10 +16,8 @@ package fuseutil
 
 import (
 	"context"
-	"fmt"
 	"runtime/debug"
 	"sync"
-	"syscall"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -146,7 +144,7 @@ func (s *fileSystemServer) handleOp(
 			return
 		}
 		if r := recover(); r != nil {
-			c.Reply(ctx, fmt.Errorf("%w: panic: %v\n\n%s", syscall.EIO, r, debug.Stack()))
+			c.Reply(ctx, &operror.Panic{Value: r, Stack: debug.Stack()})
 		}
 	}()
 

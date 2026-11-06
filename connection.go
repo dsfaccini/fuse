@@ -708,6 +708,10 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 		c.putOutMessage(outMsg)
 	}()
 
+	if opErr == nil {
+		opErr = checkBytesRead(outMsg, op)
+	}
+
 	logError := c.shouldLogError(op, opErr)
 
 	// Debug logging
@@ -723,7 +727,11 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 
 	// Error logging
 	if logError {
-		c.errorLogger.Printf("Op 0x%08x %T] -> Error: %q", fuseID, op, opErr)
+		if p, ok := opErr.(*operror.Panic); ok {
+			c.errorLogger.Printf("Op 0x%08x %T] -> Error: panic: %v\n%s", fuseID, op, p.Value, p.Stack)
+		} else {
+			c.errorLogger.Printf("Op 0x%08x %T] -> Error: %q", fuseID, op, opErr)
+		}
 	}
 
 	// Send the reply to the kernel, if one is required.
@@ -755,6 +763,45 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	return nil
 }
 
+// checkBytesRead reports a BytesRead that the op's reply buffer cannot hold.
+// kernelResponseForOp would panic on it, after the op is marked replied.
+func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
+	// convertInMessage grows m by the size of the readdir and xattr buffers.
+	grown := m.Len() - buffer.OutMessageHeaderSize
+	var n, size int
+	switch o := op.(type) {
+	case *fuseops.ReadFileOp:
+		n, size = o.BytesRead, len(o.Dst)
+		if o.Data != nil {
+			size = 0
+			for _, d := range o.Data {
+				size += len(d)
+			}
+		}
+	case *fuseops.ReadDirOp:
+		n, size = o.BytesRead, grown
+	case *fuseops.ReadDirPlusOp:
+		n, size = o.BytesRead, grown
+	case *fuseops.GetXattrOp:
+		if len(o.Dst) == 0 {
+			// A size query: BytesRead is the size, not a length within Dst.
+			return nil
+		}
+		n, size = o.BytesRead, grown
+	case *fuseops.ListXattrOp:
+		if len(o.Dst) == 0 {
+			return nil
+		}
+		n, size = o.BytesRead, grown
+	default:
+		return nil
+	}
+	if n < 0 || n > size {
+		return fmt.Errorf("%T.BytesRead is %d, outside its %d-byte buffer: %w", op, n, size, syscall.EIO)
+	}
+	return nil
+}
+
 // runCallback runs op's Callback. The op is already answered, so a panic in
 // the callback goes to the error logger instead of out of Reply.
 func (c *Connection) runCallback(fuseID uint64, op interface{}) {
@@ -764,7 +811,7 @@ func (c *Connection) runCallback(fuseID uint64, op interface{}) {
 	}
 	defer func() {
 		if r := recover(); r != nil && c.errorLogger != nil {
-			c.errorLogger.Printf("Op 0x%08x %T] -> Callback panic: %q", fuseID, op, fmt.Sprintf("%v\n\n%s", r, debug.Stack()))
+			c.errorLogger.Printf("Op 0x%08x %T] -> Callback panic: %v\n%s", fuseID, op, r, debug.Stack())
 		}
 	}()
 	callback()

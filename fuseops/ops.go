@@ -614,6 +614,8 @@ type ReadDirOp struct {
 	// of fuse_dirent (https://tinyurl.com/mp43bu8) plus the 8-byte alignment of
 	// FUSE_DIRENT_ALIGN (https://tinyurl.com/3m3ewu7h) is less than the read
 	// size of PAGE_SIZE used by fuse_readdir (https://tinyurl.com/mrwxsfxw).
+	//
+	// The op is answered with EIO when BytesRead is negative or exceeds Dst.
 	BytesRead int
 	OpContext OpContext
 }
@@ -742,6 +744,9 @@ type ReadFileOp struct {
 	// LookUpInode, GetInodeAttributes, etc.
 	//
 	// If direct IO is enabled, semantics should match those of read(2).
+	//
+	// The op is answered with EIO when BytesRead is negative or exceeds the
+	// bytes in Data, or in Dst when Data is nil.
 	BytesRead int
 	OpContext OpContext
 

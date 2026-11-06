@@ -46,12 +46,20 @@ func (l logLines) next(t *testing.T) string {
 	}
 }
 
-// checkPanicLogged checks that line carries the panic value and a stack that
-// reaches the panic in this file.
+// checkPanicLogged checks that line carries the panic value and a readable
+// stack that reaches the panic in this file.
 func checkPanicLogged(t *testing.T, line, value string) {
 	t.Helper()
-	if !strings.Contains(line, value) || !strings.Contains(line, "op_panic_test.go") {
-		t.Errorf("error log = %q, want the panic %q and its stack", line, value)
+	if !strings.Contains(line, value) || !strings.Contains(line, "\ngoroutine ") || !strings.Contains(line, "op_panic_test.go") {
+		t.Errorf("error log = %q, want the panic %q and its stack on lines of their own", line, value)
+	}
+}
+
+// checkNoMoreLogs checks that nothing else was logged.
+func checkNoMoreLogs(t *testing.T, lines logLines) {
+	t.Helper()
+	if n := len(lines); n != 0 {
+		t.Errorf("the connection logged %d more lines, want none: %q", n, <-lines)
 	}
 }
 
@@ -96,6 +104,7 @@ func TestHandlerPanicIsAnsweredWithEIO(t *testing.T) {
 			}
 			checkPanicLogged(t, lines.next(t), "panic: handler boom")
 			checkStillServing(t, k)
+			checkNoMoreLogs(t, lines)
 			if n := k.UnreadReplies(); n != 0 {
 				t.Errorf("the connection sent %d more replies, want none", n)
 			}
@@ -117,7 +126,47 @@ func TestCallbackPanicKeepsTheReply(t *testing.T) {
 	checkReply(t, k.NextReply(t), 0, []byte("hello"))
 	checkPanicLogged(t, lines.next(t), "callback boom")
 	checkStillServing(t, k)
+	checkNoMoreLogs(t, lines)
 	if n := k.UnreadReplies(); n != 0 {
 		t.Errorf("the connection sent %d more replies, want none", n)
+	}
+}
+
+func TestBytesReadOutsideItsBufferIsAnsweredWithEIO(t *testing.T) {
+	readIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Size: 16})
+	tests := []struct {
+		name    string
+		request [][]byte
+		serve   func(op any)
+	}{
+		{"read past Dst", request(fusekernel.OpRead, child, readIn), func(op any) {
+			op.(*fuseops.ReadFileOp).BytesRead = 17
+		}},
+		{"read past Data", request(fusekernel.OpRead, child, readIn), func(op any) {
+			o := op.(*fuseops.ReadFileOp)
+			o.Data = [][]byte{[]byte("hello")}
+			o.BytesRead = 6
+		}},
+		{"negative read", request(fusekernel.OpRead, child, readIn), func(op any) {
+			op.(*fuseops.ReadFileOp).BytesRead = -1
+		}},
+		{"readdir past Dst", request(fusekernel.OpReaddir, child, readIn), func(op any) {
+			op.(*fuseops.ReadDirOp).BytesRead = 17
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k, lines := servePanicking(t, func(op any) error {
+				tt.serve(op)
+				return nil
+			})
+			k.Send(tt.request...)
+			checkReply(t, k.NextReply(t), syscall.EIO, nil)
+			if line := lines.next(t); !strings.Contains(line, "BytesRead is ") {
+				t.Errorf("error log = %q, want the bad BytesRead", line)
+			}
+			checkStillServing(t, k)
+			checkNoMoreLogs(t, lines)
+		})
 	}
 }
