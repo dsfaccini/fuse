@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"syscall"
@@ -196,13 +197,20 @@ func checkInitReply(t testing.TB, reply []byte) {
 // requests with server until the test ends. Package fuse_test uses it.
 func ServeFakeKernel(t *testing.T, server Server) *fakeKernel {
 	t.Helper()
+	return ServeFakeKernelLogging(t, server, nil)
+}
+
+// ServeFakeKernelLogging is ServeFakeKernel with errorLogger as the
+// connection's error logger.
+func ServeFakeKernelLogging(t *testing.T, server Server, errorLogger *log.Logger) *fakeKernel {
+	t.Helper()
 	cfg, err := (&MountConfig{}).normalize()
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
 	k := newFakeKernel()
 	k.Send(fakeInit()...)
-	c, err := newConnection(cfg, nil, nil, nil, k)
+	c, err := newConnection(cfg, nil, errorLogger, nil, k)
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
 	}

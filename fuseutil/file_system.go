@@ -16,7 +16,10 @@ package fuseutil
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
+	"syscall"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -30,6 +33,10 @@ import (
 //
 // The FileSystem implementation should not call Connection.Reply, instead
 // returning the error with which the caller should respond.
+//
+// A panic in a method is recovered and answered with EIO. The panic value
+// and its stack go to MountConfig.ErrorLogger. The server keeps serving other
+// ops, but a lock the method held when it panicked stays held.
 //
 // See NotImplementedFileSystem for a convenient way to embed default
 // implementations for methods you don't care about.
@@ -131,6 +138,18 @@ func (s *fileSystemServer) handleOp(
 	op interface{}) {
 	defer s.opsInFlight.Done()
 
+	// A panic inside Reply comes after the op is answered, and a second Reply
+	// is fatal to the connection, so only a panic before Reply is answered.
+	replied := false
+	defer func() {
+		if replied {
+			return
+		}
+		if r := recover(); r != nil {
+			c.Reply(ctx, fmt.Errorf("%w: panic: %v\n\n%s", syscall.EIO, r, debug.Stack()))
+		}
+	}()
+
 	// Dispatch to the appropriate method.
 	var err error
 	switch typed := op.(type) {
@@ -231,6 +250,7 @@ func (s *fileSystemServer) handleOp(
 		err = s.fs.SyncFS(ctx, typed)
 	}
 
+	replied = true
 	c.Reply(ctx, err)
 }
 

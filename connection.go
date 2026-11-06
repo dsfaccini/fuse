@@ -22,6 +22,7 @@ import (
 	"log"
 	"path"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -700,10 +701,7 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	defer func() {
 		// Invoke any callbacks set by the FUSE server after the response to the kernel is
 		// complete and before the inMessage and outMessage memory buffers have been freed.
-		callback := c.callbackForOp(op)
-		if callback != nil {
-			callback()
-		}
+		c.runCallback(fuseID, op)
 
 		// Make sure we destroy the messages when we're done.
 		c.putInMessage(inMsg)
@@ -755,6 +753,21 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	}
 
 	return nil
+}
+
+// runCallback runs op's Callback. The op is already answered, so a panic in
+// the callback goes to the error logger instead of out of Reply.
+func (c *Connection) runCallback(fuseID uint64, op interface{}) {
+	callback := c.callbackForOp(op)
+	if callback == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil && c.errorLogger != nil {
+			c.errorLogger.Printf("Op 0x%08x %T] -> Callback panic: %q", fuseID, op, fmt.Sprintf("%v\n\n%s", r, debug.Stack()))
+		}
+	}()
+	callback()
 }
 
 func (c *Connection) callbackForOp(op interface{}) func() {

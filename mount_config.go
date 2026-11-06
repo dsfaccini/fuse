@@ -58,6 +58,10 @@ type MountConfig struct {
 	//   - ENOENT from LookUpInode.
 	//   - ENOTEMPTY from RmDir or Rename.
 	//   - ENODATA or ERANGE from GetXattr or ListXattr.
+	//
+	// It also receives, with its stack, each panic that fuseutil recovers
+	// from a FileSystem method, and each panic from a ReadFileOp or
+	// WriteFileOp Callback.
 	ErrorLogger *log.Logger
 
 	// A logger to use for logging debug information. If nil, no debug logging is
