@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -71,7 +72,7 @@ func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
 }
 
 func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
-	options := fskitMountOptions(&MountConfig{Options: map[string]string{"backend": "fskit"}})
+	options := fskitMountOptions(&MountConfig{Backend: BackendFSKit})
 	for _, option := range strings.Split(options, ",") {
 		name, _, _ := strings.Cut(option, "=")
 		switch name {
@@ -81,21 +82,74 @@ func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
 	}
 }
 
+// fakeMacFUSEBundle makes a macfuse.fs bundle that reports version, and
+// returns the path of its MFMount framework, which does not exist.
+func fakeMacFUSEBundle(t *testing.T, version string) string {
+	t.Helper()
+	contents := filepath.Join(t.TempDir(), "macfuse.fs", "Contents")
+	if err := os.MkdirAll(contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.macfuse.filesystems.fs.macfuse</string>
+	<key>CFBundleShortVersionString</key>
+	<string>` + version + `</string>
+	<key>CFBundleVersion</key>
+	<string>9.9.9</string>
+</dict>
+</plist>
+`
+	if err := os.WriteFile(filepath.Join(contents, "Info.plist"), []byte(plist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(contents, "Frameworks", "MFMount.framework", "Versions", "A", "MFMount")
+}
+
 func TestLoadFSKitAPIReportsMissingFramework(t *testing.T) {
-	_, err := loadFSKitAPI(filepath.Join(t.TempDir(), "MFMount"))
-	if !errors.Is(err, ErrFSKitUnavailable) {
-		t.Fatalf("loadFSKitAPI error = %v, want ErrFSKitUnavailable", err)
+	for _, path := range []string{
+		filepath.Join(t.TempDir(), "MFMount"),
+		fakeMacFUSEBundle(t, "5.5.0"),
+	} {
+		if _, err := loadFSKitAPI(path); !errors.Is(err, ErrFSKitUnavailable) {
+			t.Errorf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", path, err)
+		}
+	}
+}
+
+func TestCheckMacFUSEVersion(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		ok      bool
+	}{
+		{version: "4.9.9"},
+		{version: "5.4"},
+		{version: "5.4.99"},
+		{version: "5.5", ok: true},
+		{version: "5.5.0", ok: true},
+		{version: "5.5.1", ok: true},
+		{version: "5.10.0", ok: true},
+		{version: "6.0", ok: true},
+		{version: "five"},
+	} {
+		err := checkMacFUSEVersion(fakeMacFUSEBundle(t, test.version))
+		if test.ok {
+			if err != nil {
+				t.Errorf("macFUSE %s: %v, want it accepted", test.version, err)
+			}
+			continue
+		}
+		if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), test.version) {
+			t.Errorf("macFUSE %s: %v, want ErrFSKitUnavailable naming the version", test.version, err)
+		}
 	}
 }
 
 func TestLoadFSKitAPIResolvesInstalledFramework(t *testing.T) {
-	if _, err := os.Stat(fskitFrameworkPath); err != nil {
-		// CI installs macFUSE, so there a missing framework is a failure.
-		if os.Getenv("GITHUB_ACTIONS") == "true" {
-			t.Fatalf("macFUSE MFMount framework not installed: %v", err)
-		}
-		t.Skipf("macFUSE MFMount framework not installed: %v", err)
-	}
+	useInstalledMFMount(t)
 	if _, err := loadFSKitAPI(fskitFrameworkPath); err != nil {
 		t.Fatalf("loadFSKitAPI(%q): %v", fskitFrameworkPath, err)
 	}
@@ -136,18 +190,137 @@ func TestMountReturnsTypedFSKitErrors(t *testing.T) {
 	if _, err := loadFSKitAPI(missingFramework); !errors.Is(err, ErrFSKitUnavailable) {
 		t.Fatalf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", missingFramework, err)
 	}
-	config := &MountConfig{Options: map[string]string{"backend": "fskit"}}
+	for name, config := range map[string]*MountConfig{
+		"Backend":           {Backend: BackendFSKit},
+		"deprecated option": {Options: map[string]string{"backend": "fskit"}},
+	} {
+		setFSKitTestSystem(t, missingFramework, "15.7")
+		_, err := Mount(t.TempDir(), nil, config)
+		var mountErr FSKitMountError
+		if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
+			t.Errorf("%s: Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", name, err, FSKitMountResultUnsupportedOSVersion)
+		}
+
+		setFSKitTestSystem(t, missingFramework, "26.0")
+		if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
+			t.Errorf("%s: Mount without MFMount error = %v, want ErrFSKitUnavailable", name, err)
+		}
+
+		// The framework is missing, so even a skipped version check mounts
+		// nothing.
+		setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.4.0"), "26.0")
+		_, err = Mount(t.TempDir(), nil, config)
+		if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), "macFUSE 5.4.0 is installed") {
+			t.Errorf("%s: Mount on macFUSE 5.4.0 error = %v, want ErrFSKitUnavailable naming 5.4.0", name, err)
+		}
+	}
+}
+
+func TestFSKitAvailableChecksTheOSAndTheFramework(t *testing.T) {
+	missingFramework := filepath.Join(t.TempDir(), "MFMount")
 
 	setFSKitTestSystem(t, missingFramework, "15.7")
-	_, err := Mount(t.TempDir(), nil, config)
+	err := FSKitAvailable()
 	var mountErr FSKitMountError
-	if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion {
-		t.Errorf("Mount on macOS 15.7 error = %v, want FSKitMountError with result %d", err, FSKitMountResultUnsupportedOSVersion)
+	if !errors.As(err, &mountErr) || mountErr.Result != FSKitMountResultUnsupportedOSVersion || !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("FSKitAvailable on macOS 15.7 = %v, want FSKitMountError with result %d", err, FSKitMountResultUnsupportedOSVersion)
 	}
 
 	setFSKitTestSystem(t, missingFramework, "26.0")
-	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
-		t.Errorf("Mount without MFMount error = %v, want ErrFSKitUnavailable", err)
+	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("FSKitAvailable without MFMount = %v, want ErrFSKitUnavailable", err)
+	}
+
+	setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.4.0"), "26.0")
+	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), "macFUSE 5.4.0 is installed") {
+		t.Errorf("FSKitAvailable on macFUSE 5.4.0 = %v, want ErrFSKitUnavailable naming 5.4.0", err)
+	}
+}
+
+// A process sees macFUSE once it is installed, and loads it once.
+func TestFSKitAvailableRetriesOnlyAFailure(t *testing.T) {
+	setFSKitTestSystem(t, fskitFrameworkPath, "26.0")
+	var loads int
+	fskitAPILoader = cacheFSKitAPI(func(string) (*fskitAPI, error) {
+		loads++
+		if loads == 1 {
+			return nil, ErrFSKitUnavailable
+		}
+		return &fskitAPI{}, nil
+	})
+	if err := FSKitAvailable(); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Fatalf("first FSKitAvailable = %v, want ErrFSKitUnavailable", err)
+	}
+	for range 2 {
+		if err := FSKitAvailable(); err != nil {
+			t.Errorf("FSKitAvailable after macFUSE loads = %v, want nil", err)
+		}
+	}
+	if loads != 2 {
+		t.Errorf("loads = %d, want 2: one failure, then one success reused", loads)
+	}
+}
+
+// redirectedMFMount makes TestLoadFSKitAPIRefusesARedirectedFramework load
+// MFMount in a process that DYLD_FRAMEWORK_PATH redirects.
+const redirectedMFMount = "FUSE_TEST_REDIRECTED_MFMOUNT"
+
+// dyld honors DYLD_FRAMEWORK_PATH in a process without the hardened runtime,
+// such as a test binary, so dlopen can load a copy of MFMount from elsewhere.
+func TestLoadFSKitAPIRefusesARedirectedFramework(t *testing.T) {
+	useInstalledMFMount(t)
+	if os.Getenv(redirectedMFMount) == "1" {
+		_, err := loadFSKitAPI(fskitFrameworkPath)
+		if err != nil && strings.Contains(err.Error(), "instead of "+fskitFrameworkPath) {
+			return
+		}
+		lib, openErr := purego.Dlopen(fskitFrameworkPath, purego.RTLD_NOW|purego.RTLD_LOCAL)
+		if openErr != nil {
+			t.Fatalf("loadFSKitAPI error = %v, and dlopen failed: %v", err, openErr)
+		}
+		mount, _ := purego.Dlsym(lib, "MFMount")
+		if loaded, _ := imagePath(mount); loaded == fskitFrameworkPath {
+			t.Skip("dyld ignored DYLD_FRAMEWORK_PATH")
+		}
+		t.Fatalf("loadFSKitAPI error = %v, want a refusal of the redirected framework", err)
+	}
+
+	framework := filepath.Dir(filepath.Dir(filepath.Dir(fskitFrameworkPath)))
+	// The copy keeps the bundle, whose resources its code signature covers.
+	redirect := t.TempDir()
+	if out, err := exec.Command("cp", "-R", framework, redirect).CombinedOutput(); err != nil {
+		t.Fatalf("copying %s: %v: %s", framework, err, out)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLoadFSKitAPIRefusesARedirectedFramework$", "-test.v")
+	cmd.Env = append(os.Environ(), redirectedMFMount+"=1", "DYLD_FRAMEWORK_PATH="+redirect)
+	out, err := cmd.CombinedOutput()
+	switch {
+	case err != nil:
+		t.Fatalf("redirected load: %v\n%s", err, out)
+	case bytes.Contains(out, []byte("--- SKIP")) && os.Getenv("GITHUB_ACTIONS") == "true":
+		t.Fatalf("redirected load skipped:\n%s", out)
+	case bytes.Contains(out, []byte("--- SKIP")):
+		t.Skipf("redirected load skipped:\n%s", out)
+	case !bytes.Contains(out, []byte("--- PASS")):
+		t.Fatalf("redirected load ran no test:\n%s", out)
+	}
+}
+
+// FSKit drops notifications, so the Notifier sends none there.
+func TestFSKitNotifierReturnsENOSYSWithoutSending(t *testing.T) {
+	n := NewNotifier()
+	server := newStartedServer()
+	k := ServeFakeFSKit(t, NewServerWithNotifier(n, server))
+	server.wait(t)
+
+	if err := notifyWithin(t, func() error { return n.InvalidateInode(7, 0, 0) }); !errors.Is(err, syscall.ENOSYS) {
+		t.Errorf("InvalidateInode = %v, want ENOSYS", err)
+	}
+	if err := notifyWithin(t, func() error { return n.InvalidateEntry(1, "x") }); !errors.Is(err, syscall.ENOSYS) {
+		t.Errorf("InvalidateEntry = %v, want ENOSYS", err)
+	}
+	if got := k.UnreadReplies(); got != 0 {
+		t.Errorf("the connection sent %d messages, want none", got)
 	}
 }
 

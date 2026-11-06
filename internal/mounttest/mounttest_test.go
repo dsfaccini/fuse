@@ -333,6 +333,7 @@ var mountFailureTests = map[string]string{
 	"TestMountReturnsTypedFSKitErrors":                                   "the FSKit preflight fails",
 	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation fails",
 	"TestMountUsesMacFUSEForEveryFuseImpl":                               "the macFUSE mount helper is missing",
+	"TestMountBackendWinsOverTheDeprecatedOption":                        "the macFUSE mount helper is missing",
 	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
 	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
 }

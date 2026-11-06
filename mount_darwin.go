@@ -7,11 +7,25 @@ import (
 	"strconv"
 
 	"github.com/dsfaccini/fuse/internal/buffer"
+	"golang.org/x/sys/unix"
 )
 
 // errMacFUSENotFound is returned from Mount when macFUSE's mount helper is
 // missing. Make sure macFUSE is installed.
 var errMacFUSENotFound = errors.New("cannot locate macFUSE")
+
+// macfuseKernelExtensionSysctl is the sysctl the macFUSE kernel extension
+// registers while it is loaded.
+var macfuseKernelExtensionSysctl = "vfs.generic.macfuse.version.number"
+
+// MacFUSEKernelExtensionLoaded reports whether the macFUSE kernel extension is
+// loaded. It loads nothing. A mount through BackendMacFUSEKernelExtension
+// while the extension is not loaded makes macOS load it, which shows the user
+// a system prompt.
+func MacFUSEKernelExtensionLoaded() bool {
+	_, err := unix.SysctlRaw(macfuseKernelExtensionSysctl)
+	return err == nil
+}
 
 // macfuseMountHelper mounts through the macFUSE kernel extension and passes
 // back the device, like fusermount. Tests point it elsewhere.
@@ -55,7 +69,7 @@ func mount(dir string, cfg *MountConfig) (*os.File, func() error, error) {
 }
 
 func mountTransport(dir string, cfg *MountConfig) (nativeMount, error) {
-	if cfg.Options["backend"] == "fskit" {
+	if cfg.Backend == BackendFSKit {
 		return mountFSKitTransport(dir, cfg)
 	}
 

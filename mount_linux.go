@@ -161,10 +161,6 @@ func mount(dir string, cfg *MountConfig) (*os.File, error) {
 }
 
 func mountTransport(dir string, cfg *MountConfig) (nativeMount, error) {
-	if cfg.Options["backend"] == "fskit" {
-		return nil, fmt.Errorf("backend fskit is only available on darwin")
-	}
-
 	dev, err := mount(dir, cfg)
 	if err != nil {
 		return nil, err

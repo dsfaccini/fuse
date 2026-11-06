@@ -125,10 +125,20 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: stable
-    # TestLoadFSKitAPIResolvesInstalledFramework loads the installed MFMount
-    # framework, and fails here when it is missing.
-    - name: Install macfuse
-      run: HOMEBREW_NO_AUTO_UPDATE=1 brew install macfuse
+    # The tests that load the installed MFMount framework fail here when
+    # macFUSE is missing or older than 5.5. The runner image's Homebrew can
+    # hold an older cask, so install the release the cask installs.
+    - name: Install macFUSE
+      env:
+        MACFUSE_VERSION: 5.5.0
+        MACFUSE_SHA256: 92c21ef2db4199bcf5bddc8e6efb57b23ecb9715f74ab38cba2c77ab226d3830
+      run: |
+        dmg="$RUNNER_TEMP/macfuse.dmg"
+        curl -fsSL -o "$dmg" "https://github.com/macfuse/macfuse/releases/download/macfuse-$MACFUSE_VERSION/macfuse-$MACFUSE_VERSION.dmg"
+        echo "$MACFUSE_SHA256  $dmg" | shasum -a 256 -c -
+        hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/macfuse" "$dmg"
+        sudo installer -pkg "$RUNNER_TEMP/macfuse/Extras/macFUSE $MACFUSE_VERSION.pkg" -target /
+        hdiutil detach "$RUNNER_TEMP/macfuse"
     - name: Build
       run: go build ./...
     # composites reports unkeyed fusekernel.Protocol literals older than the

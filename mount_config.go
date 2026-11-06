@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"runtime"
 	"strings"
 
@@ -60,10 +61,13 @@ type MountConfig struct {
 	//   - ENODATA or ERANGE from GetXattr or ListXattr.
 	//
 	// It also receives, with its stack, each panic that fuseutil recovers
-	// from a FileSystem method, and each panic from a ReadFileOp or
-	// WriteFileOp Callback. It receives each method that fuseutil saw exit
-	// through runtime.Goexit, and each BytesRead that does not fit its op's
-	// buffer. Those ops are answered with EIO.
+	// from a FileSystem method. It receives each method that fuseutil saw
+	// exit through runtime.Goexit, and each BytesRead that does not fit its
+	// op's buffer. Those ops are answered with EIO.
+	//
+	// It receives each panic from a ReadFileOp or WriteFileOp Callback, with
+	// its stack. The Callback runs after the reply is sent, so the panic is
+	// only logged.
 	ErrorLogger *log.Logger
 
 	// A logger to use for logging debug information. If nil, no debug logging is
@@ -239,8 +243,18 @@ type MountConfig struct {
 	VolumeName string
 
 	// Deprecated: Mount ignores FuseImpl. On OS X it mounts through macFUSE,
-	// with the kernel extension unless Options["backend"] is "fskit".
+	// through the backend that Backend names.
 	FuseImpl FUSEImpl
+
+	// The mechanism to mount through. The zero value is the platform's
+	// default: BackendLinux on Linux, BackendMacFUSEKernelExtension on darwin.
+	// darwin also has BackendFSKit. Mount rejects a backend the platform
+	// lacks.
+	//
+	// Options["backend"] = "fskit" is a deprecated spelling of BackendFSKit.
+	// When Backend is set too, Backend wins. Either way, Mount does not pass
+	// that option on to the mount.
+	Backend Backend
 
 	// Additional key=value options to pass unadulterated to the underlying mount
 	// command. See `man 8 mount`, the fuse documentation, etc. for
@@ -412,7 +426,7 @@ func (c *MountConfig) toMap() (opts map[string]string) {
 
 	// Handle OS X options. The FSKit module parses neither novncache nor
 	// noappledouble.
-	fskit := c.Options["backend"] == "fskit"
+	fskit := c.Backend == BackendFSKit
 	if isDarwin {
 		if !fskit && !c.EnableVnodeCaching {
 			opts["novncache"] = ""
@@ -467,6 +481,13 @@ func (c *MountConfig) normalize() (MountConfig, error) {
 		return MountConfig{}, errors.New("MountConfig must not be nil")
 	}
 	cfg := *c
+	if cfg.Options["backend"] == "fskit" {
+		if cfg.Backend == "" {
+			cfg.Backend = BackendFSKit
+		}
+		cfg.Options = maps.Clone(cfg.Options)
+		delete(cfg.Options, "backend")
+	}
 	if cfg.OpContext == nil {
 		cfg.OpContext = context.Background()
 	}
@@ -483,7 +504,21 @@ func (c *MountConfig) normalize() (MountConfig, error) {
 			return MountConfig{}, err
 		}
 	}
+	if err := checkBackend(cfg.Backend); err != nil {
+		return MountConfig{}, err
+	}
 	return cfg, nil
+}
+
+// checkBackend rejects a backend that this platform lacks.
+func checkBackend(b Backend) error {
+	switch {
+	case b == "",
+		runtime.GOOS == "linux" && b == BackendLinux,
+		runtime.GOOS == "darwin" && (b == BackendMacFUSEKernelExtension || b == BackendFSKit):
+		return nil
+	}
+	return fmt.Errorf("backend %q is not available on %s", b, runtime.GOOS)
 }
 
 // checkMountOption rejects an option that would end or escape early on some
