@@ -495,6 +495,11 @@ type UnlinkOp struct {
 // with type directory, usually in response to an open(2) call from a
 // user-space process. On OS X it may not be sent for every open(2) (cf.
 // https://github.com/osxfuse/osxfuse/issues/199).
+//
+// On macFUSE's FSKit backend, one handle can serve several separate listings
+// of the directory. Each listing starts with a ReadDirOp at Offset 0, so a
+// file system that captures the listing in OpenDir must capture it afresh
+// there.
 type OpenDirOp struct {
 	// The ID of the inode to be opened.
 	Inode InodeID
@@ -529,8 +534,8 @@ type ReadDirOp struct {
 	// The offset within the directory at which to read.
 	//
 	// Warning: this field is not necessarily a count of bytes. Its legal values
-	// are defined by the results returned in ReadDirResponse. See the notes
-	// below and the notes on that struct.
+	// are the offsets of the entries the file system wrote to Dst in earlier
+	// replies, plus zero. See the notes below.
 	//
 	// In the Linux kernel this ultimately comes from file::f_pos, which starts
 	// at zero and is set by llseek and by the final consumed result returned by
@@ -588,6 +593,10 @@ type ReadDirOp struct {
 	// something that looks like a newly-opened directory. So FUSE file systems
 	// may e.g. cache an entire fresh listing for each ReadDir with a zero
 	// offset, and return array offsets into that cached listing.
+	//
+	// On macFUSE's FSKit backend, a zero offset is also the only sign of a new
+	// listing: FSKit can list a directory several times through one handle.
+	// See OpenDirOp.
 	Offset DirOffset
 
 	// The destination buffer, whose length gives the size of the read.
@@ -598,8 +607,7 @@ type ReadDirOp struct {
 	// fuseutil.WriteDirent to generate this data.
 	//
 	// Each entry returned exposes a directory offset to the user that may later
-	// show up in ReadDirRequest.Offset. See notes on that field for more
-	// information.
+	// show up in Offset. See notes on that field for more information.
 	//
 	// The library reuses Dst's memory for later ops once the op is answered.
 	Dst []byte
@@ -720,6 +728,11 @@ type ReadFileOp struct {
 	// the read, utilizing its pre-allocated request memory. The file system can write
 	// to this buffer for non-vectored reads.
 	//
+	// The library does not zero Dst. It can hold bytes of earlier requests,
+	// other files' data among them, and the reply carries the first BytesRead
+	// bytes of Dst as they are. So set BytesRead to at most the number of
+	// bytes the file system wrote to the start of Dst.
+	//
 	// If the requested read size is larger than the library's pre-allocated buffer
 	// (e.g., when MountConfig.MaxPages is configured to support larger reads), this
 	// slice will be nil.
@@ -727,7 +740,7 @@ type ReadFileOp struct {
 
 	// Set by the file system:
 	// A list of slices of data to send back to the client.
-	// If this field is populated, the contents of `Dst` will be ignored.
+	// If this field is non-nil, the contents of `Dst` will be ignored.
 	//
 	// The file system must use this field to return data if Dst is nil
 	// (which happens when MountConfig.MaxPages is configured to support reads larger than 1 MiB).
@@ -746,7 +759,19 @@ type ReadFileOp struct {
 	// If direct IO is enabled, semantics should match those of read(2).
 	//
 	// The op is answered with EIO when BytesRead is negative or exceeds the
-	// bytes in Data, or in Dst when Data is nil.
+	// bytes in Data, or in Dst when Data is nil. Within Dst, the library cannot
+	// tell bytes the file system wrote from stale ones; see Dst.
+	//
+	// On macFUSE's FSKit backend, the library answers the op with EIO when
+	// BytesRead is less than min(Offset+Size, S) - Offset
+	// (https://github.com/macfuse/macfuse/issues/1231). S is the larger of the
+	// inode's size when the read arrived and when it is answered, where the
+	// inode's size is the size in the attributes any op last returned for it,
+	// extended by any later write past it. A smaller size counts only once the
+	// kernel has accepted the reply that reports it. Direct IO does not exempt
+	// a read from this. So after a file shrinks, reads inside its old size fail
+	// with EIO until a reply reports the new size, and so does a read that was
+	// in flight when it did.
 	BytesRead int
 	OpContext OpContext
 

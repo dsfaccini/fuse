@@ -59,8 +59,8 @@ var contextKey interface{} = contextKeyType(0)
 // Reading a page at a time is a drag. Ask for a larger size.
 const maxReadahead = 1 << 20
 
-// Connection represents a connection to the fuse kernel process. It is used to
-// receive and reply to requests from the kernel.
+// Connection represents a connection to the kernel through a mount's backend.
+// It is used to receive and reply to requests from the kernel.
 type Connection struct {
 	cfg         MountConfig
 	debugLogger *log.Logger
@@ -88,6 +88,25 @@ type Connection struct {
 	//
 	// GUARDED_BY(mu)
 	fatalErr error
+
+	// The size last reported for each inode the kernel holds, kept only when
+	// the transport pads short reads. See trackReportedSizes.
+	//
+	// GUARDED_BY(mu)
+	reportedInodes map[fuseops.InodeID]reportedInode
+
+	// Taken only when reportedInodes is kept, and before mu. Each reply that
+	// can change a size record holds the write side from recording its growth,
+	// through its write, to applying its shrink, so records change in the
+	// order the kernel receives the replies. Each ReadFileOp reply holds the
+	// read side from its check through its write, so no size reaches the
+	// kernel between the two. Forgets change records too, but write nothing,
+	// and take no side. See changesReportedSizes.
+	//
+	// The cost: size-changing replies are serialized through their writes and
+	// wait for every READ reply in flight, and once one waits, new READ replies
+	// wait behind it.
+	sizeReplyMu sync.RWMutex
 
 	// Freelists, serviced by freelists.go.
 	inMessages  freelist.Freelist // GUARDED_BY(mu)
@@ -119,6 +138,10 @@ type opState struct {
 
 	// Set by the op's first Reply.
 	replied *atomic.Bool
+
+	// For a ReadFileOp on a transport that pads short reads, the size recorded
+	// for its inode when it arrived.
+	sizeAtRead uint64
 }
 
 // Return the current wirelog record from the context if the MountConfig
@@ -149,6 +172,9 @@ func newConnection(
 		wireLogger:  wireLogger,
 		transport:   transport,
 		cancelFuncs: make(map[uint64]func()),
+	}
+	if p, ok := transport.(shortReadPadder); ok && p.padsShortReads() {
+		c.reportedInodes = make(map[fuseops.InodeID]reportedInode)
 	}
 
 	// Initialize.
@@ -459,9 +485,9 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 	return c.transport.SendMessage(outMsg.Parts())
 }
 
-// ReadOp consumes the next op from the kernel process, returning the op and a
-// context that should be used for work related to the op. It returns io.EOF if
-// the kernel has closed the connection.
+// ReadOp consumes the next op from the kernel, returning the op and a context
+// that should be used for work related to the op. It returns io.EOF if the
+// kernel has closed the connection.
 //
 // ReadOp answers the poll hack's requests itself and reads on. See Mount.
 //
@@ -479,8 +505,8 @@ func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
 // If err == nil, the user is responsible for later calling c.Reply with the
 // returned context.
 //
-// This function delivers ops in exactly the order they are received from
-// /dev/fuse. It must not be called multiple times concurrently.
+// This function delivers ops in exactly the order the backend delivers them.
+// It must not be called multiple times concurrently.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
@@ -556,7 +582,13 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 			wlog = NewWireLogRecord()
 		}
 		h := inMsg.Header()
-		ctx = context.WithValue(ctx, contextKey, opState{inMsg, outMsg, op, wlog, h.Unique, h.Opcode, new(atomic.Bool)})
+		state := opState{inMsg: inMsg, outMsg: outMsg, op: op, wlog: wlog, fuseID: h.Unique, opCode: h.Opcode, replied: new(atomic.Bool)}
+		if c.reportedInodes != nil {
+			if read, ok := op.(*fuseops.ReadFileOp); ok {
+				state.sizeAtRead = c.reportedSize(read.Inode)
+			}
+		}
+		ctx = context.WithValue(ctx, contextKey, state)
 
 		// Return the op to the user.
 		return ctx, op, nil
@@ -665,9 +697,10 @@ func (c *Connection) shouldLogError(
 // (or nil if successful). The context must be the context returned by ReadOp.
 //
 // The kernel receives the first syscall.Errno in opErr's chain, or EIO when
-// the chain has none. A reply the kernel refuses with ENOENT, because the
-// request was interrupted, is not an error. A second Reply to the same op is
-// fatal to the connection.
+// the chain has none. On FSKit, a short ReadFileOp reply becomes EIO; see
+// fuseops.ReadFileOp.BytesRead. A reply the kernel refuses with ENOENT,
+// because the request was interrupted, is not an error. A second Reply to the
+// same op is fatal to the connection.
 //
 // LOCKS_EXCLUDED(c.mu)
 func (c *Connection) Reply(ctx context.Context, opErr error) error {
@@ -698,6 +731,8 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 		return err
 	}
 
+	// Deferred before sizeReplyMu is taken below, so the callback runs after
+	// the lock is released.
 	defer func() {
 		// Invoke any callbacks set by the FUSE server after the response to the kernel is
 		// complete and before the inMessage and outMessage memory buffers have been freed.
@@ -710,6 +745,19 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 
 	if opErr == nil {
 		opErr = checkBytesRead(outMsg, op)
+	}
+
+	// Record growth before the reply reaches the kernel, which may act on it.
+	// A shrink waits until the kernel has the reply.
+	if c.reportedInodes != nil {
+		if changesReportedSizes(op) {
+			c.sizeReplyMu.Lock()
+			defer c.sizeReplyMu.Unlock()
+		} else if _, ok := op.(*fuseops.ReadFileOp); ok {
+			c.sizeReplyMu.RLock()
+			defer c.sizeReplyMu.RUnlock()
+		}
+		opErr = c.trackReportedSizes(state, opErr)
 	}
 
 	if opErr == nil {
@@ -733,6 +781,9 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 			return errors.New(writeErrMsg)
 		}
 		outMsg.Sglist = nil
+		if err == nil && c.reportedInodes != nil {
+			c.shrinkReportedSizes(op, opErr)
+		}
 	}
 
 	if c.wireLogger != nil {
@@ -747,8 +798,9 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	return nil
 }
 
-// checkBytesRead reports a BytesRead that the op's reply buffer cannot hold.
-// kernelResponseForOp would panic on it, after the op is marked replied.
+// checkBytesRead reports a BytesRead that the op's reply buffer, or its Dst,
+// cannot hold. kernelResponseForOp or the size tracker would panic on it,
+// after the op is marked replied.
 func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
 	// convertInMessage grows m by the size of the readdir and xattr buffers.
 	grown := m.Len() - buffer.OutMessageHeaderSize
@@ -762,10 +814,12 @@ func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
 				size += len(d)
 			}
 		}
+	// The reply is the grown segment, and the size tracker parses Dst, which
+	// a file system may have replaced.
 	case *fuseops.ReadDirOp:
-		n, size = o.BytesRead, grown
+		n, size = o.BytesRead, min(grown, len(o.Dst))
 	case *fuseops.ReadDirPlusOp:
-		n, size = o.BytesRead, grown
+		n, size = o.BytesRead, min(grown, len(o.Dst))
 	case *fuseops.GetXattrOp:
 		if len(o.Dst) == 0 {
 			// A size query: BytesRead is the size, not a length within Dst.

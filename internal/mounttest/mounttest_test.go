@@ -100,6 +100,23 @@ func TestMountingTestsAreGated(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("found no mounting tests; the scan is broken")
 	}
+
+	// A stale entry would exempt any later test that reuses its name.
+	declared := map[string]bool{}
+	for _, files := range filesByDir {
+		for _, file := range files {
+			for _, decl := range file.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil {
+					declared[fn.Name.Name] = true
+				}
+			}
+		}
+	}
+	for name := range mountFailureTests {
+		if !declared[name] {
+			t.Errorf("mountFailureTests lists %s, which no test file declares; remove it", name)
+		}
+	}
 }
 
 func TestUngatedMountsFindsIndirectMounts(t *testing.T) {
@@ -332,7 +349,6 @@ var mountFailureTests = map[string]string{
 	"TestMountContextReturnsAtOnceWhenContextEnded":                      "the context has ended",
 	"TestMountReturnsTypedFSKitErrors":                                   "the FSKit preflight fails",
 	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation fails",
-	"TestMountUsesMacFUSEForEveryFuseImpl":                               "the macFUSE mount helper is missing",
 	"TestMountBackendWinsOverTheDeprecatedOption":                        "the macFUSE mount helper is missing",
 	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
 	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",

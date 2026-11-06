@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,6 +146,22 @@ func TestCheckMacFUSEVersion(t *testing.T) {
 		if !errors.Is(err, ErrFSKitUnavailable) || !strings.Contains(err.Error(), test.version) {
 			t.Errorf("macFUSE %s: %v, want ErrFSKitUnavailable naming the version", test.version, err)
 		}
+	}
+}
+
+// The README states the macFUSE minimum that checkMacFUSEVersion enforces.
+func TestReadmeNamesMacFUSEMinimum(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := make([]string, len(fskitMinimumMacFUSE))
+	for i, part := range fskitMinimumMacFUSE {
+		parts[i] = strconv.Itoa(part)
+	}
+	minimum := strings.TrimSuffix(strings.Join(parts, "."), ".0")
+	if want := "macFUSE " + minimum + " or later"; !bytes.Contains(readme, []byte(want)) {
+		t.Errorf("README.md does not say %q", want)
 	}
 }
 
@@ -609,5 +626,14 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 				t.Errorf("unmount calls = %v, want none", f.unmounts)
 			}
 		})
+	}
+}
+
+// Without this, the connection would send short read replies on FSKit.
+func TestFSKitTransportPadsShortReads(t *testing.T) {
+	var transport connectionTransport = &fskitTransport{}
+	p, ok := transport.(shortReadPadder)
+	if !ok || !p.padsShortReads() {
+		t.Error("fskitTransport does not report that it pads short reads")
 	}
 }

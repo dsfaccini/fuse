@@ -39,6 +39,14 @@ type connectionTransport interface {
 	Close() error
 }
 
+// shortReadPadder is implemented by a transport on which the connection
+// replies EIO to a READ reply shorter than both the read and the inode's
+// reported size (https://github.com/macfuse/macfuse/issues/1231); see
+// Connection.trackReportedSizes.
+type shortReadPadder interface {
+	padsShortReads() bool
+}
+
 // fileTransport is a FUSE device: /dev/fuse on Linux, the macFUSE kernel
 // extension's device on darwin.
 type fileTransport struct {

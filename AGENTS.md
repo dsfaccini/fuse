@@ -28,7 +28,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   mounting test, push and read that job.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
-  fails the writes `Reply` makes.
+  fails the writes `Reply` makes. `newOpTestConnection` in
+  `short_reads_test.go` completes `Init` over it and drives ops through
+  `ReadOp` and `Reply`.
 - To pin that a path does not allocate, use `testing.AllocsPerRun`, as
   `transport_test.go` does. Take out-messages from `getOutMessage`. A zero
   `buffer.OutMessage` keeps no scratch, so each of its `Grow` calls allocates.
@@ -62,9 +64,11 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   no default-deny.
 - `Mount` force-unmounts a native mount it will not return, and
   `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
-  `unmountSyscall`, and FSKit's EPERM fallback runs `diskutilPath`. A test
-  that reaches them replaces those first: `recordUnmounts` in
-  `unmount_test.go` records the unmount(2) calls and answers them.
+  `unmountSyscall`. On EPERM, FSKit falls back to `diskutilPath`, and Linux
+  to the `fusermount3` or `fusermount` on `PATH`. A test that reaches them
+  replaces those first: `recordUnmounts` in `unmount_test.go` records the
+  unmount(2) calls and answers them, and `fakeFusermount` in
+  `unmount_linux_test.go` puts a recording `fusermount3` on `PATH`.
 - To test the macFUSE kernel extension path without a mount, call
   `useFakeMacFUSEMountHelper`. It points `macfuseMountHelper` at the test
   binary running `TestFakeMacFUSEMountHelper`, which `fakeMountHelper`
@@ -134,6 +138,37 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 - The kernel reply, the error log and the wire log all judge the errno that
   `Errno` finds. When `Errno` finds none, the kernel gets EIO and the wire-log
   `Status` stays 0.
+
+## Ops that return attributes feed the FSKit short-read check
+
+- On FSKit, `Connection` replies EIO to a `ReadFileOp` reply that ends before
+  both the read and the inode's size (macfuse#1231). That size is the larger of
+  the sizes recorded when the read arrived and when it is answered.
+- `short_reads.go` keeps a record for each inode the kernel holds through a
+  lookup. Entry replies create records and count lookups. Getattr and setattr
+  replies only update existing records. `trackReportedSizes` records growth
+  before a reply is written, and `shrinkReportedSizes` records a shrink after
+  the kernel has the reply. Each reply that can change a record holds the
+  write side of `sizeReplyMu` from recording its growth, through its write, to
+  recording its shrink, so records change in write order. A READ reply holds
+  the read side from its check through its write. Forgets change records too,
+  but write nothing and take neither side.
+- An op whose reply gains an inode's attributes must report them in
+  `forEachReportedSize`, with `lookup` true when the reply gives the kernel a
+  lookup, and must be listed in `changesReportedSizes`. A missed size goes
+  stale and fails reads inside it with EIO. A missed lookup lets a forget drop
+  the record while the kernel still holds the inode.
+
+## Wire structs have the host's layout
+
+- Size a wire struct with `unsafe.Sizeof` of its `fusekernel` type. Never sum
+  field widths by hand. On darwin, `Attr` carries crtime and flags, so `Attr`
+  and `EntryOut` are 16 bytes longer than on Linux.
+- Write a `fusekernel.Dirent` header as `fusekernel.DirentSize` bytes. Its
+  trailing `Name [0]byte` pads `unsafe.Sizeof` past the 24-byte header.
+- Check a layout against the C headers: Linux `include/uapi/linux/fuse.h`, and
+  `include/fuse_kernel.h` in `macfuse/library`, macFUSE's libfuse.
+  `fuseutil/dirent_test.go` parses READDIRPLUS replies by those headers.
 
 ## FSKit changes need a test that does not mount
 

@@ -237,19 +237,14 @@ type MountConfig struct {
 
 	// OS X only.
 	//
-	// The name of the mounted volume, as displayed in the Finder. If empty, a
-	// default name involving the string 'osxfuse' (the old name of macFUSE)
-	// is used.
+	// The name of the mounted volume, as displayed in the Finder. If empty,
+	// macFUSE picks a default name.
 	VolumeName string
-
-	// Deprecated: Mount ignores FuseImpl. On OS X it mounts through macFUSE,
-	// through the backend that Backend names.
-	FuseImpl FUSEImpl
 
 	// The mechanism to mount through. The zero value is the platform's
 	// default: BackendLinux on Linux, BackendMacFUSEKernelExtension on darwin.
-	// darwin also has BackendFSKit. Mount rejects a backend the platform
-	// lacks.
+	// darwin also has BackendFSKit; see FSKitAvailable for what it needs.
+	// Mount rejects a backend the platform lacks.
 	//
 	// Options["backend"] = "fskit" is a deprecated spelling of BackendFSKit.
 	// When Backend is set too, Backend wins. Either way, Mount does not pass
@@ -369,19 +364,6 @@ type MountConfig struct {
 	// to a value smaller than 256 pages).
 	MaxWrite uint32
 }
-
-// FUSEImpl is the type of MountConfig.FuseImpl. On OS X, Mount always mounts
-// through macFUSE.
-//
-// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
-type FUSEImpl uint8
-
-const (
-	// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
-	FUSEImplFuseT FUSEImpl = iota
-	// Deprecated: Mount ignores MountConfig.FuseImpl; leave it unset.
-	FUSEImplMacFUSE
-)
 
 // Create a map containing all of the key=value mount options to be given to
 // the mount helper.
