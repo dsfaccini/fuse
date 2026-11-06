@@ -49,7 +49,7 @@ func callErrno(raw uintptr) syscall.Errno {
 }
 
 // fskitAPI holds the addresses of the MFMount functions the FSKit transport
-// calls. The channel functions arrived in macFUSE 5.3.
+// calls.
 type fskitAPI struct {
 	channelCreate          uintptr
 	mount                  uintptr
