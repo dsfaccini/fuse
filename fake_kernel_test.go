@@ -197,12 +197,12 @@ func checkInitReply(t testing.TB, reply []byte) {
 // requests with server until the test ends. Package fuse_test uses it.
 func ServeFakeKernel(t *testing.T, server Server) *fakeKernel {
 	t.Helper()
-	return ServeFakeKernelLogging(t, server, nil)
+	return ServeFakeKernelWithLoggers(t, server, nil, nil)
 }
 
-// ServeFakeKernelLogging is ServeFakeKernel with errorLogger as the
-// connection's error logger.
-func ServeFakeKernelLogging(t *testing.T, server Server, errorLogger *log.Logger) *fakeKernel {
+// ServeFakeKernelWithLoggers is ServeFakeKernel with the connection's error
+// and debug loggers.
+func ServeFakeKernelWithLoggers(t *testing.T, server Server, errorLogger, debugLogger *log.Logger) *fakeKernel {
 	t.Helper()
 	cfg, err := (&MountConfig{}).normalize()
 	if err != nil {
@@ -210,7 +210,7 @@ func ServeFakeKernelLogging(t *testing.T, server Server, errorLogger *log.Logger
 	}
 	k := newFakeKernel()
 	k.Send(fakeInit()...)
-	c, err := newConnection(cfg, nil, errorLogger, nil, k)
+	c, err := newConnection(cfg, debugLogger, errorLogger, nil, k)
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
 	}

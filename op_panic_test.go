@@ -16,6 +16,7 @@ package fuse_test
 
 import (
 	"log"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -27,7 +28,7 @@ import (
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
-// logLines hands each line a log.Logger writes to the test.
+// logLines hands each entry a log.Logger writes to the test.
 type logLines chan string
 
 func (l logLines) Write(p []byte) (int, error) {
@@ -41,7 +42,7 @@ func (l logLines) next(t *testing.T) string {
 	case line := <-l:
 		return line
 	case <-time.After(5 * time.Second):
-		t.Fatal("no error log line within 5s")
+		t.Fatal("no log line within 5s")
 		return ""
 	}
 }
@@ -63,18 +64,18 @@ func checkNoMoreLogs(t *testing.T, lines logLines) {
 	}
 }
 
-// servePanicking serves the ops in panics through a file system that calls
-// the op's function, and answers a getattr with attrs.
-func servePanicking(t *testing.T, panics func(op any) error) (fakeKernel, logLines) {
+// servePanicking serves through a file system that answers a getattr with
+// attrs and hands every other op to handle.
+func servePanicking(t *testing.T, handle func(op any) error) (fakeKernel, logLines) {
 	lines := make(logLines, 10)
 	fs := &protocolFS{serve: func(op any) error {
 		if o, ok := op.(*fuseops.GetInodeAttributesOp); ok {
 			o.Attributes = attrs
 			return nil
 		}
-		return panics(op)
+		return handle(op)
 	}}
-	k := fuse.ServeFakeKernelLogging(t, fuseutil.NewFileSystemServer(fs), log.New(lines, "", 0))
+	k := fuse.ServeFakeKernelWithLoggers(t, fuseutil.NewFileSystemServer(fs), log.New(lines, "", 0), nil)
 	return k, lines
 }
 
@@ -109,6 +110,41 @@ func TestHandlerPanicIsAnsweredWithEIO(t *testing.T) {
 				t.Errorf("the connection sent %d more replies, want none", n)
 			}
 		})
+	}
+}
+
+func TestHandlerGoexitIsAnsweredWithEIO(t *testing.T) {
+	k, lines := servePanicking(t, func(any) error {
+		runtime.Goexit()
+		return nil
+	})
+	k.Send(request(fusekernel.OpLookup, parent, names("file"))...)
+	checkReply(t, k.NextReply(t), syscall.EIO, nil)
+	if line := lines.next(t); !strings.Contains(line, "exited without returning") {
+		t.Errorf("error log = %q, want the method's exit", line)
+	}
+	checkStillServing(t, k)
+	checkNoMoreLogs(t, lines)
+}
+
+// With no ErrorLogger, a Callback panic goes to the DebugLogger, as a
+// handler panic does.
+func TestCallbackPanicGoesToTheDebugLogger(t *testing.T) {
+	lines := make(logLines, 10)
+	fs := &protocolFS{serve: func(op any) error {
+		o := op.(*fuseops.ReadFileOp)
+		o.Callback = func() { panic("callback boom") }
+		return nil
+	}}
+	k := fuse.ServeFakeKernelWithLoggers(t, fuseutil.NewFileSystemServer(fs), nil, log.New(lines, "", 0))
+	k.Send(request(fusekernel.OpRead, child, fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Size: 16}))...)
+	checkReply(t, k.NextReply(t), 0, nil)
+	for {
+		line := lines.next(t)
+		if strings.Contains(line, "Callback: panic: callback boom") {
+			checkPanicLogged(t, line, "callback boom")
+			return
+		}
 	}
 }
 

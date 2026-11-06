@@ -712,26 +712,10 @@ func (c *Connection) Reply(ctx context.Context, opErr error) error {
 		opErr = checkBytesRead(outMsg, op)
 	}
 
-	logError := c.shouldLogError(op, opErr)
-
-	// Debug logging
-	if c.debugLogger != nil {
-		if opErr == nil {
-			c.debugLog(fuseID, 1, "-> %s", describeResponse(op))
-		} else {
-			if !logError {
-				c.debugLog(fuseID, 1, "-> Error: %q", opErr)
-			}
-		}
-	}
-
-	// Error logging
-	if logError {
-		if p, ok := opErr.(*operror.Panic); ok {
-			c.errorLogger.Printf("Op 0x%08x %T] -> Error: panic: %v\n%s", fuseID, op, p.Value, p.Stack)
-		} else {
-			c.errorLogger.Printf("Op 0x%08x %T] -> Error: %q", fuseID, op, opErr)
-		}
+	if opErr == nil {
+		c.debugLog(fuseID, 1, "-> %s", describeResponse(op))
+	} else {
+		c.logOpError(fuseID, op, "Error", opErr)
 	}
 
 	// Send the reply to the kernel, if one is required.
@@ -803,18 +787,34 @@ func checkBytesRead(m *buffer.OutMessage, op interface{}) error {
 }
 
 // runCallback runs op's Callback. The op is already answered, so a panic in
-// the callback goes to the error logger instead of out of Reply.
+// the callback is logged instead of leaving Reply.
 func (c *Connection) runCallback(fuseID uint64, op interface{}) {
 	callback := c.callbackForOp(op)
 	if callback == nil {
 		return
 	}
 	defer func() {
-		if r := recover(); r != nil && c.errorLogger != nil {
-			c.errorLogger.Printf("Op 0x%08x %T] -> Callback panic: %v\n%s", fuseID, op, r, debug.Stack())
+		if r := recover(); r != nil {
+			c.logOpError(fuseID, op, "Callback", &operror.Panic{Value: r, Stack: debug.Stack()})
 		}
 	}()
 	callback()
+}
+
+// logOpError logs an op's error to the error logger, or to the debug logger
+// when shouldLogError skips it. An operror.Panic is logged with its stack.
+func (c *Connection) logOpError(fuseID uint64, op interface{}, label string, opErr error) {
+	p, isPanic := opErr.(*operror.Panic)
+	switch {
+	case c.shouldLogError(op, opErr) && isPanic:
+		c.errorLogger.Printf("Op 0x%08x %T] -> %s: panic: %v\n%s", fuseID, op, label, p.Value, p.Stack)
+	case c.shouldLogError(op, opErr):
+		c.errorLogger.Printf("Op 0x%08x %T] -> %s: %q", fuseID, op, label, opErr)
+	case isPanic:
+		c.debugLog(fuseID, 1, "-> %s: panic: %v\n%s", label, p.Value, p.Stack)
+	default:
+		c.debugLog(fuseID, 1, "-> %s: %q", label, opErr)
+	}
 }
 
 func (c *Connection) callbackForOp(op interface{}) func() {

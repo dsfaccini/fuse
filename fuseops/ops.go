@@ -752,8 +752,8 @@ type ReadFileOp struct {
 
 	// If set, this function will be invoked after the operation response has been
 	// sent to the kernel and before the buffers containing the response data are
-	// freed. Reply recovers a panic in it and logs the panic to
-	// MountConfig.ErrorLogger.
+	// freed. Reply recovers a panic in it and logs the panic with its stack,
+	// where it logs an op's error.
 	Callback func()
 }
 
@@ -819,8 +819,8 @@ type WriteFileOp struct {
 
 	// If set, this function will be invoked after the operation response has been
 	// sent to the kernel and before the buffers containing the response data are
-	// freed. Reply recovers a panic in it and logs the panic to
-	// MountConfig.ErrorLogger.
+	// freed. Reply recovers a panic in it and logs the panic with its stack,
+	// where it logs an op's error.
 	Callback func()
 }
 

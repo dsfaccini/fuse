@@ -61,8 +61,9 @@ type MountConfig struct {
 	//
 	// It also receives, with its stack, each panic that fuseutil recovers
 	// from a FileSystem method, and each panic from a ReadFileOp or
-	// WriteFileOp Callback. It receives each BytesRead that does not fit its
-	// op's buffer, which the op answers with EIO.
+	// WriteFileOp Callback. It receives each method that fuseutil saw exit
+	// through runtime.Goexit, and each BytesRead that does not fit its op's
+	// buffer. fuseutil answers those ops with EIO.
 	ErrorLogger *log.Logger
 
 	// A logger to use for logging debug information. If nil, no debug logging is

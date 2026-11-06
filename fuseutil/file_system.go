@@ -16,8 +16,10 @@ package fuseutil
 
 import (
 	"context"
+	"fmt"
 	"runtime/debug"
 	"sync"
+	"syscall"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -32,9 +34,10 @@ import (
 // The FileSystem implementation should not call Connection.Reply, instead
 // returning the error with which the caller should respond.
 //
-// A panic in a method is recovered and answered with EIO. The panic value
-// and its stack go to MountConfig.ErrorLogger. The server keeps serving other
-// ops, but a lock the method held when it panicked stays held.
+// A panic in a method other than Destroy is recovered and answered with EIO,
+// and so is a method that calls runtime.Goexit. The panic value and its stack
+// go to MountConfig.ErrorLogger. The server keeps serving other ops, but a
+// lock the method held when it panicked stays held.
 //
 // See NotImplementedFileSystem for a convenient way to embed default
 // implementations for methods you don't care about.
@@ -96,6 +99,8 @@ func NewFileSystemServer(fs FileSystem) fuse.Server {
 	}
 }
 
+var errExitedWithoutReply = fmt.Errorf("fuseutil: the method exited without returning: %w", syscall.EIO)
+
 type fileSystemServer struct {
 	fs          FileSystem
 	opsInFlight sync.WaitGroup
@@ -137,7 +142,9 @@ func (s *fileSystemServer) handleOp(
 	defer s.opsInFlight.Done()
 
 	// A panic inside Reply comes after the op is answered, and a second Reply
-	// is fatal to the connection, so only a panic before Reply is answered.
+	// is fatal to the connection, so only an op that never reached Reply is
+	// answered here. recover returns nil when the method called
+	// runtime.Goexit.
 	replied := false
 	defer func() {
 		if replied {
@@ -145,6 +152,8 @@ func (s *fileSystemServer) handleOp(
 		}
 		if r := recover(); r != nil {
 			c.Reply(ctx, &operror.Panic{Value: r, Stack: debug.Stack()})
+		} else {
+			c.Reply(ctx, errExitedWithoutReply)
 		}
 	}()
 
