@@ -144,7 +144,7 @@ func (m *deviceMount) waitMounted() error {
 	return m.mountErr
 }
 
-// cancel does nothing: a read of the device cannot be interrupted.
+// cancel does nothing: MountContext does not interrupt a device read.
 func (m *deviceMount) cancel() {}
 
 var _ nativeMount = (*deviceMount)(nil)

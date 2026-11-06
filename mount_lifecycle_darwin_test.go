@@ -221,14 +221,14 @@ func fakeDiskutil(t *testing.T) string {
 	return argsFile
 }
 
-// fakeMountHelperExit makes the test binary act as mount_macfuse: it passes
-// back /dev/null as the device, then exits with the status the variable
-// holds.
-const fakeMountHelperExit = "FUSE_TEST_FAKE_MOUNT_HELPER_EXIT"
+// fakeMountHelper makes the test binary act as mount_macfuse. Its value is
+// "<result>,<exit status>": the helper passes back /dev/null as the device,
+// sends result as its mount result unless result is "-", and exits.
+const fakeMountHelper = "FUSE_TEST_FAKE_MOUNT_HELPER"
 
 func TestFakeMacFUSEMountHelper(t *testing.T) {
-	code, err := strconv.Atoi(os.Getenv(fakeMountHelperExit))
-	if err != nil {
+	result, exit, ok := strings.Cut(os.Getenv(fakeMountHelper), ",")
+	if !ok {
 		t.Skip("runs only as the fake mount helper")
 	}
 	dev, err := os.Open(os.DevNull)
@@ -238,10 +238,24 @@ func TestFakeMacFUSEMountHelper(t *testing.T) {
 	if err := unix.Sendmsg(3, []byte{0}, unix.UnixRights(int(dev.Fd())), nil, 0); err != nil {
 		os.Exit(101)
 	}
+	if result != "-" {
+		status, err := strconv.Atoi(result)
+		if err != nil {
+			os.Exit(102)
+		}
+		value := int32(status)
+		if _, err := unix.Write(3, NativeBytes(&value)); err != nil {
+			os.Exit(103)
+		}
+	}
+	code, err := strconv.Atoi(exit)
+	if err != nil {
+		os.Exit(104)
+	}
 	os.Exit(code)
 }
 
-func TestKernelExtensionMountReportsTheHelperExitStatus(t *testing.T) {
+func TestKernelExtensionMountReportsTheHelperResult(t *testing.T) {
 	helper := filepath.Join(t.TempDir(), "mount_macfuse")
 	script := "#!/bin/sh\nexec '" + os.Args[0] + "' -test.run='^TestFakeMacFUSEMountHelper$'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
@@ -252,22 +266,43 @@ func TestKernelExtensionMountReportsTheHelperExitStatus(t *testing.T) {
 	t.Cleanup(func() { macfuseMountHelper = old })
 
 	for _, test := range []struct {
-		name string
-		exit int
+		name   string
+		helper string
+		// check reports whether Mount's error is the helper's failure. Nil
+		// means the helper mounted.
+		check func(error) bool
 	}{
-		{name: "helper fails", exit: 3},
-		{name: "helper succeeds", exit: 0},
+		{
+			name:   "mount(2) fails",
+			helper: "13,0",
+			check:  func(err error) bool { return errors.Is(err, syscall.EACCES) },
+		},
+		{
+			name:   "unknown failure",
+			helper: "-1,0",
+			check:  func(err error) bool { return err != nil && strings.Contains(err.Error(), "status -1") },
+		},
+		{
+			name:   "no result, exit status",
+			helper: "-,3",
+			check: func(err error) bool {
+				var exitErr *exec.ExitError
+				return errors.As(err, &exitErr) && exitErr.ExitCode() == 3
+			},
+		},
+		// The result wins over the exit status.
+		{name: "mounted", helper: "0,3"},
+		{name: "mounted, no result", helper: "-,0"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(fakeMountHelperExit, strconv.Itoa(test.exit))
+			t.Setenv(fakeMountHelper, test.helper)
 			unmounts := recordUnmounts(t, nil)
 			dir := t.TempDir()
 			// The device is /dev/null, so INIT fails.
 			_, err := Mount(dir, drainServer{}, &MountConfig{})
-			if test.exit != 0 {
-				var exitErr *exec.ExitError
-				if !errors.As(err, &exitErr) || exitErr.ExitCode() != test.exit {
-					t.Errorf("Mount error = %v, want the helper's exit status %d", err, test.exit)
+			if test.check != nil {
+				if !test.check(err) || !strings.HasPrefix(err.Error(), "mount (background): ") {
+					t.Errorf("Mount error = %v, want the helper's failure", err)
 				}
 				if got := unmounts(); len(got) != 0 {
 					t.Errorf("unmount calls = %v, want none after the helper failed", got)

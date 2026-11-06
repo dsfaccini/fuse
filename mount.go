@@ -16,8 +16,10 @@ package fuse
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -250,8 +252,8 @@ func checkMountPoint(dir string) error {
 
 // fusermount runs binary, a mount helper, and returns the device it passes
 // back. With wait set, the helper has exited by then. Otherwise fusermount
-// also returns a function that waits for the helper to exit and returns an
-// error when it fails.
+// also returns a function that waits for the helper's mount result; see
+// mountHelperResult.
 func fusermount(binary string, argv []string, additionalEnv []string, wait bool, debugLogger *log.Logger) (_ *os.File, waitHelper func() error, err error) {
 	if debugLogger != nil {
 		debugLogger.Println("Creating a socket pair")
@@ -292,16 +294,10 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 		return nil, nil, fmt.Errorf("running %v: %v", binary, err)
 	}
 	if !wait {
-		waitHelper = func() error {
-			if err := cmd.Wait(); err != nil {
-				return fmt.Errorf("%s: %w", binary, err)
-			}
-			return nil
-		}
 		defer func() {
 			if err != nil {
 				// Reap the helper.
-				go waitHelper()
+				go cmd.Wait()
 			}
 		}()
 	}
@@ -314,7 +310,13 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 	if err != nil {
 		return nil, nil, fmt.Errorf("FileConn: %v", err)
 	}
-	defer c.Close()
+	// Without wait, the helper sends its mount result on the socket later.
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			c.Close()
+		}
+	}()
 
 	if debugLogger != nil {
 		debugLogger.Println("Checking that we have a unix domain socket")
@@ -329,7 +331,9 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 		debugLogger.Println("Read a message from socket")
 	}
 	// Read a message.
-	buf := make([]byte, 32) // expect 1 byte
+	// Read only the byte that carries the descriptor, so that the mount
+	// result the helper sends next stays on the socket.
+	buf := make([]byte, 1)
 	oob := make([]byte, 32) // expect 24 bytes
 	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
 	if err != nil {
@@ -367,5 +371,34 @@ func fusermount(binary string, argv []string, additionalEnv []string, wait bool,
 		debugLogger.Println("Converting FD into os.File")
 	}
 	// Turn the FD into an os.File.
+	if !wait {
+		keepConn = true
+		waitHelper = func() error {
+			defer c.Close()
+			return mountHelperResult(binary, uc, cmd)
+		}
+	}
 	return os.NewFile(uintptr(gotFds[0]), "/dev/fuse"), waitHelper, nil
+}
+
+// mountHelperResult reads the mount result that a macFUSE mount helper sends
+// on its socket once mount(2) returns, as macFUSE's libfuse does, and reaps
+// the helper. With _FUSE_COMMVERS=2 the result is a native-endian int32: 0
+// for success, an errno, or -1 for an unknown failure. A helper that sends no
+// result reports through its exit status.
+func mountHelperResult(helper string, conn io.Reader, cmd *exec.Cmd) error {
+	var status int32
+	readErr := binary.Read(conn, binary.NativeEndian, &status)
+	waitErr := cmd.Wait()
+	switch {
+	case readErr == nil && status == 0:
+		return nil
+	case readErr == nil && status > 0:
+		return fmt.Errorf("%s: mount(2): %w", helper, syscall.Errno(status))
+	case readErr == nil:
+		return fmt.Errorf("%s: mount failed with status %d", helper, status)
+	case waitErr != nil:
+		return fmt.Errorf("%s: %w", helper, waitErr)
+	}
+	return nil
 }
