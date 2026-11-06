@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -48,6 +49,17 @@ func makeOpMessage(opcode uint32, unique, nodeid uint64, body ...[]byte) []byte 
 	return message
 }
 
+// normalizedConfig fills in cfg's defaults, as Mount does before it creates
+// the connection.
+func normalizedConfig(t *testing.T, cfg MountConfig) MountConfig {
+	t.Helper()
+	normalized, err := cfg.normalize()
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	return normalized
+}
+
 // opTestConnection completes Init over a testTransport, then drives ops
 // through ReadOp and Reply as a file system server would.
 type opTestConnection struct {
@@ -66,7 +78,7 @@ func newOpTestConnection(t *testing.T, padsShortReads bool) *opTestConnection {
 		kernel = paddingTestTransport{transport}
 	}
 	// One page of write payload keeps each in-flight message small.
-	cfg := MountConfig{OpContext: context.Background(), MaxWrite: uint32(buffer.GetPageSize())}
+	cfg := normalizedConfig(t, MountConfig{MaxWrite: uint32(buffer.GetPageSize())})
 	c, err := newConnection(cfg, nil, nil, nil, kernel)
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
@@ -417,7 +429,7 @@ func newHookTestConnection(t *testing.T, padsShortReads bool) (*opTestConnection
 	init := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
 	transport := &testTransport{messages: [][]byte{makeOpMessage(fusekernel.OpInit, 1, 0, structBytes(&init))}}
 	hooks := &hookTransport{testTransport: transport, pads: padsShortReads}
-	c, err := newConnection(MountConfig{OpContext: context.Background()}, nil, nil, nil, hooks)
+	c, err := newConnection(normalizedConfig(t, MountConfig{}), nil, nil, nil, hooks)
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
 	}
@@ -756,7 +768,7 @@ func TestSizeChangeHoldsWriteSideThroughShrink(t *testing.T) {
 	init := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
 	transport := &testTransport{messages: [][]byte{makeOpMessage(fusekernel.OpInit, 1, 0, structBytes(&init))}}
 	wireLog := &heldSizeReplyMuLog{t: t}
-	c, err := newConnection(MountConfig{OpContext: context.Background()}, nil, nil, wireLog, paddingTestTransport{transport})
+	c, err := newConnection(normalizedConfig(t, MountConfig{}), nil, nil, wireLog, paddingTestTransport{transport})
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
 	}
@@ -891,6 +903,20 @@ func TestDirentPlusDotEntriesIgnored(t *testing.T) {
 	}
 	if errno, _ := o.read(3, 0, 512, 299); errno != syscall.EIO {
 		t.Errorf("short read of a dot-prefixed entry = errno %d, want EIO", errno)
+	}
+}
+
+// A file system can write any Namelen. One past the reply ends the entries.
+func TestDirentPlusNamelenPastReply(t *testing.T) {
+	huge := direntPlus(3, 300, "f")
+	binary.NativeEndian.PutUint32(huge[unsafe.Sizeof(fusekernel.EntryOut{})+unsafe.Offsetof(fusekernel.Dirent{}.Namelen):], math.MaxUint32)
+	o := newOpTestConnection(t, true)
+	o.readDirPlus(direntPlus(2, 100, "f"), huge)
+	if errno, _ := o.read(2, 0, 512, 99); errno != syscall.EIO {
+		t.Errorf("short read of the entry before = errno %d, want EIO", errno)
+	}
+	if errno, n := o.read(3, 0, 512, 46); errno != 0 || n != 46 {
+		t.Errorf("read of the entry with a Namelen past the reply = errno %d with %d bytes, want 46 bytes", errno, n)
 	}
 }
 

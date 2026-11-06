@@ -190,16 +190,17 @@ func forEachDirentPlus(b []byte, f func(inode fuseops.InodeID, size uint64)) {
 		alignment     = 8
 	)
 	for len(b) >= headerSize {
-		namelen := int(binary.NativeEndian.Uint32(b[namelenOffset:]))
-		n := (headerSize + namelen + alignment - 1) &^ (alignment - 1)
-		if n > len(b) {
+		// uint64 keeps a Namelen near 2^32 from overflowing int on 32-bit.
+		namelen := uint64(binary.NativeEndian.Uint32(b[namelenOffset:]))
+		reclen := (uint64(headerSize) + namelen + alignment - 1) &^ (alignment - 1)
+		if reclen > uint64(len(b)) {
 			return
 		}
 
-		if name := string(b[headerSize : headerSize+namelen]); name != "." && name != ".." {
+		if name := string(b[headerSize : uint64(headerSize)+namelen]); name != "." && name != ".." {
 			f(fuseops.InodeID(binary.NativeEndian.Uint64(b)), binary.NativeEndian.Uint64(b[sizeOffset:]))
 		}
-		b = b[n:]
+		b = b[reclen:]
 	}
 }
 
