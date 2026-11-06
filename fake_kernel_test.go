@@ -41,7 +41,7 @@ type fakeKernel struct {
 	// interrupts counts Interrupt calls. A read fails with EINTR when it
 	// changes while the read waits.
 	interrupts int
-	replies     chan []byte
+	replies    chan []byte
 }
 
 // fakeRead is one read of the channel: a request's body buffers, or an errno.
