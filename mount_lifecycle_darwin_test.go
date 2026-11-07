@@ -295,6 +295,73 @@ func TestKernelExtensionUnmountKeepsEPERM(t *testing.T) {
 	}
 }
 
+func TestUnmountByPathFallsBackToDiskutilOnlyOnFSKit(t *testing.T) {
+	// The mount table holds the mount point's real path, and Unmount gets one
+	// through a symlink.
+	real, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(link, "mnt")
+	for _, test := range []struct {
+		name         string
+		mounted      string
+		flagsExt     uint32
+		wantDiskutil bool
+	}{
+		{name: "FSKit", mounted: filepath.Join(real, "mnt"), flagsExt: mntExtFSKit, wantDiskutil: true},
+		{name: "kernel extension", mounted: filepath.Join(real, "mnt")},
+		{name: "FSKit at another mount point", mounted: filepath.Join(real, "other"), flagsExt: mntExtFSKit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			unmounts := recordUnmounts(t, func(int) error { return syscall.EPERM })
+			argsFile := fakeDiskutil(t)
+			var volume unix.Statfs_t
+			copy(volume.Fstypename[:], "macfuse")
+			copy(volume.Mntonname[:], test.mounted)
+			volume.Flags_ext = test.flagsExt
+			fakeMountTable(t, volume)
+			err := Unmount(dir)
+			if got := unmounts(); len(got) != 1 || got[0] != (fakeUnmount{dir, 0}) {
+				t.Errorf("unmount calls = %v, want [{%s 0}]", got, dir)
+			}
+			args, readErr := os.ReadFile(argsFile)
+			if !test.wantDiskutil {
+				if !errors.Is(err, syscall.EPERM) {
+					t.Errorf("Unmount error = %v, want EPERM", err)
+				}
+				if readErr == nil {
+					t.Errorf("diskutil ran with args %q", args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unmount: %v", err)
+			}
+			if want := "unmount\n" + dir + "\n"; string(args) != want {
+				t.Errorf("diskutil args = %q (read error: %v), want %q", args, readErr, want)
+			}
+		})
+	}
+}
+
+// fakeMountTable makes the mount table hold only volumes until the test ends.
+func fakeMountTable(t *testing.T, volumes ...unix.Statfs_t) {
+	t.Helper()
+	old := getfsstat
+	getfsstat = func(buf []unix.Statfs_t, _ int) (int, error) {
+		if buf == nil {
+			return len(volumes), nil
+		}
+		return copy(buf, volumes), nil
+	}
+	t.Cleanup(func() { getfsstat = old })
+}
+
 // fakeDiskutil points diskutilPath at a script that records its arguments,
 // one per line, in the returned file.
 func fakeDiskutil(t *testing.T) string {

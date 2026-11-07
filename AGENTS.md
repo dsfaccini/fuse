@@ -63,12 +63,16 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   path. If you cannot tell, do not run it. Packages other than the root have
   no default-deny.
 - `Mount` force-unmounts a native mount it will not return, and
-  `MountedFileSystem.Unmount` unmounts through `unmountBackend`. Both call
-  `unmountSyscall`. On EPERM, FSKit falls back to `diskutilPath`, and Linux
-  to the `fusermount3` or `fusermount` on `PATH`. A test that reaches them
-  replaces those first: `recordUnmounts` in `unmount_test.go` records the
-  unmount(2) calls and answers them, and `fakeFusermount` in
-  `unmount_linux_test.go` puts a recording `fusermount3` on `PATH`.
+  `MountedFileSystem.Unmount` and `Unmount(dir)` unmount through
+  `unmountBackend`. All three call `unmountSyscall`. On EPERM, FSKit falls
+  back to `diskutilPath`, and Linux to the `fusermount3` or `fusermount` on
+  `PATH`. A test that reaches them replaces those first: `recordUnmounts` in
+  `unmount_test.go` records the unmount(2) calls and answers them, and
+  `fakeFusermount` in `unmount_linux_test.go` puts a recording `fusermount3`
+  on `PATH`.
+- On darwin, `Unmount(dir)` finds an FSKit volume by the `MNT_EXT_FSKIT` bit
+  of its mount table entry, read through `getfsstat`. To test it, fake the
+  mount table with `fakeMountTable` in `mount_lifecycle_darwin_test.go`.
 - To test the macFUSE kernel extension path without a mount, call
   `useFakeMacFUSEMountHelper`. It points `macfuseMountHelper` at the test
   binary running `TestFakeMacFUSEMountHelper`, which `fakeMountHelper`
