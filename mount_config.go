@@ -67,6 +67,25 @@ type MountConfig struct {
 	// It receives each panic from a ReadFileOp or WriteFileOp Callback, with
 	// its stack. The Callback runs after the reply is sent, so the panic is
 	// only logged.
+	//
+	// It receives an op's error as one entry, which fmt formats as
+	//
+	//	"Op 0x%08x %T] -> %s: %q", requestID, op, label, err
+	//
+	// and an op's panic as
+	//
+	//	"Op 0x%08x %T] -> %s: panic: %v\n%s", requestID, op, label, value, stack
+	//
+	// label is "Callback" for a panic in a Callback, and "Error" otherwise.
+	// The library's own errors, for a method that exited through
+	// runtime.Goexit, a BytesRead that does not fit its buffer, and a short
+	// read on FSKit (see fuseops.ReadFileOp.BytesRead), read:
+	//
+	//	fuseutil: the method exited without returning: input/output error
+	//	%T.BytesRead is %d, outside its %d-byte buffer: input/output error
+	//	read of inode %d at offset %d returned %d bytes, want %d for size %d: input/output error
+	//
+	// Other entries, such as a failed reply write, have no fixed form.
 	ErrorLogger *log.Logger
 
 	// A logger to use for logging debug information. If nil, no debug logging is
