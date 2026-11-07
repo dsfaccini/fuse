@@ -26,6 +26,11 @@ var errDiskutilUnmount = errors.New("diskutil unmount")
 // supplied directory.
 // For external mountpoints (like /dev/fd/N), it returns ErrExternallyManagedMountPoint
 // for unsuccessful unmount attempt.
+//
+// On darwin, Unmount reads the mount table to learn whether dir is an FSKit
+// volume, which mount(8) lists with the "fskit" option. It then unmounts as
+// MountedFileSystem.Unmount does on that backend, but tries once and never
+// forces.
 func Unmount(dir string) error {
 	return unmount(dir)
 }

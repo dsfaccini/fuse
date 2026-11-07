@@ -2298,19 +2298,6 @@ func within(d time.Duration, f func() error) error {
 	}
 }
 
-// mountTable reads the mounted volumes without touching any of them.
-func mountTable() ([]unix.Statfs_t, error) {
-	n, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
-	if err != nil {
-		return nil, err
-	}
-	stats := make([]unix.Statfs_t, n+16)
-	if n, err = unix.Getfsstat(stats, unix.MNT_NOWAIT); err != nil {
-		return nil, err
-	}
-	return stats[:n], nil
-}
-
 // mountedVolume finds the volume mounted at dir. Each probe mount point has a
 // unique name, which also matches a mount table entry that spells the path
 // differently.
