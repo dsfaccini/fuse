@@ -942,8 +942,8 @@ func (m *probeMount) measureInterrupt() {
 
 // measure1231FirstRead checks macfuse#1231 on the first read of a file whose
 // data FSKit has not cached: the server reports 8192 bytes and answers READ
-// with 100 bytes and no error. The test fails once the read returns only those
-// 100 bytes, or fails with EIO.
+// with 100 bytes and no error. Two probe runs on macFUSE 5.5.0 measured the
+// read failing with EIO, so the case expects fails_read.
 func (m *probeMount) measure1231FirstRead() {
 	const name, reported, sent = "short_read", 8192, 100
 	mark := m.log.mark()
@@ -981,7 +981,7 @@ func (m *probeMount) measure1231Reread() {
 }
 
 // report1231 reports a macfuse#1231 case, and fails the test when the read
-// measured the fix.
+// measured a result the case does not expect.
 func (m *probeMount) report1231(item string, sent, got int, err error, replies []probeEvent, details map[string]string) {
 	m.t.Helper()
 	result := shortReadResult(sent, got, err, replies)
@@ -992,13 +992,39 @@ func (m *probeMount) report1231(item string, sent, got int, err error, replies [
 	details["library_errors"] = yesNo(slices.ContainsFunc(replies, isLibraryError))
 	details["empty_replies"] = yesNo(slices.ContainsFunc(replies, isEmptyReply))
 	m.report(item, result, details)
-	fixed := "%s: FSKit no longer returns the reported size for a %d-byte READ reply, so macfuse#1231 looks fixed (%s): make this case expect the fix, and revisit the workarounds for it"
-	switch result {
-	case "fails_read":
-		m.t.Errorf(fixed, item, sent, "the read fails with EIO")
-	case "not_padded":
-		m.t.Errorf(fixed, item, sent, "the read returns only the reply")
+	if failure := macfuse1231Failure(item, sent, result); failure != "" {
+		m.t.Error(failure)
 	}
+}
+
+// macfuse1231Expected is the result each macfuse#1231 case expects: EIO on the
+// first read, and the reported size on the reread, as macfuse#1231 reports.
+var macfuse1231Expected = map[string]string{
+	"macfuse_1231_first_read": "fails_read",
+	"macfuse_1231_reread":     "padded",
+}
+
+// shortReadOutcomes describes each measured shortReadResult.
+var shortReadOutcomes = map[string]string{
+	"padded":     "the read returns the reported size",
+	"not_padded": "the read returns only the reply",
+	"fails_read": "the read fails with EIO",
+}
+
+// macfuse1231Failure returns the message that fails the test when a
+// macfuse#1231 case measures result, or "" when the case passes. A case passes
+// on its expected result and on unknown. sent is the READ reply's size.
+func macfuse1231Failure(item string, sent int, result string) string {
+	expected, ok := macfuse1231Expected[item]
+	switch {
+	case !ok:
+		return fmt.Sprintf("%s: no expected result for this macfuse#1231 case", item)
+	case result == "unknown" || result == expected:
+		return ""
+	case expected == "padded":
+		return fmt.Sprintf("%s: FSKit no longer returns the reported size for a %d-byte READ reply, so macfuse#1231 looks fixed (%s): make this case expect the fix, and revisit the workarounds for it", item, sent, shortReadOutcomes[result])
+	}
+	return fmt.Sprintf("%s: a %d-byte READ reply measured %s (%s), and this case expects %s: update the case to expect %s", item, sent, result, shortReadOutcomes[result], expected, result)
 }
 
 // shortReadResult judges one read(2) of a file whose READ replies carried sent
@@ -2468,6 +2494,28 @@ func TestFSKitProbeShortReadResult(t *testing.T) {
 	} {
 		if got := shortReadResult(sent, test.got, test.err, test.replies); got != test.want {
 			t.Errorf("%s: shortReadResult = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+func TestFSKitProbe1231Expectations(t *testing.T) {
+	const sent = 100
+	const first, reread = "macfuse_1231_first_read", "macfuse_1231_reread"
+	for _, test := range []struct {
+		item, result, want string
+	}{
+		{first, "fails_read", ""},
+		{first, "unknown", ""},
+		{first, "padded", "macfuse_1231_first_read: a 100-byte READ reply measured padded (the read returns the reported size), and this case expects fails_read: update the case to expect padded"},
+		{first, "not_padded", "macfuse_1231_first_read: a 100-byte READ reply measured not_padded (the read returns only the reply), and this case expects fails_read: update the case to expect not_padded"},
+		{reread, "padded", ""},
+		{reread, "unknown", ""},
+		{reread, "fails_read", "macfuse_1231_reread: FSKit no longer returns the reported size for a 100-byte READ reply, so macfuse#1231 looks fixed (the read fails with EIO): make this case expect the fix, and revisit the workarounds for it"},
+		{reread, "not_padded", "macfuse_1231_reread: FSKit no longer returns the reported size for a 100-byte READ reply, so macfuse#1231 looks fixed (the read returns only the reply): make this case expect the fix, and revisit the workarounds for it"},
+		{"macfuse_1231", "padded", "macfuse_1231: no expected result for this macfuse#1231 case"},
+	} {
+		if got := macfuse1231Failure(test.item, sent, test.result); got != test.want {
+			t.Errorf("macfuse1231Failure(%s, %s) = %q, want %q", test.item, test.result, got, test.want)
 		}
 	}
 }
