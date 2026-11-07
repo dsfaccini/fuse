@@ -572,7 +572,7 @@ type ReleaseIn struct {
 	Fh           uint64
 	Flags        uint32
 	ReleaseFlags uint32
-	LockOwner    uint32
+	LockOwner    uint64
 }
 
 type FlushIn struct {

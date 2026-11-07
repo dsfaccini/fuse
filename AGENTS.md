@@ -44,11 +44,18 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - To check what the connection logs to `MountConfig.ErrorLogger` or
   `DebugLogger`, serve through `ServeFakeKernelWithLoggers` in
   `fake_kernel_test.go`.
+- To serve with other `MountConfig` fields, such as `OpContext` or the INIT
+  options, use `ServeFakeKernelWithConfig`. The connection takes the config
+  as `Mount` gives it.
+- To test what a `Notifier` caller gets when the kernel refuses a
+  notification, call `FailNotifications` on the fake kernel.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
   `protocol_test.go`. Each case runs over a fake kernel transport on every OS,
   and through `Mount` and the fake MFMount on darwin.
+- A reply that carries a cache timeout differs from run to run. Check its
+  body in the case's `checkBody`.
 - To test `Mount`'s config validation without a mount, pass a mount point that
   does not exist. `Mount` validates the config before it checks the mount
   point. A regression then fails with ENOENT instead of mounting.
@@ -180,7 +187,12 @@ job times out after 10 minutes.
   trailing `Name [0]byte` pads `unsafe.Sizeof` past the 24-byte header.
 - Check a layout against the C headers: Linux `include/uapi/linux/fuse.h`, and
   `include/fuse_kernel.h` in `macfuse/library`, macFUSE's libfuse.
-  `fuseutil/dirent_test.go` parses READDIRPLUS replies by those headers.
+  `fuseutil/dirent_test.go` parses READDIR and READDIRPLUS replies by those
+  headers.
+- `TestWireStructsMatchTheKernel` in `internal/fusekernel` holds each wire
+  struct's C field offsets and size, per OS. Add a row when you add a wire
+  struct. The protocol tests build their expected bytes from the same structs,
+  so they pass a wrong layout.
 
 ## FSKit changes need a test that does not mount
 

@@ -166,7 +166,13 @@ func TestWriteDirentPlusMatchesKernelLayout(t *testing.T) {
 		child := fuseops.InodeID(10 + i)
 		d := DirentPlus{
 			Dirent: Dirent{Offset: fuseops.DirOffset(i + 1), Inode: child, Name: name, Type: DT_File},
-			Entry:  fuseops.ChildInodeEntry{Child: child, Generation: 9, Attributes: attrs},
+			Entry: fuseops.ChildInodeEntry{
+				Child:                child,
+				Generation:           9,
+				Attributes:           attrs,
+				AttributesExpiration: time.Now().Add(2 * time.Hour),
+				EntryExpiration:      time.Now().Add(time.Hour),
+			},
 		}
 		reclen := (direntPlusNameOffset() + len(name) + 7) &^ 7
 		if got := WriteDirentPlus(make([]byte, reclen-1), d); got != 0 {
@@ -185,6 +191,97 @@ func TestWriteDirentPlusMatchesKernelLayout(t *testing.T) {
 	}
 
 	got := parseDirentPlus(t, written)
+	if len(got) != len(want) {
+		t.Fatalf("parsed %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		// The timeouts count down from when WriteDirentPlus ran.
+		e := &got[i]
+		checkValidFor(t, "entry_valid", e.entryValid, e.entryValidNsec, time.Hour)
+		checkValidFor(t, "attr_valid", e.attrValid, e.attrValidNsec, 2*time.Hour)
+		e.entryValid, e.entryValidNsec, e.attrValid, e.attrValidNsec = 0, 0, 0, 0
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %+v\nwant %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// checkValidFor checks a cache timeout set to ttl from now when the entry was
+// written.
+func checkValidFor(t *testing.T, name string, secs uint64, nsecs uint32, ttl time.Duration) {
+	t.Helper()
+	if got := time.Duration(secs)*time.Second + time.Duration(nsecs); got <= ttl-time.Minute || got > ttl {
+		t.Errorf("%s = %v, want just under %v", name, got, ttl)
+	}
+}
+
+// kernelDirent is struct fuse_dirent as parse_dirfile in Linux fs/fuse/readdir.c
+// reads it: ino, off, namelen and type, then the name at FUSE_NAME_OFFSET, 24,
+// padded with zeros to 8 bytes.
+type kernelDirent struct {
+	ino, off uint64
+	typ      uint32
+	name     string
+}
+
+// parseDirent reads buf as parse_dirfile does, and fails where the kernel
+// answers EIO. It also fails on nonzero padding and on bytes the kernel would
+// skip.
+func parseDirent(t *testing.T, buf []byte) []kernelDirent {
+	t.Helper()
+	const nameOffset = 24
+	var entries []kernelDirent
+	for len(buf) >= nameOffset {
+		f := fields{buf}
+		var e kernelDirent
+		e.ino, e.off = f.u64(), f.u64()
+		namelen := int(f.u32())
+		e.typ = f.u32()
+		reclen := (nameOffset + namelen + 7) &^ 7
+		if namelen == 0 || namelen > fuseNameMax {
+			t.Fatalf("namelen = %d; the kernel answers EIO", namelen)
+		}
+		if reclen > len(buf) {
+			break
+		}
+		e.name = string(f.b[:namelen])
+		if strings.Contains(e.name, "/") {
+			t.Fatalf("name %q has a /; the kernel answers EIO", e.name)
+		}
+		for i, c := range buf[nameOffset+namelen : reclen] {
+			if c != 0 {
+				t.Errorf("%q: padding byte %d = %#x, want 0", e.name, i, c)
+			}
+		}
+		entries = append(entries, e)
+		buf = buf[reclen:]
+	}
+	if len(buf) != 0 {
+		t.Errorf("the kernel skips the last %d bytes", len(buf))
+	}
+	return entries
+}
+
+func TestWriteDirentMatchesKernelLayout(t *testing.T) {
+	types := []DirentType{DT_File, DT_Directory, DT_Link, DT_File, DT_Directory}
+	var written []byte
+	var want []kernelDirent
+	for i, name := range []string{"a", "file", "seven77", "eight888", "nine99999"} {
+		d := Dirent{Offset: fuseops.DirOffset(i + 1), Inode: fuseops.InodeID(10 + i), Name: name, Type: types[i]}
+		reclen := (24 + len(name) + 7) &^ 7
+		if got := WriteDirent(make([]byte, reclen-1), d); got != 0 {
+			t.Errorf("%q into %d bytes: wrote %d, want 0", name, reclen-1, got)
+		}
+		// 0xff shows any byte WriteDirent leaves unwritten.
+		entry := bytes.Repeat([]byte{0xff}, reclen)
+		if got := WriteDirent(entry, d); got != reclen {
+			t.Errorf("%q into %d bytes: wrote %d, want %d", name, reclen, got, reclen)
+		}
+		written = append(written, entry...)
+		want = append(want, kernelDirent{ino: uint64(10 + i), off: uint64(i + 1), typ: uint32(types[i]), name: name})
+	}
+
+	got := parseDirent(t, written)
 	if len(got) != len(want) {
 		t.Fatalf("parsed %d entries, want %d", len(got), len(want))
 	}

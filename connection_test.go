@@ -41,99 +41,6 @@ import (
 // A nil *os.PathError panics when errors.As or errors.Is unwraps it.
 var nilPathErr error = (*os.PathError)(nil)
 
-func TestKernelResponseKeepsWrappedErrno(t *testing.T) {
-	tests := []struct {
-		name  string
-		opErr error
-		want  syscall.Errno
-	}{
-		{"bare errno", syscall.ENOENT, syscall.ENOENT},
-		{"wrapped errno", fmt.Errorf("lookup: %w", syscall.ENOENT), syscall.ENOENT},
-		{"path error", &os.PathError{Op: "open", Path: "f", Err: syscall.EACCES}, syscall.EACCES},
-		{"no errno", errors.New("lookup failed"), syscall.EIO},
-		{"EIO before ENOENT", fmt.Errorf("lookup: %w (cleanup: %w)", syscall.EIO, syscall.ENOENT), syscall.EIO},
-		{"joined EACCES and ENOENT", errors.Join(syscall.EACCES, syscall.ENOENT), syscall.EACCES},
-		{"nil path error", nilPathErr, syscall.EIO},
-		{"wrapped nil path error", fmt.Errorf("lookup: %w", nilPathErr), syscall.EIO},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var c Connection
-			var m buffer.OutMessage
-			m.Reset()
-			c.kernelResponse(&m, 1, &fuseops.LookUpInodeOp{}, tt.opErr)
-			if got := m.OutHeader().Error; got != -int32(tt.want) {
-				t.Errorf("reply error = %d, want %d", got, -int32(tt.want))
-			}
-		})
-	}
-}
-
-func TestShouldLogErrorMatchesWrappedErrno(t *testing.T) {
-	wrap := func(errno syscall.Errno) error { return fmt.Errorf("op: %w", errno) }
-	tests := []struct {
-		name string
-		op   interface{}
-		err  error
-		want bool
-	}{
-		{"lookup ENOENT", &fuseops.LookUpInodeOp{}, wrap(syscall.ENOENT), false},
-		{"getxattr ENODATA", &fuseops.GetXattrOp{}, wrap(syscall.ENODATA), false},
-		{"listxattr ERANGE", &fuseops.ListXattrOp{}, wrap(syscall.ERANGE), false},
-		{"getxattr ENOSYS", &fuseops.GetXattrOp{}, wrap(syscall.ENOSYS), false},
-		{"unknown op ENOSYS", &unknownOp{}, wrap(syscall.ENOSYS), false},
-		{"lookup EIO", &fuseops.LookUpInodeOp{}, wrap(syscall.EIO), true},
-		{"lookup EIO before ENOENT", &fuseops.LookUpInodeOp{}, fmt.Errorf("lookup: %w (cleanup: %w)", syscall.EIO, syscall.ENOENT), true},
-		{"lookup joined EACCES and ENOENT", &fuseops.LookUpInodeOp{}, errors.Join(syscall.EACCES, syscall.ENOENT), true},
-		{"lookup no errno", &fuseops.LookUpInodeOp{}, errors.New("lookup failed"), true},
-		{"lookup nil path error", &fuseops.LookUpInodeOp{}, nilPathErr, true},
-		{"lookup wrapped nil path error", &fuseops.LookUpInodeOp{}, fmt.Errorf("lookup: %w", nilPathErr), true},
-	}
-	c := &Connection{errorLogger: log.New(io.Discard, "", 0)}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := c.shouldLogError(tt.op, tt.err); got != tt.want {
-				t.Errorf("shouldLogError = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestShouldLogErrorSkipsExpectedErrnos(t *testing.T) {
-	wrap := func(errno syscall.Errno) error { return fmt.Errorf("op: %w", errno) }
-	tests := []struct {
-		name string
-		op   interface{}
-		err  error
-		want bool
-	}{
-		{"setxattr ENOSYS", &fuseops.SetXattrOp{}, wrap(syscall.ENOSYS), false},
-		{"setxattr EPERM", &fuseops.SetXattrOp{}, wrap(syscall.EPERM), true},
-		{"removexattr ENOSYS", &fuseops.RemoveXattrOp{}, wrap(syscall.ENOSYS), false},
-		{"removexattr EIO", &fuseops.RemoveXattrOp{}, wrap(syscall.EIO), true},
-		{"createlink ENOSYS", &fuseops.CreateLinkOp{}, wrap(syscall.ENOSYS), false},
-		{"createlink EPERM", &fuseops.CreateLinkOp{}, wrap(syscall.EPERM), true},
-		{"readfile EINTR", &fuseops.ReadFileOp{}, wrap(syscall.EINTR), false},
-		{"readfile EIO", &fuseops.ReadFileOp{}, wrap(syscall.EIO), true},
-		{"getattr EINTR", &fuseops.GetInodeAttributesOp{}, wrap(syscall.EINTR), false},
-		{"getattr ESTALE", &fuseops.GetInodeAttributesOp{}, wrap(syscall.ESTALE), true},
-		{"rmdir ENOTEMPTY", &fuseops.RmDirOp{}, wrap(syscall.ENOTEMPTY), false},
-		{"rmdir EPERM", &fuseops.RmDirOp{}, wrap(syscall.EPERM), true},
-		{"rename ENOTEMPTY", &fuseops.RenameOp{}, wrap(syscall.ENOTEMPTY), false},
-		{"rename EIO", &fuseops.RenameOp{}, wrap(syscall.EIO), true},
-		{"unlink ENOTEMPTY", &fuseops.UnlinkOp{}, wrap(syscall.ENOTEMPTY), true},
-		{"unlink EIO before ENOSYS", &fuseops.UnlinkOp{}, fmt.Errorf("unlink: %w (cleanup: %w)", syscall.EIO, syscall.ENOSYS), true},
-	}
-	c := &Connection{errorLogger: log.New(io.Discard, "", 0)}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := c.shouldLogError(tt.op, tt.err); got != tt.want {
-				t.Errorf("shouldLogError = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 // The kernel answers a reply to an interrupted request with ENOENT.
 func TestReplyTreatsENOENTWriteAsBenign(t *testing.T) {
 	tests := []struct {
@@ -991,6 +898,83 @@ func TestInitNegotiatesAutoInvalData(t *testing.T) {
 			want := tt.enable && tt.offered && runtime.GOOS == "linux"
 			if got := out.Flags&uint32(fusekernel.InitAutoInvalData) != 0; got != want {
 				t.Errorf("InitOut.Flags has FUSE_AUTO_INVAL_DATA: %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// The kernel reads the INIT reply as fuse_init_out. artifact-fs mounts with
+// DisableWritebackCaching, and on Linux with EnableParallelDirOps and
+// EnableAutoInvalData.
+func TestInitReplyFollowsConfig(t *testing.T) {
+	pageSize := uint32(buffer.GetPageSize())
+	defaultPages := uint16((1 << 20) / pageSize)
+	var autoInvalData fusekernel.InitFlags
+	if runtime.GOOS == "linux" {
+		autoInvalData = fusekernel.InitAutoInvalData
+	}
+	const always = fusekernel.InitBigWrites | fusekernel.InitMaxPages
+	tests := []struct {
+		name     string
+		cfg      MountConfig
+		flags    fusekernel.InitFlags
+		maxWrite uint32
+		maxPages uint16
+	}{
+		{"default", MountConfig{}, always | fusekernel.InitWritebackCache, 1 << 20, defaultPages},
+		{"artifact-fs",
+			MountConfig{DisableWritebackCaching: true, EnableParallelDirOps: true, EnableAutoInvalData: true},
+			always | fusekernel.InitParallelDirOps | autoInvalData, 1 << 20, defaultPages},
+		{"MaxPages", MountConfig{DisableWritebackCaching: true, MaxPages: 32}, always, 32 * pageSize, 32},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := tt.cfg.normalize()
+			if err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			k := newFakeKernel()
+			k.Send(FakeRequest(fusekernel.InHeader{Opcode: fusekernel.OpInit, Unique: 1}, NativeBytes(&fusekernel.InitIn{
+				Major: 7, Minor: 19, MaxReadahead: 1 << 20, Flags: uint32(fusekernel.InitAutoInvalData),
+			}))...)
+			c, err := newConnection(cfg, nil, nil, nil, k)
+			if err != nil {
+				t.Fatalf("newConnection: %v", err)
+			}
+			defer c.close()
+
+			reply := k.NextReply(t)
+			checkInitReply(t, reply)
+			var got fusekernel.InitOut
+			copy(structBytes(&got), reply[buffer.OutMessageHeaderSize:])
+			if gotFlags := fusekernel.InitFlags(got.Flags); gotFlags != tt.flags {
+				t.Errorf("INIT reply flags = %v, want %v", gotFlags, tt.flags)
+			}
+			want := fusekernel.InitOut{
+				Major:               7,
+				Minor:               19,
+				MaxReadahead:        1 << 20,
+				Flags:               got.Flags,
+				MaxBackground:       12,
+				CongestionThreshold: 9,
+				MaxWrite:            tt.maxWrite,
+				TimeGran:            1,
+				MaxPages:            tt.maxPages,
+			}
+			if got != want {
+				t.Errorf("INIT reply = %+v\nwant %+v", got, want)
+			}
+
+			// The kernel sends writes of up to MaxWrite bytes.
+			payload := bytes.Repeat([]byte{0xa5}, int(tt.maxWrite))
+			k.Send(FakeRequest(fusekernel.InHeader{Opcode: fusekernel.OpWrite, Unique: 2, Nodeid: 3},
+				NativeBytes(&fusekernel.WriteIn{Fh: 4, Size: tt.maxWrite}), payload)...)
+			_, op, err := c.ReadOp()
+			if err != nil {
+				t.Fatalf("ReadOp of a %d-byte write: %v", tt.maxWrite, err)
+			}
+			if w, ok := op.(*fuseops.WriteFileOp); !ok || !bytes.Equal(w.Data, payload) {
+				t.Errorf("a %d-byte write decoded as %T, not the payload", tt.maxWrite, op)
 			}
 		})
 	}

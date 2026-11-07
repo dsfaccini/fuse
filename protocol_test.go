@@ -70,6 +70,9 @@ type protocolCase struct {
 	// errno is the error the reply carries, and reply is its body.
 	errno syscall.Errno
 	reply []byte
+	// checkBody checks the body instead of reply. A cache timeout counts down
+	// from the reply, so a reply that carries one differs from run to run.
+	checkBody func(t *testing.T, body []byte)
 	// noReply ops get no reply.
 	noReply bool
 }
@@ -97,7 +100,11 @@ func testProtocol(t *testing.T, serve func(*testing.T, fuse.Server) fakeKernel) 
 			case <-time.After(5 * time.Second):
 				t.Fatal("the file system got no op within 5s")
 			}
-			if !c.noReply {
+			switch {
+			case c.noReply:
+			case c.checkBody != nil:
+				c.checkBody(t, checkReplyHeader(t, k.NextReply(t), c.errno))
+			default:
 				checkReply(t, k.NextReply(t), c.errno, c.reply)
 			}
 		})
@@ -105,6 +112,14 @@ func testProtocol(t *testing.T, serve func(*testing.T, fuse.Server) fakeKernel) 
 }
 
 func checkReply(t *testing.T, reply []byte, errno syscall.Errno, body []byte) {
+	t.Helper()
+	if got := checkReplyHeader(t, reply, errno); !bytes.Equal(got, body) {
+		t.Errorf("reply body = %x, want %x", got, body)
+	}
+}
+
+// checkReplyHeader checks the reply's header and returns its body.
+func checkReplyHeader(t *testing.T, reply []byte, errno syscall.Errno) []byte {
 	t.Helper()
 	var h fusekernel.OutHeader
 	if err := binary.Read(bytes.NewReader(reply), binary.NativeEndian, &h); err != nil {
@@ -119,8 +134,22 @@ func checkReply(t *testing.T, reply []byte, errno syscall.Errno, body []byte) {
 	if h.Unique != reqUnique {
 		t.Errorf("reply unique = %d, want %d", h.Unique, reqUnique)
 	}
-	if got := reply[binary.Size(h):]; !bytes.Equal(got, body) {
-		t.Errorf("reply body = %x, want %x", got, body)
+	return reply[binary.Size(h):]
+}
+
+// validFor reads a cache timeout, its seconds at secsAt and its nanoseconds at
+// nsecAt.
+func validFor(body []byte, secsAt, nsecAt int) time.Duration {
+	return time.Duration(binary.NativeEndian.Uint64(body[secsAt:]))*time.Second +
+		time.Duration(binary.NativeEndian.Uint32(body[nsecAt:]))
+}
+
+// checkValidFor checks a cache timeout set to ttl from now when the file
+// system answered.
+func checkValidFor(t *testing.T, name string, got, ttl time.Duration) {
+	t.Helper()
+	if got <= ttl-time.Minute || got > ttl {
+		t.Errorf("%s = %v, want just under %v", name, got, ttl)
 	}
 }
 
@@ -209,7 +238,21 @@ var entry = fuseops.ChildInodeEntry{Child: child, Generation: 9, Attributes: att
 
 // kernelEntry is entry as the kernel gets it.
 func kernelEntry() []byte {
-	return fuse.NativeBytes(&fusekernel.EntryOut{Nodeid: uint64(child), Generation: 9, Attr: kernelAttr(child)})
+	return kernelEntryWithMode(syscall.S_IFREG | 0o644)
+}
+
+// entryWithMode is entry with the file mode mode.
+func entryWithMode(mode os.FileMode) fuseops.ChildInodeEntry {
+	e := entry
+	e.Attributes.Mode = mode
+	return e
+}
+
+// kernelEntryWithMode is entry as the kernel gets it, with the mode kernelMode.
+func kernelEntryWithMode(kernelMode uint32) []byte {
+	a := kernelAttr(child)
+	a.Mode = kernelMode
+	return fuse.NativeBytes(&fusekernel.EntryOut{Nodeid: uint64(child), Generation: 9, Attr: a})
 }
 
 // The protocol cases cover the ops of artifact-fs's file system, in the order
@@ -269,6 +312,46 @@ func protocolCases() []protocolCase {
 			errno: syscall.ENOENT,
 		},
 		{
+			name:    "lookup with expirations",
+			request: request(fusekernel.OpLookup, parent, names("file")),
+			serve: func(t *testing.T, op any) error {
+				if o := checkOp(t, op, &fuseops.LookUpInodeOp{Parent: parent, Name: "file", OpContext: reqContext}); o != nil {
+					o.Entry = entry
+					o.Entry.EntryExpiration = time.Now().Add(time.Hour)
+					o.Entry.AttributesExpiration = time.Now().Add(2 * time.Hour)
+				}
+				return nil
+			},
+			// fuse_entry_out: entry_valid and attr_valid at 16 and 24, their
+			// nanoseconds at 32 and 36.
+			checkBody: func(t *testing.T, body []byte) {
+				checkValidFor(t, "entry_valid", validFor(body, 16, 32), time.Hour)
+				checkValidFor(t, "attr_valid", validFor(body, 24, 36), 2*time.Hour)
+				got := bytes.Clone(body)
+				clear(got[16:40])
+				if want := kernelEntry(); !bytes.Equal(got, want) {
+					t.Errorf("reply body without timeouts = %x, want %x", got, want)
+				}
+			},
+		},
+		{
+			// A negative entry: the kernel caches that the name is missing.
+			name:    "negative lookup",
+			request: request(fusekernel.OpLookup, parent, names("missing")),
+			serve: func(t *testing.T, op any) error {
+				if o := checkOp(t, op, &fuseops.LookUpInodeOp{Parent: parent, Name: "missing", OpContext: reqContext}); o != nil {
+					o.Entry = fuseops.ChildInodeEntry{EntryExpiration: time.Now().Add(time.Hour)}
+				}
+				return nil
+			},
+			checkBody: func(t *testing.T, body []byte) {
+				if nodeid := binary.NativeEndian.Uint64(body); nodeid != 0 {
+					t.Errorf("nodeid = %d, want 0", nodeid)
+				}
+				checkValidFor(t, "entry_valid", validFor(body, 16, 32), time.Hour)
+			},
+		},
+		{
 			name:    "getattr",
 			request: request(fusekernel.OpGetattr, child, fuse.NativeBytes(&fusekernel.GetattrIn{})),
 			serve: func(t *testing.T, op any) error {
@@ -278,6 +361,26 @@ func protocolCases() []protocolCase {
 				return nil
 			},
 			reply: fuse.NativeBytes(&fusekernel.AttrOut{Attr: kernelAttr(child)}),
+		},
+		{
+			name:    "getattr with expiration",
+			request: request(fusekernel.OpGetattr, child, fuse.NativeBytes(&fusekernel.GetattrIn{})),
+			serve: func(t *testing.T, op any) error {
+				if o := checkOp(t, op, &fuseops.GetInodeAttributesOp{Inode: child, OpContext: reqContext}); o != nil {
+					o.Attributes = attrs
+					o.AttributesExpiration = time.Now().Add(time.Hour)
+				}
+				return nil
+			},
+			// fuse_attr_out: attr_valid at 0, its nanoseconds at 8.
+			checkBody: func(t *testing.T, body []byte) {
+				checkValidFor(t, "attr_valid", validFor(body, 0, 8), time.Hour)
+				got := bytes.Clone(body)
+				clear(got[0:12])
+				if want := fuse.NativeBytes(&fusekernel.AttrOut{Attr: kernelAttr(child)}); !bytes.Equal(got, want) {
+					t.Errorf("reply body without timeouts = %x, want %x", got, want)
+				}
+			},
 		},
 		{
 			name:    "setattr",
@@ -327,15 +430,16 @@ func protocolCases() []protocolCase {
 		},
 		{
 			// The osxfuse kext sends S_IFDIR (fuse_vnop_mkdir in osxfuse/kext).
+			// The kernel takes the file type from the reply's mode.
 			name:    "mkdir",
 			request: request(fusekernel.OpMkdir, parent, join(fuse.NativeBytes(&fusekernel.MkdirIn{Mode: syscall.S_IFDIR | 0o755, Umask: 0o022}), names("dir"))),
 			serve: func(t *testing.T, op any) error {
 				if o := checkOp(t, op, &fuseops.MkDirOp{Parent: parent, Name: "dir", Mode: os.ModeDir | 0o755, OpContext: reqContext}); o != nil {
-					o.Entry = entry
+					o.Entry = entryWithMode(os.ModeDir | 0o755)
 				}
 				return nil
 			},
-			reply: kernelEntry(),
+			reply: kernelEntryWithMode(syscall.S_IFDIR | 0o755),
 		},
 		{
 			// Linux strips S_IFDIR and keeps the sticky bit (fs/fuse/dir.c
@@ -396,11 +500,11 @@ func protocolCases() []protocolCase {
 			request: request(fusekernel.OpSymlink, parent, names("link", "target")),
 			serve: func(t *testing.T, op any) error {
 				if o := checkOp(t, op, &fuseops.CreateSymlinkOp{Parent: parent, Name: "link", Target: "target", OpContext: reqContext}); o != nil {
-					o.Entry = entry
+					o.Entry = entryWithMode(os.ModeSymlink | 0o777)
 				}
 				return nil
 			},
-			reply: kernelEntry(),
+			reply: kernelEntryWithMode(syscall.S_IFLNK | 0o777),
 		},
 		{
 			name:    "rename",
@@ -625,6 +729,46 @@ func protocolCases() []protocolCase {
 				return nil
 			},
 		},
+	}
+}
+
+// forgetFS implements ForgetInode and not BatchForget, like artifact-fs.
+type forgetFS struct {
+	fuseutil.NotImplementedFileSystem
+	forgets chan fuseops.ForgetInodeOp
+}
+
+func (fs *forgetFS) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) error {
+	fs.forgets <- *op
+	return nil
+}
+
+// A file system without BatchForget gets each entry of a BATCH_FORGET as a
+// ForgetInode.
+func TestBatchForgetFallsBackToForgetInode(t *testing.T) {
+	fs := &forgetFS{forgets: make(chan fuseops.ForgetInodeOp, 2)}
+	var k fakeKernel
+	// Registered first, so it runs after the connection ends.
+	t.Cleanup(func() {
+		if n := k.UnreadReplies(); n != 0 {
+			t.Errorf("the connection sent %d replies, want none", n)
+		}
+	})
+	k = fuse.ServeFakeKernel(t, fuseutil.NewFileSystemServer(fs))
+	k.Send(request(fusekernel.OpBatchForget, 0,
+		join(
+			fuse.NativeBytes(&fusekernel.BatchForgetCountIn{Count: 2}),
+			fuse.NativeBytes(&fusekernel.BatchForgetEntryIn{Inode: 3, Nlookup: 1}),
+			fuse.NativeBytes(&fusekernel.BatchForgetEntryIn{Inode: 5, Nlookup: 2})))...)
+	for _, want := range []fuseops.ForgetInodeOp{{Inode: 3, N: 1, OpContext: reqContext}, {Inode: 5, N: 2, OpContext: reqContext}} {
+		select {
+		case got := <-fs.forgets:
+			if got != want {
+				t.Errorf("ForgetInode got %+v, want %+v", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no ForgetInode of inode %d within 5s", want.Inode)
+		}
 	}
 }
 
