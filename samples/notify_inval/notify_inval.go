@@ -31,7 +31,7 @@ type NotifyTimer interface {
 // https://github.com/libfuse/libfuse/blob/e75d2c54a347906478724be24bfa1df2638094cb/example/notify_inval_inode.c
 // https://github.com/libfuse/libfuse/blob/e75d2c54a347906478724be24bfa1df2638094cb/example/notify_inval_entry.c
 //
-// Unlike package dynamicfs, this implementation does _not_ depend on direct IO.
+// This implementation does _not_ depend on direct IO.
 // The invalidations allow file operations to eventually observe the changes.
 func NewNotifyInvalFS(t NotifyTimer) fuse.Server {
 	n := fuse.NewNotifier()

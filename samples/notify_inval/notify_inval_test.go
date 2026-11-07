@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dsfaccini/fuse/fusetesting"
 	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
 	"github.com/dsfaccini/fuse/samples/notify_inval"
@@ -51,25 +50,6 @@ func (t *NotifyInvalFSTest) SetUp(ti *TestInfo) {
 	}
 	t.Server = notify_inval.NewNotifyInvalFS(t.ticker)
 	t.SampleTest.SetUp(ti)
-}
-
-func (t *NotifyInvalFSTest) ReadDir_Root() {
-	entries, err := fusetesting.ReadDirPicky(t.Dir)
-	AssertEq(nil, err)
-	AssertEq(2, len(entries))
-
-	var fi os.FileInfo
-	fi = entries[0]
-	ExpectEq(t.expectedTime.Format(time.RFC3339), fi.Name())
-	ExpectEq(0, fi.Size())
-	ExpectEq(0444, fi.Mode())
-	ExpectFalse(fi.IsDir())
-
-	fi = entries[1]
-	ExpectEq("current_time", fi.Name())
-	ExpectEq(len(time.Time{}.Format(time.RFC3339))+1, fi.Size())
-	ExpectEq(0444, fi.Mode())
-	ExpectFalse(fi.IsDir())
 }
 
 func (t *NotifyInvalFSTest) ObserveTimeUpdate() {

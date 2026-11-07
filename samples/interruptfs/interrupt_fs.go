@@ -38,9 +38,9 @@ var fooAttrs = fuseops.InodeAttributes{
 	Size:  1234,
 }
 
-// A file system containing exactly one file, named "foo". ReadFile and
-// FlushFile ops can be made to hang until interrupted. Exposes a method for
-// synchronizing with the arrival of a read or a flush.
+// A file system containing exactly one file, named "foo". ReadFile ops can be
+// made to hang until interrupted. Exposes a method for synchronizing with the
+// arrival of a read.
 //
 // Must be created with New.
 type InterruptFS struct {
@@ -48,18 +48,15 @@ type InterruptFS struct {
 
 	mu sync.Mutex
 
-	blockForReads   bool // GUARDED_BY(mu)
-	blockForFlushes bool // GUARDED_BY(mu)
+	blockForReads bool // GUARDED_BY(mu)
 
-	// Must hold the mutex when closing these.
-	readReceived  chan struct{}
-	flushReceived chan struct{}
+	// Must hold the mutex when closing this.
+	readReceived chan struct{}
 }
 
 func New() *InterruptFS {
 	return &InterruptFS{
-		readReceived:  make(chan struct{}),
-		flushReceived: make(chan struct{}),
+		readReceived: make(chan struct{}),
 	}
 }
 
@@ -72,25 +69,12 @@ func (fs *InterruptFS) WaitForFirstRead() {
 	<-fs.readReceived
 }
 
-// Block until the first flush is received.
-func (fs *InterruptFS) WaitForFirstFlush() {
-	<-fs.flushReceived
-}
-
 // Enable blocking until interrupted for the next (and subsequent) read ops.
 func (fs *InterruptFS) EnableReadBlocking() {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	fs.blockForReads = true
-}
-
-// Enable blocking until interrupted for the next (and subsequent) flush ops.
-func (fs *InterruptFS) EnableFlushBlocking() {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	fs.blockForFlushes = true
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -157,34 +141,6 @@ func (fs *InterruptFS) ReadFile(
 	case <-fs.readReceived:
 	default:
 		close(fs.readReceived)
-	}
-	fs.mu.Unlock()
-
-	// Wait for cancellation if enabled.
-	if shouldBlock {
-		done := ctx.Done()
-		if done == nil {
-			panic("Expected non-nil channel.")
-		}
-
-		<-done
-		return ctx.Err()
-	}
-
-	return nil
-}
-
-func (fs *InterruptFS) FlushFile(
-	ctx context.Context,
-	op *fuseops.FlushFileOp) error {
-	fs.mu.Lock()
-	shouldBlock := fs.blockForFlushes
-
-	// Signal that a flush has been received, if this is the first.
-	select {
-	case <-fs.flushReceived:
-	default:
-		close(fs.flushReceived)
 	}
 	fs.mu.Unlock()
 

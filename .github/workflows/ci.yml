@@ -62,7 +62,6 @@ jobs:
         sudo apt-get update
         sudo apt-get install --yes fuse3
         test -c /dev/fuse
-    # samples/flushfs runs go build, so root keeps the runner's PATH and HOME.
     - &mount-test
       name: Test
       env:
@@ -71,7 +70,7 @@ jobs:
         set -o pipefail
         exec_flag=()
         if [ "$MOUNT_USER" = root ]; then
-          exec_flag=(-exec "sudo env PATH=$PATH HOME=$HOME FUSE_RUN_MOUNT_TESTS=1")
+          exec_flag=(-exec "sudo env FUSE_RUN_MOUNT_TESTS=1")
         fi
         go test "${exec_flag[@]}" -race -count=1 -timeout 5m -json ./... \
           | tee "$RUNNER_TEMP/test.json" \
@@ -126,7 +125,7 @@ jobs:
     - *mount-test
     - *check-mounting-test
 
-  # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
+  # Mounting tests skip here: they run only on Linux.
   macos:
     runs-on: macos-latest
     timeout-minutes: 10

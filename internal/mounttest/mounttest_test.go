@@ -50,6 +50,17 @@ func TestGatesSkipByDefault(t *testing.T) {
 	}
 }
 
+func TestMountingTestsSkipOffLinux(t *testing.T) {
+	reached := false
+	t.Run("darwin", func(t *testing.T) {
+		skipUnlessEnabled(t, "darwin", "1")
+		reached = true
+	})
+	if reached {
+		t.Errorf("SkipUnlessEnabled did not skip on darwin with %s=1", Env)
+	}
+}
+
 // TestMountingTestsAreGated runs ungatedMounts on the test files of every
 // directory in the module.
 func TestMountingTestsAreGated(t *testing.T) {
@@ -362,7 +373,7 @@ var fakeMounts = map[string]string{
 
 // mountCallees mount when called: Mount and MountContext directly, mountFSKitTransport under
 // the FSKit probe, ogletest's RunTests through suites that mount in SetUp, and
-// SetUp on samples.SampleTest and samples.SubprocessTest.
+// SetUp on samples.SampleTest.
 var mountCallees = []string{"Mount", "MountContext", "mountFSKitTransport", "RunTests", "SetUp"}
 
 // fskitMountCallees mount through FSKit. Only the FSKit probe's gate may guard

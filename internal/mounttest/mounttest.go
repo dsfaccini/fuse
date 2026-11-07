@@ -18,20 +18,32 @@ package mounttest
 
 import (
 	"os"
+	"runtime"
 	"testing"
 )
 
 // Env enables tests that mount a real file system when set to "1".
 const Env = "FUSE_RUN_MOUNT_TESTS"
 
-// SkipUnlessEnabled skips t unless FUSE_RUN_MOUNT_TESTS=1. Every test that
-// mounts calls it before anything else.
+// SkipUnlessEnabled skips t unless FUSE_RUN_MOUNT_TESTS=1 on Linux. Every
+// test that mounts calls it before anything else. The mounting tests assume
+// Linux, so it skips them on every other OS.
 //
 // A test it lets run logs "FUSE_RUN_MOUNT_TESTS=1: mounting". CI fails each
 // mounting job when no test that logged it passed.
 func SkipUnlessEnabled(t testing.TB) {
 	t.Helper()
-	if os.Getenv(Env) != "1" {
+	skipUnlessEnabled(t, runtime.GOOS, os.Getenv(Env))
+}
+
+// skipUnlessEnabled is SkipUnlessEnabled on goos with env as the value of
+// FUSE_RUN_MOUNT_TESTS.
+func skipUnlessEnabled(t testing.TB, goos, env string) {
+	t.Helper()
+	if goos != "linux" {
+		t.Skipf("mounts a file system; runs only on Linux")
+	}
+	if env != "1" {
 		t.Skipf("mounts a file system; set %s=1 to run", Env)
 	}
 	t.Logf("%s=1: mounting", Env)

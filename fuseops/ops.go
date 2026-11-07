@@ -268,9 +268,8 @@ type BatchForgetOp struct {
 //
 // The Linux kernel appears to verify the name doesn't already exist (mkdir
 // calls mkdirat calls user_path_create calls filename_create, which verifies:
-// https://tinyurl.com/24yw46mf). Indeed, the tests in samples/memfs that call
-// in parallel appear to bear this out. But osxfuse does not appear to
-// guarantee this (https://tinyurl.com/22587hcf). And if names may be created
+// https://tinyurl.com/24yw46mf). But osxfuse does not appear to guarantee
+// this (https://tinyurl.com/22587hcf). And if names may be created
 // outside of the kernel's control, it doesn't matter what the kernel does
 // anyway.
 //
