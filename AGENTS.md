@@ -31,7 +31,8 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   arrive. `samples/forgetfs` checks in `TearDown`, before it unmounts.
 - Linux keeps an entry with a zero expiration cached until the next lookup of
   its name. Until then the entry holds its inode, so the inode is not
-  forgotten.
+  forgotten. `fuse_dentry_settime` in `fs/fuse/dir.c` drops such an entry at
+  once only when `delete_stale` is set, which only virtiofs does.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes. `newOpTestConnection` in

@@ -50,6 +50,17 @@ func TestGatesSkipByDefault(t *testing.T) {
 	}
 }
 
+func TestMountingTestsSkipOffLinux(t *testing.T) {
+	reached := false
+	t.Run("darwin", func(t *testing.T) {
+		skipUnlessEnabled(t, "darwin", "1")
+		reached = true
+	})
+	if reached {
+		t.Errorf("SkipUnlessEnabled did not skip on darwin with %s=1", Env)
+	}
+}
+
 // TestMountingTestsAreGated runs ungatedMounts on the test files of every
 // directory in the module.
 func TestMountingTestsAreGated(t *testing.T) {

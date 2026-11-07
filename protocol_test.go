@@ -598,11 +598,11 @@ func protocolCases() []protocolCase {
 			request: request(fusekernel.OpOpen, child, fuse.NativeBytes(&fusekernel.OpenIn{Flags: uint32(os.O_WRONLY | os.O_APPEND)})),
 			serve: func(t *testing.T, op any) error {
 				if o := checkOp(t, op, &fuseops.OpenFileOp{Inode: child, OpenFlags: fusekernel.OpenFlags(os.O_WRONLY | os.O_APPEND), OpContext: reqContext}); o != nil {
-					o.Handle, o.KeepPageCache = handle, true
+					o.Handle, o.KeepPageCache, o.UseDirectIO = handle, true, true
 				}
 				return nil
 			},
-			reply: fuse.NativeBytes(&fusekernel.OpenOut{Fh: uint64(handle), OpenFlags: uint32(fusekernel.OpenKeepCache)}),
+			reply: fuse.NativeBytes(&fusekernel.OpenOut{Fh: uint64(handle), OpenFlags: uint32(fusekernel.OpenKeepCache | fusekernel.OpenDirectIO)}),
 		},
 		{
 			name:    "read into Dst",

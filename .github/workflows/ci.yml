@@ -125,7 +125,7 @@ jobs:
     - *mount-test
     - *check-mounting-test
 
-  # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
+  # Mounting tests skip here: they run only on Linux.
   macos:
     runs-on: macos-latest
     timeout-minutes: 10
