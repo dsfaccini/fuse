@@ -42,7 +42,9 @@ type fakeKernel struct {
 	// interrupts counts Interrupt calls. A read fails with EINTR when it
 	// changes while the read waits.
 	interrupts int
-	replies    chan []byte
+	// notifyErrno, when set, fails every notification the connection sends.
+	notifyErrno syscall.Errno
+	replies     chan []byte
 }
 
 // fakeRead is one read of the channel: a request's body buffers, or an errno.
@@ -149,8 +151,24 @@ func (k *fakeKernel) Read(p []byte) (int, error) {
 	return copy(p, message), nil
 }
 
+// FailNotifications makes the kernel refuse each notification with errno, as
+// Linux refuses one for an inode or entry it does not hold.
+func (k *fakeKernel) FailNotifications(errno syscall.Errno) {
+	k.mu.Lock()
+	k.notifyErrno = errno
+	k.mu.Unlock()
+}
+
 func (k *fakeKernel) SendMessage(parts [][]byte) error {
-	k.replies <- bytes.Join(parts, nil)
+	message := bytes.Join(parts, nil)
+	k.mu.Lock()
+	errno := k.notifyErrno
+	k.mu.Unlock()
+	// A notification's header carries unique 0.
+	if errno != 0 && binary.NativeEndian.Uint64(message[8:16]) == 0 {
+		return errno
+	}
+	k.replies <- message
 	return nil
 }
 
@@ -221,13 +239,20 @@ func ServeFakeKernel(t *testing.T, server Server) *fakeKernel {
 // and debug loggers.
 func ServeFakeKernelWithLoggers(t *testing.T, server Server, errorLogger, debugLogger *log.Logger) *fakeKernel {
 	t.Helper()
-	cfg, err := (&MountConfig{}).normalize()
+	return ServeFakeKernelWithConfig(t, server, &MountConfig{ErrorLogger: errorLogger, DebugLogger: debugLogger})
+}
+
+// ServeFakeKernelWithConfig is ServeFakeKernel with a config, which the
+// connection takes as Mount gives it.
+func ServeFakeKernelWithConfig(t *testing.T, server Server, config *MountConfig) *fakeKernel {
+	t.Helper()
+	cfg, err := config.normalize()
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
 	k := newFakeKernel()
 	k.Send(fakeInit()...)
-	c, err := newConnection(cfg, debugLogger, errorLogger, nil, k)
+	c, err := newConnection(cfg, cfg.DebugLogger, cfg.ErrorLogger, cfg.WireLogger, k)
 	if err != nil {
 		t.Fatalf("newConnection: %v", err)
 	}

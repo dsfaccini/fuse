@@ -15,13 +15,12 @@
 package fuse
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
 // startedServer drains ops like drainServer, after it closes started.
@@ -75,19 +74,51 @@ func TestNotifierReturnsENOTCONNWhileNothingServes(t *testing.T) {
 	check("after ServeOps returned")
 }
 
-func TestNotifierSendsWhileServing(t *testing.T) {
+// The kernel reads a notification as fuse_out_header with the notify code in
+// error and unique 0, then fuse_notify_inval_inode_out or
+// fuse_notify_inval_entry_out and the name with its NUL. Linux
+// include/uapi/linux/fuse.h and macFUSE's include/fuse_kernel.h lay them out
+// alike.
+func TestNotifierWireFormat(t *testing.T) {
 	n := NewNotifier()
 	server := newStartedServer()
 	k := ServeFakeKernel(t, NewServerWithNotifier(n, server))
 	server.wait(t)
 
-	if err := notifyWithin(t, func() error { return n.InvalidateInode(7, 0, 0) }); err != nil {
+	notification := func(code int32, body []byte) []byte {
+		b := binary.NativeEndian.AppendUint32(nil, uint32(16+len(body)))
+		b = binary.NativeEndian.AppendUint32(b, uint32(code))
+		b = binary.NativeEndian.AppendUint64(b, 0)
+		return append(b, body...)
+	}
+	inodeBody := binary.NativeEndian.AppendUint64(nil, 7)
+	inodeBody = binary.NativeEndian.AppendUint64(inodeBody, 4096)
+	inodeBody = binary.NativeEndian.AppendUint64(inodeBody, 8192)
+	entryBody := binary.NativeEndian.AppendUint64(nil, 5)
+	entryBody = binary.NativeEndian.AppendUint32(entryBody, 4)
+	entryBody = binary.NativeEndian.AppendUint32(entryBody, 0)
+	entryBody = append(entryBody, "name\x00"...)
+
+	if err := notifyWithin(t, func() error { return n.InvalidateInode(7, 4096, 8192) }); err != nil {
 		t.Fatalf("InvalidateInode: %v", err)
 	}
-	reply := k.NextReply(t)
-	code, unique := int32(binary.NativeEndian.Uint32(reply[4:8])), binary.NativeEndian.Uint64(reply[8:16])
-	if code != fusekernel.NotifyCodeInvalInode || unique != 0 {
-		t.Errorf("notification code = %d, unique = %d; want an inode invalidation", code, unique)
+	if got, want := k.NextReply(t), notification(2, inodeBody); !bytes.Equal(got, want) {
+		t.Errorf("inode invalidation = %x, want %x", got, want)
+	}
+	if err := notifyWithin(t, func() error { return n.InvalidateEntry(5, "name") }); err != nil {
+		t.Fatalf("InvalidateEntry: %v", err)
+	}
+	if got, want := k.NextReply(t), notification(3, entryBody); !bytes.Equal(got, want) {
+		t.Errorf("entry invalidation = %x, want %x", got, want)
+	}
+
+	// The caller tells a notification the kernel had nothing for by ENOENT.
+	k.FailNotifications(syscall.ENOENT)
+	if err := notifyWithin(t, func() error { return n.InvalidateInode(7, 0, 0) }); !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("InvalidateInode of an inode the kernel lacks = %v, want ENOENT", err)
+	}
+	if err := notifyWithin(t, func() error { return n.InvalidateEntry(5, "name") }); !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("InvalidateEntry of an entry the kernel lacks = %v, want ENOENT", err)
 	}
 }
 
