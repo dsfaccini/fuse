@@ -492,40 +492,8 @@ func TestSecondReplyIsFatal(t *testing.T) {
 	}
 }
 
-func TestSecondReplyAfterMessagesAreReused(t *testing.T) {
-	transport := &testTransport{messages: [][]byte{
-		testMessage(fusekernel.OpGetattr, 5),
-		testMessage(fusekernel.OpGetattr, 6),
-	}}
-	c := newTestConnection(transport)
-	ctx5, _, err := c.ReadOp()
-	if err != nil {
-		t.Fatalf("ReadOp: %v", err)
-	}
-	if err := c.Reply(ctx5, syscall.ENOSYS); err != nil {
-		t.Fatalf("Reply: %v", err)
-	}
-	ctx6, _, err := c.ReadOp()
-	if err != nil {
-		t.Fatalf("ReadOp: %v", err)
-	}
-	if ctx5.Value(contextKey).(opState).inMsg != ctx6.Value(contextKey).(opState).inMsg {
-		t.Fatal("request 6 did not reuse request 5's InMessage")
-	}
-
-	if err := c.Reply(ctx5, syscall.ENOSYS); err == nil {
-		t.Error("second Reply to request 5 succeeded, want an error")
-	}
-	if len(transport.writes) != 1 {
-		t.Errorf("replies = %d, want 1", len(transport.writes))
-	}
-	if in, out := drainFreelists(c); len(in) != 0 || len(out) != 0 {
-		t.Errorf("freelists hold request 6's messages: %d in, %d out", len(in), len(out))
-	}
-}
-
 // The macFUSE kext reuses a request ID once its reply is written
-// (osxfuse#208).
+// (osxfuse#208), and the new request reuses the old one's messages.
 func TestSecondReplyAfterRequestIDIsReused(t *testing.T) {
 	transport := &testTransport{messages: [][]byte{
 		testMessage(fusekernel.OpGetattr, 5),
@@ -542,6 +510,9 @@ func TestSecondReplyAfterRequestIDIsReused(t *testing.T) {
 	cur, _, err := c.ReadOp()
 	if err != nil {
 		t.Fatalf("ReadOp: %v", err)
+	}
+	if old.Value(contextKey).(opState).inMsg != cur.Value(contextKey).(opState).inMsg {
+		t.Fatal("the request in flight did not reuse the old request's InMessage")
 	}
 
 	if err := c.Reply(old, syscall.ENOSYS); err == nil {

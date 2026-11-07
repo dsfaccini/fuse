@@ -248,6 +248,7 @@ func TestBytesReadThatFillsItsBufferIsAnswered(t *testing.T) {
 		{"readdir", request(fusekernel.OpReaddir, child, readIn), make([]byte, 16)},
 		{"zero-size readdir", request(fusekernel.OpReaddir, child, zeroIn), nil},
 		{"readdirplus", request(fusekernel.OpReaddirplus, child, readIn), make([]byte, 16)},
+		{"zero-size readdirplus", request(fusekernel.OpReaddirplus, child, zeroIn), nil},
 	}
 	for _, tt := range tests {
 		k.Send(tt.request...)

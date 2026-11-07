@@ -348,7 +348,7 @@ var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                                          "checkMountPoint rejects the directory",
 	"TestMountContextReturnsAtOnceWhenContextEnded":                      "the context has ended",
 	"TestMountReturnsTypedFSKitErrors":                                   "the FSKit preflight fails",
-	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation fails",
+	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation or checkMountPoint fails",
 	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
 	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
 }

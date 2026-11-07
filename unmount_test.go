@@ -120,8 +120,13 @@ func TestUnmountBacksOff(t *testing.T) {
 	recordUnmounts(t, func(int) error { return syscall.EBUSY })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	const ms = time.Millisecond
-	want := []time.Duration{100 * ms, 200 * ms, 400 * ms, 800 * ms, 1600 * ms, 2000 * ms, 2000 * ms}
+	// The waits double from unmountRetryInterval, then stay at
+	// unmountRetryMaxInterval.
+	var want []time.Duration
+	for wait := unmountRetryInterval; wait < unmountRetryMaxInterval; wait *= 2 {
+		want = append(want, wait)
+	}
+	want = append(want, unmountRetryMaxInterval, unmountRetryMaxInterval)
 	var waits []time.Duration
 	old := unmountRetryAfter
 	unmountRetryAfter = func(d time.Duration) <-chan time.Time {

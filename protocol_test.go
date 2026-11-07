@@ -640,6 +640,17 @@ func protocolCases() []protocolCase {
 			reply: fuse.NativeBytes(&fusekernel.WriteOut{Size: 7}),
 		},
 		{
+			name: "write with bytes past Size",
+			request: request(fusekernel.OpWrite, child,
+				fuse.NativeBytes(&fusekernel.WriteIn{Fh: uint64(handle), Offset: 10, Size: 3}),
+				[]byte("payload")),
+			serve: func(t *testing.T, op any) error {
+				checkOp(t, op, &fuseops.WriteFileOp{Inode: child, Handle: handle, Offset: 10, Data: []byte("pay"), OpContext: reqContext})
+				return nil
+			},
+			reply: fuse.NativeBytes(&fusekernel.WriteOut{Size: 3}),
+		},
+		{
 			name:    "fsync",
 			request: request(fusekernel.OpFsync, child, fuse.NativeBytes(&fusekernel.FsyncIn{Fh: uint64(handle)})),
 			serve: func(t *testing.T, op any) error {

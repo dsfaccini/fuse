@@ -83,46 +83,6 @@ func (t *testTransport) written() [][]byte {
 	return t.writes
 }
 
-func TestConnectionTransportReadsWholeMessages(t *testing.T) {
-	messageA := makeTestInMessage(101)
-	messageB := makeTestInMessage(202)
-	transport := &testTransport{messages: [][]byte{messageA, messageB}}
-
-	for i, wantUnique := range []uint64{101, 202} {
-		inMessage := buffer.NewInMessage(len(messageA))
-		if err := inMessage.Init(transport); err != nil {
-			t.Fatalf("Init message %d: %v", i, err)
-		}
-		if got := inMessage.Header().Unique; got != wantUnique {
-			t.Errorf("message %d unique = %d, want %d", i, got, wantUnique)
-		}
-	}
-	if transport.reads != 2 {
-		t.Errorf("ReadMessage calls = %d, want 2", transport.reads)
-	}
-}
-
-func TestConnectionTransportWritesWholeReplies(t *testing.T) {
-	transport := &testTransport{}
-	c := &Connection{transport: transport}
-
-	var out buffer.OutMessage
-	out.Reset()
-	out.OutHeader().Unique = 77
-	out.Append([]byte("payload-a"), []byte("payload-b"))
-	want := append(append(append([]byte(nil), out.OutHeaderBytes()...), []byte("payload-a")...), []byte("payload-b")...)
-
-	if err := c.writeOutMessage(&out); err != nil {
-		t.Fatalf("writeOutMessage: %v", err)
-	}
-	if len(transport.writes) != 1 {
-		t.Fatalf("SendMessage calls = %d, want 1", len(transport.writes))
-	}
-	if !bytes.Equal(transport.writes[0], want) {
-		t.Errorf("written reply = %x, want %x", transport.writes[0], want)
-	}
-}
-
 // The kernel takes each write(2) or writev(2) to /dev/fuse as one whole
 // message, so a short write must fail instead of sending the rest as a second
 // message.

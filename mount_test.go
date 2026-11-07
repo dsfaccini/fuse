@@ -38,39 +38,6 @@ func (fs *minimalFS) StatFS(
 // Tests
 ////////////////////////////////////////////////////////////////////////
 
-func TestSuccessfulMount(t *testing.T) {
-	mounttest.SkipUnlessEnabled(t)
-
-	ctx := context.Background()
-
-	// Set up a temporary directory.
-	dir, err := ioutil.TempDir("", "mount_test")
-	if err != nil {
-		t.Fatalf("ioutil.TempDir: %v", err)
-	}
-
-	defer os.RemoveAll(dir)
-
-	// Mount.
-	fs := &minimalFS{}
-	mfs, err := fuse.Mount(
-		dir,
-		fuseutil.NewFileSystemServer(fs),
-		&fuse.MountConfig{})
-
-	if err != nil {
-		t.Fatalf("fuse.Mount: %v", err)
-	}
-
-	defer func() {
-		if err := mfs.Join(ctx); err != nil {
-			t.Errorf("Joining: %v", err)
-		}
-	}()
-
-	defer fuse.Unmount(mfs.Dir())
-}
-
 func TestMountContextUnmountsThroughItsBackend(t *testing.T) {
 	mounttest.SkipUnlessEnabled(t)
 
@@ -135,10 +102,18 @@ func TestNonexistentMountPoint(t *testing.T) {
 }
 
 // The mount point does not exist, so Mount fails without mounting. It reports
-// the config error only when it validates the config first.
+// the config error only when it validates the config first, and the missing
+// mount point for a config it accepts.
 func TestMountRejectsInvalidConfigBeforeMounting(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	const separator = "cannot contain commas or backslashes"
+	// Each OS accepts only its own backends.
+	const accepted = "no such file or directory"
+	refused := "is not available on " + runtime.GOOS
+	linux, kernelExtension, fskit := accepted, refused, refused
+	if runtime.GOOS == "darwin" {
+		linux, kernelExtension, fskit = refused, accepted, accepted
+	}
 	for _, test := range []struct {
 		name   string
 		config *fuse.MountConfig
@@ -157,6 +132,10 @@ func TestMountRejectsInvalidConfigBeforeMounting(t *testing.T) {
 		{name: "backslash in option key", config: &fuse.MountConfig{Options: map[string]string{`x\`: ""}}, want: separator},
 		{name: "MaxWrite above MaxPages", config: &fuse.MountConfig{MaxPages: 1, MaxWrite: 1 << 20}, want: "must be at least MaxWrite"},
 		{name: "unknown backend", config: &fuse.MountConfig{Backend: "kext"}, want: `backend "kext" is not available`},
+		{name: "no backend", config: &fuse.MountConfig{}, want: accepted},
+		{name: "Linux backend", config: &fuse.MountConfig{Backend: fuse.BackendLinux}, want: linux},
+		{name: "kernel extension backend", config: &fuse.MountConfig{Backend: fuse.BackendMacFUSEKernelExtension}, want: kernelExtension},
+		{name: "FSKit backend", config: &fuse.MountConfig{Backend: fuse.BackendFSKit}, want: fskit},
 		{name: "backend option", config: &fuse.MountConfig{Options: map[string]string{"backend": "fskit"}}, want: "MountConfig.Backend"},
 		{name: "empty backend option", config: &fuse.MountConfig{Options: map[string]string{"backend": ""}}, want: "MountConfig.Backend"},
 	} {

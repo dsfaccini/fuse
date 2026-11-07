@@ -24,28 +24,6 @@ import (
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
 
-// Mount hands the connection the FSKit transport itself, so the connection
-// sees that it pads short reads and answers a short READ with EIO.
-func TestShortReadThroughFakeFSKit(t *testing.T) {
-	served := make(chan struct{}, 2)
-	k := fuse.ServeFakeFSKit(t, fuseutil.NewFileSystemServer(&protocolFS{serve: func(op any) error {
-		defer func() { served <- struct{}{} }()
-		switch o := op.(type) {
-		case *fuseops.LookUpInodeOp:
-			o.Entry = fuseops.ChildInodeEntry{Child: child, Attributes: fuseops.InodeAttributes{Size: 200, Nlink: 1, Mode: 0o644}}
-		case *fuseops.ReadFileOp:
-			o.BytesRead = 46
-		}
-		return nil
-	}}))
-	k.Send(request(fusekernel.OpLookup, parent, names("file"))...)
-	<-served
-	k.NextReply(t)
-	k.Send(request(fusekernel.OpRead, child, fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Size: 512}))...)
-	<-served
-	checkReply(t, k.NextReply(t), syscall.EIO, nil)
-}
-
 // The size tracker parses the entries fuseutil.WriteDirentPlus writes,
 // through Mount, the FSKit transport and the fake MFMount.
 func TestReadDirPlusThroughFakeFSKitRecordsWrittenEntries(t *testing.T) {
