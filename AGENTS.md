@@ -29,6 +29,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Check a file system's lookup counts before you unmount it. At unmount, Linux
   ends the connection before it drops its inodes, so their forgets never
   arrive. `samples/forgetfs` checks in `TearDown`, before it unmounts.
+- Linux keeps an entry with a zero expiration cached until the next lookup of
+  its name. Until then the entry holds its inode, so the inode is not
+  forgotten.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes. `newOpTestConnection` in

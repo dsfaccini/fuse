@@ -51,8 +51,15 @@ func (t *ForgetFSTest) SetUp(ti *TestInfo) {
 }
 
 // The kernel drops its cached inodes at unmount without forgetting them, so
-// TearDown checks before it unmounts.
+// TearDown checks before it unmounts. A cached entry with a zero expiration
+// keeps its inode until the next lookup of its name, so TearDown first looks
+// up each name the tests create.
 func (t *ForgetFSTest) TearDown() {
+	for _, name := range []string{"blah", "bar/blah"} {
+		_, err := os.Stat(path.Join(t.Dir, name))
+		ExpectTrue(os.IsNotExist(err), "stat %s: %v", name, err)
+	}
+
 	ctx, cancel := context.WithTimeout(t.Ctx, 10*time.Second)
 	defer cancel()
 	ExpectEq(nil, t.fs.Check(ctx))

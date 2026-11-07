@@ -100,8 +100,9 @@ func (fs *ForgetFS) ServeOps(c *fuse.Connection) {
 }
 
 // Check waits until the kernel has forgotten every inode that CreateFile and
-// MkDir minted, or until ctx ends. Those inodes have no links and their
-// entries do not stay cached, so the kernel forgets each once nothing uses it.
+// MkDir minted, or until ctx ends. Those inodes have no links, so the kernel
+// forgets each once nothing uses it. Its cached entry still uses it until a
+// lookup of the name finds the name gone, so look up each created name first.
 // Check returns the recorded violations, and the minted inodes the kernel
 // still holds when ctx ends.
 func (fs *ForgetFS) Check(ctx context.Context) error {
