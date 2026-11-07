@@ -65,11 +65,12 @@ const fskitProbeMounts = 5
 // Each result is one log line: "FSKIT_PROBE " and a JSON object with item,
 // mount, result and details. A result the run does not settle is "unknown"
 // and does not fail the test. Only the two macfuse#1231 cases fail on a
-// measured result: each passes while the read of a short READ reply returns
-// the reported size, and fails once the read returns only the reply or fails
-// with EIO. A failed mount, measurements that stop early, a server panic and a
-// mount left behind also fail the test, and so does a second run in one
-// process, such as -count=2.
+// measured result. The first-read case expects the read of a short READ reply
+// to fail with EIO, and fails on any other result. The reread case passes
+// while the read returns the reported size, and fails once the read returns
+// only the reply or fails with EIO. A failed mount, measurements that stop
+// early, a server panic and a mount left behind also fail the test, and so
+// does a second run in one process, such as -count=2.
 //
 // The probe runs only on David's go-ahead in his own words, because macFUSE's
 // FSKit extension switches itself off after a series of mounts
