@@ -27,7 +27,7 @@ const Env = "FUSE_RUN_MOUNT_TESTS"
 // SkipUnlessEnabled skips t unless FUSE_RUN_MOUNT_TESTS=1. Every test that
 // mounts calls it before anything else.
 //
-// A test it lets run logs "FUSE_RUN_MOUNT_TESTS=1: mounting". CI fails the
+// A test it lets run logs "FUSE_RUN_MOUNT_TESTS=1: mounting". CI fails each
 // mounting job when no test that logged it passed.
 func SkipUnlessEnabled(t testing.TB) {
 	t.Helper()

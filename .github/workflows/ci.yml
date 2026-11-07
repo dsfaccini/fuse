@@ -11,18 +11,85 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its run in progress. Each push to
+# master gets a group of its own, so every merge runs in full.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
-  gofmt:
+  # Runs the mounting tests as the runner user, where Mount falls back to
+  # fusermount3.
+  #
+  # Only this job saves the Go build cache. The first job to finish saves the
+  # entry for a key, and every later run restores it, so a job that builds
+  # less would leave the others compiling from scratch.
+  linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MOUNT_USER: runner
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Set up Go
+      id: go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: stable
+        cache: false
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: &go-cache-path |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: &go-cache-key go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}
+    - name: Build
+      run: go build ./...
+    # composites reports unkeyed fusekernel.Protocol literals older than the
+    # fork.
+    - name: Vet
+      run: go vet -composites=false ./...
+    # A 32-bit int catches wire lengths that overflow it. The race detector
+    # does not support 386.
+    - name: Test (386)
+      run: GOARCH=386 go test -count=1 ./...
+    - &setup-fuse
+      name: Set up FUSE
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes fuse3
+        test -c /dev/fuse
+    # samples/flushfs runs go build, so root keeps the runner's PATH and HOME.
+    - &mount-test
+      name: Test
+      env:
+        FUSE_RUN_MOUNT_TESTS: "1"
+      run: |
+        set -o pipefail
+        exec_flag=()
+        if [ "$MOUNT_USER" = root ]; then
+          exec_flag=(-exec "sudo env PATH=$PATH HOME=$HOME FUSE_RUN_MOUNT_TESTS=1")
+        fi
+        go test "${exec_flag[@]}" -race -count=1 -timeout 5m -json ./... \
+          | tee "$RUNNER_TEMP/test.json" \
+          | jq -rj 'select(.Action == "output") | .Output'
+    # mounttest.SkipUnlessEnabled logs the marker in each test it lets run. A
+    # broken gate skips every mounting test, and the step above passes.
+    - &check-mounting-test
+      name: Check that a mounting test passed
+      run: |
+        jq -se '
+          (map(select(.Test and .Action == "output"
+                      and (.Output | contains("FUSE_RUN_MOUNT_TESTS=1: mounting")))
+               | [.Package, .Test]) | unique) as $mounting
+          | any(.[]; .Test and .Action == "pass" and ([.Package, .Test] | IN($mounting[])))
+        ' "$RUNNER_TEMP/test.json" > /dev/null || {
+          echo "::error::no mounting test passed; check the FUSE_RUN_MOUNT_TESTS gate"
+          exit 1
+        }
     # Check the codebase has been formatted by `gofmt`.
     # We run two `gofmt` commands for different purposes:
     # 1. `gofmt -d .`: to print diffs in the CI log if any.
@@ -34,88 +101,35 @@ jobs:
         gofmt -d .
         test -z $(gofmt -l .)
 
-  # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
-  linux:
+  # Runs the mounting tests as root through sudo, where Mount mounts directly.
+  linux-mount-root:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MOUNT_USER: root
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Set up Go
+      id: go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: stable
-    - name: Build
-      run: go build ./...
-    # composites reports unkeyed fusekernel.Protocol literals older than the
-    # fork.
-    - name: Vet
-      run: |
-        go vet -composites=false ./...
-        GOARCH=arm64 go vet -composites=false ./...
-    - name: Test
-      run: go test -race -count=1 ./...
-    # A 32-bit int catches wire lengths that overflow it. The race detector
-    # does not support 386.
-    - name: Test (386)
-      run: GOARCH=386 go test -count=1 ./...
-
-  # Runs the mounting tests twice: as the runner user, where Mount falls back
-  # to fusermount3, and as root, where Mount mounts directly.
-  linux-mount:
-    name: linux-mount (${{ matrix.user }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        user: [runner, root]
-
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        cache: false
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        persist-credentials: false
-    - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-      with:
-        go-version: stable
-    - name: Set up FUSE
-      run: |
-        sudo apt-get update
-        sudo apt-get install --yes fuse3
-        test -c /dev/fuse
-    # samples/flushfs runs go build, so root keeps the runner's PATH and HOME.
-    - name: Test
-      env:
-        FUSE_RUN_MOUNT_TESTS: "1"
-        MOUNT_USER: ${{ matrix.user }}
-      run: |
-        set -o pipefail
-        exec_flag=()
-        if [ "$MOUNT_USER" = root ]; then
-          exec_flag=(-exec "sudo env PATH=$PATH HOME=$HOME FUSE_RUN_MOUNT_TESTS=1")
-        fi
-        go test "${exec_flag[@]}" -race -count=1 -timeout 10m -json ./... \
-          | tee "$RUNNER_TEMP/test.json" \
-          | jq -rj 'select(.Action == "output") | .Output'
-    # mounttest.SkipUnlessEnabled logs the marker in each test it lets run. A
-    # broken gate skips every mounting test, and the step above passes.
-    - name: Check that a mounting test passed
-      run: |
-        jq -se '
-          (map(select(.Test and .Action == "output"
-                      and (.Output | contains("FUSE_RUN_MOUNT_TESTS=1: mounting")))
-               | [.Package, .Test]) | unique) as $mounting
-          | any(.[]; .Test and .Action == "pass" and ([.Package, .Test] | IN($mounting[])))
-        ' "$RUNNER_TEMP/test.json" > /dev/null || {
-          echo "::error::no mounting test passed; check the FUSE_RUN_MOUNT_TESTS gate"
-          exit 1
-        }
+        path: *go-cache-path
+        key: *go-cache-key
+    - *setup-fuse
+    - *mount-test
+    - *check-mounting-test
 
   # Mounting tests skip here: FUSE_RUN_MOUNT_TESTS is unset.
   macos:
     runs-on: macos-latest
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -152,6 +166,7 @@ jobs:
   # Builds and vets the consumer against this checkout, for Linux and darwin.
   artifact-fs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,10 +195,20 @@ jobs:
           echo "::error::artifact-fs does not require github.com/dsfaccini/fuse"
           exit 1
         fi
+    # A failed build is this checkout's fault only when artifact-fs main still
+    # builds against the fuse it pins.
     - name: Build and vet
       working-directory: artifact-fs
       run: |
-        go build ./...
-        go vet ./...
-        GOOS=darwin go build ./...
-        GOOS=darwin go vet ./...
+        check() {
+          go build ./... && go vet ./... &&
+            GOOS=darwin go build ./... && GOOS=darwin go vet ./...
+        }
+        check && exit 0
+        echo "Building artifact-fs main against the fuse it pins."
+        git checkout -- go.mod go.sum
+        if check; then
+          echo "::error::this checkout breaks artifact-fs main"
+          exit 1
+        fi
+        echo "::warning::artifact-fs main is broken on its own"
