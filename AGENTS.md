@@ -199,11 +199,23 @@ covers the change.
   protocol. One run makes at most 5 FSKit mounts. Its doc comment lists the
   mounts and what each measures.
 - Its gate is `FUSE_RUN_FSKIT_PROBE=1`. `FUSE_RUN_MOUNT_TESTS` does not run it.
-- Run it only on David's go-ahead in his own words. A click on an option you
-  wrote is not a go-ahead. macFUSE's FSKit extension switches itself off after
-  a series of mounts (https://github.com/macfuse/macfuse/issues/1232), and a
+- Run an FSKit test without asking first. These rules hold for every run that
+  mounts through FSKit, the probe included:
+  - Make at most 8 FSKit mounts per run.
+  - Mount nothing else on the machine during the run.
+  - After the first mount, read the log of macFUSE's FSKit module, process
+    `io.macfuse.app.fsmodule.macfuse`:
+    ```
+    log show --last 5m --style compact --predicate 'process BEGINSWITH "io.macfuse.app.fsmodule.macfuse" OR eventMessage CONTAINS "File system extension not enabled"'
+    ```
+    `log show` logs its own arguments. Ignore lines that contain
+    `log run noninteractively`.
+  - When the log holds "File system extension not enabled", stop the run. Ask
+    the machine's owner to re-enable the extension.
+- These rules exist because macFUSE's FSKit extension switches itself off
+  after a series of mounts (https://github.com/macfuse/macfuse/issues/1232). A
   stalled FSKit mount clears only on reboot.
-- Run it on darwin, outside any sandbox:
+- Run the probe on darwin, outside any sandbox:
   ```
   FUSE_RUN_FSKIT_PROBE=1 GOWORK=off go test -tags fuse_record -run '^TestFSKitProbe$' -v -count=1 -timeout 30m .
   ```

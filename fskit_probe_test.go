@@ -72,8 +72,8 @@ const fskitProbeMounts = 5
 // early, a server panic and a mount left behind also fail the test, and so
 // does a second run in one process, such as -count=2.
 //
-// The probe runs only on David's go-ahead in his own words, because macFUSE's
-// FSKit extension switches itself off after a series of mounts
+// The probe follows the FSKit run rules in AGENTS.md, "The FSKit probe",
+// because macFUSE's FSKit extension switches itself off after a series of mounts
 // (https://github.com/macfuse/macfuse/issues/1232) and a stalled FSKit mount
 // clears only on reboot. AGENTS.md has the command. The probe refuses to start
 // while a macFUSE volume or a probe mount point is mounted. It starts no
