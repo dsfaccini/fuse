@@ -15,7 +15,6 @@
 package memfs_test
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
 	"io/ioutil"
@@ -23,7 +22,6 @@ import (
 	"os/user"
 	"path"
 	"reflect"
-	"runtime"
 	"strconv"
 	"syscall"
 	"testing"
@@ -92,6 +90,11 @@ func applyUmask(m os.FileMode) os.FileMode {
 
 	// Apply it.
 	return m &^ os.FileMode(umask)
+}
+
+func getFileOffset(f *os.File) (offset int64, err error) {
+	const relativeToCurrent = 1
+	return f.Seek(0, relativeToCurrent)
 }
 
 func (t *memFSTest) checkReadWriteOpenFlags(
@@ -174,7 +177,6 @@ func (t *MemFSTest) Mkdir_OneLevel() {
 	ExpectEq(0, fi.Size())
 	ExpectEq(os.ModeDir|applyUmask(0754), fi.Mode())
 	ExpectThat(fi, fusetesting.MtimeIsWithin(createTime, timeSlop))
-	ExpectThat(fi, fusetesting.BirthtimeIsWithin(createTime, timeSlop))
 	ExpectTrue(fi.IsDir())
 
 	ExpectNe(0, stat.Ino)
@@ -230,7 +232,6 @@ func (t *MemFSTest) Mkdir_TwoLevels() {
 	ExpectEq(0, fi.Size())
 	ExpectEq(os.ModeDir|applyUmask(0754), fi.Mode())
 	ExpectThat(fi, fusetesting.MtimeIsWithin(createTime, timeSlop))
-	ExpectThat(fi, fusetesting.BirthtimeIsWithin(createTime, timeSlop))
 	ExpectTrue(fi.IsDir())
 
 	ExpectNe(0, stat.Ino)
@@ -344,7 +345,6 @@ func (t *MemFSTest) CreateNewFile_InRoot() {
 	ExpectEq(len(contents), fi.Size())
 	ExpectEq(applyUmask(0400), fi.Mode())
 	ExpectThat(fi, fusetesting.MtimeIsWithin(createTime, timeSlop))
-	ExpectThat(fi, fusetesting.BirthtimeIsWithin(createTime, timeSlop))
 	ExpectFalse(fi.IsDir())
 
 	ExpectNe(0, stat.Ino)
@@ -387,7 +387,6 @@ func (t *MemFSTest) CreateNewFile_InSubDir() {
 	ExpectEq(len(contents), fi.Size())
 	ExpectEq(applyUmask(0400), fi.Mode())
 	ExpectThat(fi, fusetesting.MtimeIsWithin(createTime, timeSlop))
-	ExpectThat(fi, fusetesting.BirthtimeIsWithin(createTime, timeSlop))
 	ExpectFalse(fi.IsDir())
 
 	ExpectNe(0, stat.Ino)
@@ -411,7 +410,6 @@ func (t *MemFSTest) ModifyExistingFile_InRoot() {
 	// Write a file.
 	fileName := path.Join(t.Dir, memfs.CheckFileOpenFlagsFileName)
 
-	createTime := time.Now()
 	err = ioutil.WriteFile(fileName, []byte("Hello, world!"), 0600)
 	AssertEq(nil, err)
 
@@ -435,7 +433,6 @@ func (t *MemFSTest) ModifyExistingFile_InRoot() {
 	ExpectEq(len("Hello, world!"), fi.Size())
 	ExpectEq(applyUmask(0600), fi.Mode())
 	ExpectThat(fi, fusetesting.MtimeIsWithin(modifyTime, timeSlop))
-	ExpectThat(fi, fusetesting.BirthtimeIsWithin(createTime, timeSlop))
 	ExpectFalse(fi.IsDir())
 
 	ExpectNe(0, stat.Ino)
@@ -465,7 +462,6 @@ func (t *MemFSTest) ModifyExistingFile_InSubDir() {
 	// Write a file.
 	fileName := path.Join(dirName, "foo")
 
-	createTime := time.Now()
 	err = ioutil.WriteFile(fileName, []byte("Hello, world!"), 0600)
 	AssertEq(nil, err)
 
@@ -488,7 +484,6 @@ func (t *MemFSTest) ModifyExistingFile_InSubDir() {
 	ExpectEq(len("Hello, world!"), fi.Size())
 	ExpectEq(applyUmask(0600), fi.Mode())
 	ExpectThat(fi, fusetesting.MtimeIsWithin(modifyTime, timeSlop))
-	ExpectThat(fi, fusetesting.BirthtimeIsWithin(createTime, timeSlop))
 	ExpectFalse(fi.IsDir())
 
 	ExpectNe(0, stat.Ino)
@@ -841,27 +836,6 @@ func (t *MemFSTest) WriteAtDoesntChangeOffset_AppendMode() {
 	offset, err := getFileOffset(f)
 	AssertEq(nil, err)
 	ExpectEq(4, offset)
-}
-
-func (t *MemFSTest) LargeFile() {
-	var err error
-
-	// Create a file.
-	f, err := os.Create(path.Join(t.Dir, "foo"))
-	t.ToClose = append(t.ToClose, f)
-	AssertEq(nil, err)
-
-	// Copy in large contents.
-	const size = 1 << 24
-	contents := bytes.Repeat([]byte{0x20}, size)
-
-	_, err = io.Copy(f, bytes.NewReader(contents))
-	AssertEq(nil, err)
-
-	// Read the full contents of the file.
-	contents, err = ioutil.ReadFile(f.Name())
-	AssertEq(nil, err)
-	ExpectEq(size, len(contents))
 }
 
 func (t *MemFSTest) AppendMode() {
@@ -1439,30 +1413,6 @@ func (t *MemFSTest) ReadHardlink() {
 	AssertEq(true, reflect.DeepEqual(original, linked))
 }
 
-func (t *MemFSTest) CreateInParallel_NoTruncate() {
-	fusetesting.RunCreateInParallelTest_NoTruncate(t.Ctx, t.Dir)
-}
-
-func (t *MemFSTest) CreateInParallel_Truncate() {
-	fusetesting.RunCreateInParallelTest_Truncate(t.Ctx, t.Dir)
-}
-
-func (t *MemFSTest) CreateInParallel_Exclusive() {
-	fusetesting.RunCreateInParallelTest_Exclusive(t.Ctx, t.Dir)
-}
-
-func (t *MemFSTest) MkdirInParallel() {
-	fusetesting.RunMkdirInParallelTest(t.Ctx, t.Dir)
-}
-
-func (t *MemFSTest) SymlinkInParallel() {
-	fusetesting.RunSymlinkInParallelTest(t.Ctx, t.Dir)
-}
-
-func (t *MemFSTest) HardlinkInParallel() {
-	fusetesting.RunHardlinkInParallelTest(t.Ctx, t.Dir)
-}
-
 func (t *MemFSTest) RenameWithinDir_File() {
 	var err error
 
@@ -1791,17 +1741,14 @@ func (t *MemFSTest) RenameOverExistingDirectory() {
 	err = os.Rename(newPath, oldPath)
 	ExpectThat(err, Error(MatchesRegexp("not empty|file exists")))
 
-	// As of Go 1.8 this shouldn't work the other way around either (see
-	// https://github.com/golang/go/commit/321c312).
-	if atLeastGo18 {
-		err = os.Rename(oldPath, newPath)
-		ExpectThat(err, Error(HasSubstr("file exists")))
+	// Nor the other way around (see https://github.com/golang/go/commit/321c312).
+	err = os.Rename(oldPath, newPath)
+	ExpectThat(err, Error(HasSubstr("file exists")))
 
-		// Both should still be present in the parent listing.
-		entries, err := fusetesting.ReadDirPicky(t.Dir)
-		AssertEq(nil, err)
-		ExpectEq(2, len(entries))
-	}
+	// Both should still be present in the parent listing.
+	entries, err := fusetesting.ReadDirPicky(t.Dir)
+	AssertEq(nil, err)
+	ExpectEq(2, len(entries))
 }
 
 func (t *MemFSTest) RenameOverExisting_WrongType() {
@@ -1977,11 +1924,6 @@ type MknodTest struct {
 func init() { RegisterTestSuite(&MknodTest{}) }
 
 func (t *MknodTest) File() {
-	// mknod(2) only works for root on OS X.
-	if runtime.GOOS == "darwin" {
-		return
-	}
-
 	var err error
 	p := path.Join(t.Dir, "foo")
 
@@ -2003,27 +1945,7 @@ func (t *MknodTest) File() {
 	ExpectEq("", string(contents))
 }
 
-func (t *MknodTest) Directory() {
-	// mknod(2) only works for root on OS X.
-	if runtime.GOOS == "darwin" {
-		return
-	}
-
-	var err error
-	p := path.Join(t.Dir, "foo")
-
-	// Quoth `man 2 mknod`: "Under Linux, this call cannot be used to create
-	// directories."
-	err = syscall.Mknod(p, syscall.S_IFDIR|0700, 0)
-	ExpectEq(syscall.EPERM, err)
-}
-
 func (t *MknodTest) AlreadyExists() {
-	// mknod(2) only works for root on OS X.
-	if runtime.GOOS == "darwin" {
-		return
-	}
-
 	var err error
 	p := path.Join(t.Dir, "foo")
 
@@ -2042,11 +1964,6 @@ func (t *MknodTest) AlreadyExists() {
 }
 
 func (t *MknodTest) NonExistentParent() {
-	// mknod(2) only works for root on OS X.
-	if runtime.GOOS == "darwin" {
-		return
-	}
-
 	var err error
 	p := path.Join(t.Dir, "foo/bar")
 

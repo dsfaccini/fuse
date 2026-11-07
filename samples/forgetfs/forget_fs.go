@@ -16,8 +16,10 @@ package forgetfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/dsfaccini/fuse"
 	"github.com/dsfaccini/fuse/fuseops"
@@ -33,11 +35,10 @@ import (
 // name may be created within any directory, but the resulting inode will
 // appear to have been unlinked immediately.
 //
-// The file system maintains reference counts for the inodes involved. It will
-// panic if a reference count becomes negative or if an inode ID is re-used
-// after we expect it to be dead. Its Check method may be used to check that
-// there are no inodes with unexpected reference counts remaining, after
-// unmounting.
+// The file system maintains lookup counts for the inodes involved. It records
+// a violation when the kernel forgets more lookups than an inode has, or names
+// an inode the file system never issued or the kernel has forgotten. Check
+// reports those violations, and each created inode the kernel still holds.
 func NewFileSystem() *ForgetFS {
 	// Set up the actual file system.
 	impl := &fsImpl{
@@ -62,6 +63,7 @@ func NewFileSystem() *ForgetFS {
 			},
 		},
 		nextInodeID: cannedID_Next,
+		forgot:      make(chan struct{}),
 	}
 
 	// The root inode starts with a lookup count of one.
@@ -97,10 +99,13 @@ func (fs *ForgetFS) ServeOps(c *fuse.Connection) {
 	fs.server.ServeOps(c)
 }
 
-// Panic if there are any inodes that have a non-zero reference count. For use
-// after unmounting.
-func (fs *ForgetFS) Check() {
-	fs.impl.Check()
+// Check waits until the kernel has forgotten every inode that CreateFile and
+// MkDir minted, or until ctx ends. Those inodes have no links and their
+// entries do not stay cached, so the kernel forgets each once nothing uses it.
+// Check returns the recorded violations, and the minted inodes the kernel
+// still holds when ctx ends.
+func (fs *ForgetFS) Check(ctx context.Context) error {
+	return fs.impl.check(ctx)
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -134,6 +139,16 @@ type fsImpl struct {
 	//
 	// GUARDED_BY(mu)
 	nextInodeID fuseops.InodeID
+
+	// Each violation of the lookup-count contract seen so far.
+	//
+	// GUARDED_BY(mu)
+	violations []error
+
+	// Closed and replaced on each forget.
+	//
+	// GUARDED_BY(mu)
+	forgot chan struct{}
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -159,22 +174,6 @@ func (in *inode) IncrementLookupCount() {
 	in.lookedUp = true
 }
 
-func (in *inode) DecrementLookupCount(n uint64) {
-	if in.lookupCount < n {
-		panic(fmt.Sprintf(
-			"Overly large decrement: %v, %v",
-			in.lookupCount,
-			n))
-	}
-
-	in.lookupCount -= n
-}
-
-// Decrement the lookup count to zero.
-func (in *inode) Destroy() {
-	in.DecrementLookupCount(in.lookupCount)
-}
-
 ////////////////////////////////////////////////////////////////////////
 // Helpers
 ////////////////////////////////////////////////////////////////////////
@@ -190,28 +189,52 @@ func (fs *fsImpl) checkInvariants() {
 }
 
 // LOCKS_EXCLUDED(fs.mu)
-func (fs *fsImpl) Check() {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+func (fs *fsImpl) check(ctx context.Context) error {
+	for {
+		fs.mu.Lock()
+		errs := append([]error(nil), fs.violations...)
+		var held []fuseops.InodeID
+		for id, in := range fs.inodes {
+			if id >= cannedID_Next && in.lookupCount != 0 {
+				held = append(held, id)
+			}
+		}
+		forgot := fs.forgot
+		fs.mu.Unlock()
 
-	for k, v := range fs.inodes {
-		if v.lookupCount != 0 {
-			panic(fmt.Sprintf("Inode %v has lookup count %v", k, v.lookupCount))
+		if len(held) == 0 {
+			return errors.Join(errs...)
+		}
+
+		select {
+		case <-forgot:
+		case <-ctx.Done():
+			sort.Slice(held, func(i, j int) bool { return held[i] < held[j] })
+			errs = append(errs, fmt.Errorf("%v: the kernel still holds created inodes %v", ctx.Err(), held))
+			return errors.Join(errs...)
 		}
 	}
 }
 
-// Look up the inode and verify it hasn't been forgotten.
+// LOCKS_REQUIRED(fs.mu)
+func (fs *fsImpl) violate(format string, args ...interface{}) {
+	fs.violations = append(fs.violations, fmt.Errorf(format, args...))
+}
+
+// Look up the inode, recording a violation and returning nil when the file
+// system never issued it or the kernel has forgotten it.
 //
 // LOCKS_REQUIRED(fs.mu)
 func (fs *fsImpl) findInodeByID(id fuseops.InodeID) *inode {
 	in := fs.inodes[id]
-	if in == nil {
-		panic(fmt.Sprintf("Unknown inode: %v", id))
-	}
+	switch {
+	case in == nil:
+		fs.violate("unknown inode: %v", id)
+		return nil
 
-	if in.Forgotten() {
-		panic(fmt.Sprintf("Forgotten inode: %v", id))
+	case in.Forgotten():
+		fs.violate("forgotten inode: %v", id)
+		return nil
 	}
 
 	return in
@@ -234,7 +257,9 @@ func (fs *fsImpl) LookUpInode(
 	defer fs.mu.Unlock()
 
 	// Make sure the parent exists and has not been forgotten.
-	_ = fs.findInodeByID(op.Parent)
+	if fs.findInodeByID(op.Parent) == nil {
+		return fuse.EIO
+	}
 
 	// Handle the names we support.
 	var childID fuseops.InodeID
@@ -251,6 +276,9 @@ func (fs *fsImpl) LookUpInode(
 
 	// Look up the child.
 	child := fs.findInodeByID(childID)
+	if child == nil {
+		return fuse.EIO
+	}
 	child.IncrementLookupCount()
 
 	// Return an appropriate entry.
@@ -270,6 +298,9 @@ func (fs *fsImpl) GetInodeAttributes(
 
 	// Find the inode, verifying that it has not been forgotten.
 	in := fs.findInodeByID(op.Inode)
+	if in == nil {
+		return fuse.EIO
+	}
 
 	// Return appropriate attributes.
 	op.Attributes = in.attributes
@@ -285,7 +316,16 @@ func (fs *fsImpl) ForgetInode(
 
 	// Find the inode and decrement its count.
 	in := fs.findInodeByID(op.Inode)
-	in.DecrementLookupCount(op.N)
+	if in == nil {
+		return nil
+	}
+	if in.lookupCount < op.N {
+		fs.violate("forget of %v lookups of inode %v, which has %v", op.N, op.Inode, in.lookupCount)
+	}
+	in.lookupCount -= min(op.N, in.lookupCount)
+
+	close(fs.forgot)
+	fs.forgot = make(chan struct{})
 
 	return nil
 }
@@ -297,7 +337,9 @@ func (fs *fsImpl) MkDir(
 	defer fs.mu.Unlock()
 
 	// Make sure the parent exists and has not been forgotten.
-	_ = fs.findInodeByID(op.Parent)
+	if fs.findInodeByID(op.Parent) == nil {
+		return fuse.EIO
+	}
 
 	// Mint a child inode.
 	childID := fs.nextInodeID
@@ -329,7 +371,9 @@ func (fs *fsImpl) CreateFile(
 	defer fs.mu.Unlock()
 
 	// Make sure the parent exists and has not been forgotten.
-	_ = fs.findInodeByID(op.Parent)
+	if fs.findInodeByID(op.Parent) == nil {
+		return fuse.EIO
+	}
 
 	// Mint a child inode.
 	childID := fs.nextInodeID
@@ -361,7 +405,9 @@ func (fs *fsImpl) OpenFile(
 	defer fs.mu.Unlock()
 
 	// Verify that the inode has not been forgotten.
-	_ = fs.findInodeByID(op.Inode)
+	if fs.findInodeByID(op.Inode) == nil {
+		return fuse.EIO
+	}
 
 	return nil
 }
@@ -373,13 +419,9 @@ func (fs *fsImpl) OpenDir(
 	defer fs.mu.Unlock()
 
 	// Verify that the inode has not been forgotten.
-	_ = fs.findInodeByID(op.Inode)
+	if fs.findInodeByID(op.Inode) == nil {
+		return fuse.EIO
+	}
 
 	return nil
-}
-
-func (fs *fsImpl) Destroy() {
-	for _, in := range fs.inodes {
-		in.Destroy()
-	}
 }

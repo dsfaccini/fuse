@@ -47,12 +47,8 @@ func TestMountContextUnmountsThroughItsBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fuse.MountContext: %v", err)
 	}
-	want := fuse.BackendLinux
-	if runtime.GOOS == "darwin" {
-		want = fuse.BackendMacFUSEKernelExtension
-	}
-	if got := mfs.Backend(); got != want {
-		t.Errorf("Backend() = %q, want %q", got, want)
+	if got := mfs.Backend(); got != fuse.BackendLinux {
+		t.Errorf("Backend() = %q, want %q", got, fuse.BackendLinux)
 	}
 	if err := mfs.Unmount(ctx); err != nil {
 		t.Fatalf("Unmount: %v", err)

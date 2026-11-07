@@ -15,10 +15,12 @@
 package forgetfs_test
 
 import (
+	"context"
 	"io"
 	"os"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/dsfaccini/fuse/internal/mounttest"
 	"github.com/dsfaccini/fuse/samples"
@@ -48,12 +50,14 @@ func (t *ForgetFSTest) SetUp(ti *TestInfo) {
 	t.SampleTest.SetUp(ti)
 }
 
+// The kernel drops its cached inodes at unmount without forgetting them, so
+// TearDown checks before it unmounts.
 func (t *ForgetFSTest) TearDown() {
-	// Unmount.
-	t.SampleTest.TearDown()
+	ctx, cancel := context.WithTimeout(t.Ctx, 10*time.Second)
+	defer cancel()
+	ExpectEq(nil, t.fs.Check(ctx))
 
-	// Crash if anything is left.
-	t.fs.Check()
+	t.SampleTest.TearDown()
 }
 
 ////////////////////////////////////////////////////////////////////////

@@ -16,6 +16,7 @@ package samples
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -27,6 +28,12 @@ import (
 	"github.com/jacobsa/ogletest"
 	"github.com/jacobsa/timeutil"
 )
+
+var fDebug = flag.Bool("debug", false, "If true, print fuse debug info.")
+
+// unmountTimeout bounds how long TearDown retries unmounting a busy file
+// system.
+const unmountTimeout = 30 * time.Second
 
 // A struct that implements common behavior needed by tests in the samples/
 // directory. Use it as an embedded field in your test fixture, calling its
@@ -129,8 +136,10 @@ func (t *SampleTest) destroy() (err error) {
 	}
 
 	// Unmount the file system.
-	if err := unmount(t.Dir); err != nil {
-		return fmt.Errorf("unmount: %v", err)
+	ctx, cancel := context.WithTimeout(t.Ctx, unmountTimeout)
+	defer cancel()
+	if err := t.mfs.Unmount(ctx); err != nil {
+		return fmt.Errorf("Unmount: %v", err)
 	}
 
 	// Unlink the mount point.

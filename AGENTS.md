@@ -7,7 +7,7 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 ## Tests never mount by default
 
 - Every mounting test calls `mounttest.SkipUnlessEnabled` first, so plain
-  `go test ./...` mounts nothing. The mounting tests run only with
+  `go test ./...` mounts nothing. The mounting tests run only on Linux, with
   `FUSE_RUN_MOUNT_TESTS=1`.
 - The FSKit probe calls `mounttest.SkipUnlessFSKitProbeEnabled` instead. See
   "The FSKit probe".
@@ -21,11 +21,14 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - That test matches names without type checking, so it can miss a mount
   reached through a shape it does not model, such as non-test code or another
   package. Read new mounting code by hand.
-- Set `FUSE_RUN_MOUNT_TESTS=1` only on a host that can mount. On Linux that
-  needs `fuse3`. On darwin the tests mount through the macFUSE kernel
-  extension, which needs macFUSE installed with that extension enabled.
+- Set `FUSE_RUN_MOUNT_TESTS=1` only on a Linux host with `fuse3`.
+  `SkipUnlessEnabled` skips every mounting test on other OSes, so no test
+  mounts through the macFUSE kernel extension.
 - Only the `linux` and `linux-mount-root` CI jobs set
   `FUSE_RUN_MOUNT_TESTS=1`. To check a mounting test, push and read both jobs.
+- Check a file system's lookup counts before you unmount it. At unmount, Linux
+  ends the connection before it drops its inodes, so their forgets never
+  arrive. `samples/forgetfs` checks in `TearDown`, before it unmounts.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes. `newOpTestConnection` in
@@ -70,8 +73,8 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   point. A regression then fails with ENOENT instead of mounting.
 - On darwin, the root package's test binary cannot reach macFUSE by default.
   Its `init` in `mount_deny_darwin_test.go` points `fskitFrameworkPath` at a
-  missing path unless `FUSE_RUN_FSKIT_PROBE=1`, and `macfuseMountHelper`
-  unless `FUSE_RUN_MOUNT_TESTS=1`. `TestMountsAreDeniedByDefault` checks it.
+  missing path unless `FUSE_RUN_FSKIT_PROBE=1`, and `macfuseMountHelper` at
+  one always. `TestMountsAreDeniedByDefault` checks it.
 - To load the installed MFMount in a test, call `useInstalledMFMount`. It
   restores the denied path and the loader cache when the test ends.
 - Before you run a mutant of mount, backend or loader code, check that every

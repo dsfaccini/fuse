@@ -30,32 +30,26 @@ const deniedMountDir = "/var/empty/fuse-tests-deny-mounts"
 var installedMFMount = fskitFrameworkPath
 
 // init keeps every test in this binary, package fuse_test included, from
-// reaching macFUSE's real MFMount or mount helper, unless the gate that allows
-// that mount is set. A regression in backend selection then fails instead of
-// mounting.
+// reaching macFUSE's real mount helper, and its real MFMount unless the FSKit
+// probe's gate is set. The mounting tests run only on Linux, so no gate lets a
+// test reach the mount helper. A regression in backend selection then fails
+// instead of mounting.
 func init() {
 	if os.Getenv(mounttest.FSKitProbeEnv) != "1" {
 		fskitFrameworkPath = deniedMountDir + "/MFMount"
 	}
-	if os.Getenv(mounttest.Env) != "1" {
-		macfuseMountHelper = deniedMountDir + "/mount_macfuse"
-	}
+	macfuseMountHelper = deniedMountDir + "/mount_macfuse"
 }
 
 func TestMountsAreDeniedByDefault(t *testing.T) {
-	for _, denied := range []struct {
-		gate string
-		path string
-	}{
-		{gate: mounttest.FSKitProbeEnv, path: fskitFrameworkPath},
-		{gate: mounttest.Env, path: macfuseMountHelper},
-	} {
-		if os.Getenv(denied.gate) == "1" {
-			continue
-		}
-		if _, err := os.Stat(denied.path); !os.IsNotExist(err) {
-			t.Errorf("without %s=1, tests can reach %s: stat error = %v, want it missing", denied.gate, denied.path, err)
-		}
+	if _, err := os.Stat(macfuseMountHelper); !os.IsNotExist(err) {
+		t.Errorf("tests can reach %s: stat error = %v, want it missing", macfuseMountHelper, err)
+	}
+	if os.Getenv(mounttest.FSKitProbeEnv) == "1" {
+		return
+	}
+	if _, err := os.Stat(fskitFrameworkPath); !os.IsNotExist(err) {
+		t.Errorf("without %s=1, tests can reach %s: stat error = %v, want it missing", mounttest.FSKitProbeEnv, fskitFrameworkPath, err)
 	}
 }
 
