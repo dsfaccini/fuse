@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"runtime"
 	"strings"
@@ -238,6 +239,25 @@ func TestShortReadOnPaddingTransport(t *testing.T) {
 				t.Errorf("read reply = errno %d with %d bytes, want errno %d with %d bytes", errno, n, tt.wantErrno, tt.wantLen)
 			}
 		})
+	}
+}
+
+func TestShortReadErrorLogLine(t *testing.T) {
+	init := fusekernel.InitIn{Major: fusekernel.ProtoVersionMaxMajor, Minor: fusekernel.ProtoVersionMaxMinor}
+	transport := &testTransport{messages: [][]byte{makeOpMessage(fusekernel.OpInit, 1, 0, structBytes(&init))}}
+	var logged strings.Builder
+	c, err := newConnection(normalizedConfig(t, MountConfig{}), nil, log.New(&logged, "", 0), nil, paddingTestTransport{transport})
+	if err != nil {
+		t.Fatalf("newConnection: %v", err)
+	}
+	o := &opTestConnection{t: t, transport: transport, c: c, unique: 1}
+	o.lookUp(2, 200)
+	if errno, _ := o.read(2, 150, 100, 49); errno != syscall.EIO {
+		t.Fatalf("read reply = errno %d, want EIO", errno)
+	}
+	want := "Op 0x00000003 *fuseops.ReadFileOp] -> Error: \"read of inode 2 at offset 150 returned 49 bytes, want 50 for size 200: input/output error\"\n"
+	if got := logged.String(); got != want {
+		t.Errorf("error log = %q, want %q; MountConfig.ErrorLogger states the format", got, want)
 	}
 }
 

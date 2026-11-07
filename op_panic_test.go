@@ -47,12 +47,21 @@ func (l logLines) next(t *testing.T) string {
 	}
 }
 
-// checkPanicLogged checks that line carries the panic value and a readable
-// stack that reaches the panic in this file.
-func checkPanicLogged(t *testing.T, line, value string) {
+// checkPanicLogged checks that line holds first on a line of its own, then a
+// readable stack that reaches the panic in this file.
+func checkPanicLogged(t *testing.T, line, first string) {
 	t.Helper()
-	if !strings.Contains(line, value) || !strings.Contains(line, "\ngoroutine ") || !strings.Contains(line, "op_panic_test.go") {
-		t.Errorf("error log = %q, want the panic %q and its stack on lines of their own", line, value)
+	stack, ok := strings.CutPrefix(line, first+"\n")
+	if !ok || !strings.HasPrefix(stack, "goroutine ") || !strings.Contains(stack, "op_panic_test.go") {
+		t.Errorf("error log = %q, want %q and then its stack; MountConfig.ErrorLogger states the format", line, first)
+	}
+}
+
+// checkErrorLogged checks the line logged for an op's error.
+func checkErrorLogged(t *testing.T, line, want string) {
+	t.Helper()
+	if line != want {
+		t.Errorf("error log = %q, want %q; MountConfig.ErrorLogger states the format", line, want)
 	}
 }
 
@@ -91,10 +100,13 @@ func TestHandlerPanicIsAnsweredWithEIO(t *testing.T) {
 		name    string
 		request [][]byte
 		noReply bool
+		logged  string
 	}{
-		{name: "lookup", request: request(fusekernel.OpLookup, parent, names("file"))},
+		{name: "lookup", request: request(fusekernel.OpLookup, parent, names("file")),
+			logged: "Op 0x0000002a *fuseops.LookUpInodeOp] -> Error: panic: handler boom"},
 		// ForgetInode runs on the goroutine that reads requests.
-		{name: "forget", request: request(fusekernel.OpForget, child, fuse.NativeBytes(&fusekernel.ForgetIn{Nlookup: 1})), noReply: true},
+		{name: "forget", request: request(fusekernel.OpForget, child, fuse.NativeBytes(&fusekernel.ForgetIn{Nlookup: 1})), noReply: true,
+			logged: "Op 0x0000002a *fuseops.ForgetInodeOp] -> Error: panic: handler boom"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -103,7 +115,7 @@ func TestHandlerPanicIsAnsweredWithEIO(t *testing.T) {
 			if !tt.noReply {
 				checkReply(t, k.NextReply(t), syscall.EIO, nil)
 			}
-			checkPanicLogged(t, lines.next(t), "panic: handler boom")
+			checkPanicLogged(t, lines.next(t), tt.logged)
 			checkStillServing(t, k)
 			checkNoMoreLogs(t, lines)
 			if n := k.UnreadReplies(); n != 0 {
@@ -120,9 +132,7 @@ func TestHandlerGoexitIsAnsweredWithEIO(t *testing.T) {
 	})
 	k.Send(request(fusekernel.OpLookup, parent, names("file"))...)
 	checkReply(t, k.NextReply(t), syscall.EIO, nil)
-	if line := lines.next(t); !strings.Contains(line, "exited without returning") {
-		t.Errorf("error log = %q, want the method's exit", line)
-	}
+	checkErrorLogged(t, lines.next(t), "Op 0x0000002a *fuseops.LookUpInodeOp] -> Error: \"fuseutil: the method exited without returning: input/output error\"\n")
 	checkStillServing(t, k)
 	checkNoMoreLogs(t, lines)
 }
@@ -141,8 +151,9 @@ func TestCallbackPanicGoesToTheDebugLogger(t *testing.T) {
 	checkReply(t, k.NextReply(t), 0, nil)
 	for {
 		line := lines.next(t)
-		if strings.Contains(line, "Callback: panic: callback boom") {
-			checkPanicLogged(t, line, "callback boom")
+		// A debug line names its caller's source line after the request ID.
+		if _, after, ok := strings.Cut(line, "] -> Callback: "); ok {
+			checkPanicLogged(t, after, "panic: callback boom")
 			return
 		}
 	}
@@ -160,7 +171,7 @@ func TestCallbackPanicKeepsTheReply(t *testing.T) {
 	readIn := fuse.NativeBytes(&fusekernel.ReadIn{Fh: uint64(handle), Size: 1 << 16})
 	k.Send(request(fusekernel.OpRead, child, readIn)...)
 	checkReply(t, k.NextReply(t), 0, []byte("hello"))
-	checkPanicLogged(t, lines.next(t), "callback boom")
+	checkPanicLogged(t, lines.next(t), "Op 0x0000002a *fuseops.ReadFileOp] -> Callback: panic: callback boom")
 	checkStillServing(t, k)
 	checkNoMoreLogs(t, lines)
 	if n := k.UnreadReplies(); n != 0 {
@@ -174,27 +185,28 @@ func TestBytesReadOutsideItsBufferIsAnsweredWithEIO(t *testing.T) {
 		name    string
 		request [][]byte
 		serve   func(op any)
+		logged  string
 	}{
 		{"read past Dst", request(fusekernel.OpRead, child, readIn), func(op any) {
 			op.(*fuseops.ReadFileOp).BytesRead = 17
-		}},
+		}, `Op 0x0000002a *fuseops.ReadFileOp] -> Error: "*fuseops.ReadFileOp.BytesRead is 17, outside its 16-byte buffer: input/output error"`},
 		{"read past Data", request(fusekernel.OpRead, child, readIn), func(op any) {
 			o := op.(*fuseops.ReadFileOp)
 			o.Data = [][]byte{[]byte("hello")}
 			o.BytesRead = 6
-		}},
+		}, `Op 0x0000002a *fuseops.ReadFileOp] -> Error: "*fuseops.ReadFileOp.BytesRead is 6, outside its 5-byte buffer: input/output error"`},
 		{"negative read", request(fusekernel.OpRead, child, readIn), func(op any) {
 			op.(*fuseops.ReadFileOp).BytesRead = -1
-		}},
+		}, `Op 0x0000002a *fuseops.ReadFileOp] -> Error: "*fuseops.ReadFileOp.BytesRead is -1, outside its 16-byte buffer: input/output error"`},
 		{"readdir past Dst", request(fusekernel.OpReaddir, child, readIn), func(op any) {
 			op.(*fuseops.ReadDirOp).BytesRead = 17
-		}},
+		}, `Op 0x0000002a *fuseops.ReadDirOp] -> Error: "*fuseops.ReadDirOp.BytesRead is 17, outside its 16-byte buffer: input/output error"`},
 		{"readdirplus past Dst", request(fusekernel.OpReaddirplus, child, readIn), func(op any) {
 			op.(*fuseops.ReadDirPlusOp).BytesRead = 17
-		}},
+		}, `Op 0x0000002a *fuseops.ReadDirPlusOp] -> Error: "*fuseops.ReadDirPlusOp.BytesRead is 17, outside its 16-byte buffer: input/output error"`},
 		{"listxattr past Dst", request(fusekernel.OpListxattr, child, fuse.NativeBytes(&fusekernel.ListxattrIn{Size: 16})), func(op any) {
 			op.(*fuseops.ListXattrOp).BytesRead = 17
-		}},
+		}, `Op 0x0000002a *fuseops.ListXattrOp] -> Error: "*fuseops.ListXattrOp.BytesRead is 17, outside its 16-byte buffer: input/output error"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -204,9 +216,7 @@ func TestBytesReadOutsideItsBufferIsAnsweredWithEIO(t *testing.T) {
 			})
 			k.Send(tt.request...)
 			checkReply(t, k.NextReply(t), syscall.EIO, nil)
-			if line := lines.next(t); !strings.Contains(line, "BytesRead is ") {
-				t.Errorf("error log = %q, want the bad BytesRead", line)
-			}
+			checkErrorLogged(t, lines.next(t), tt.logged+"\n")
 			checkStillServing(t, k)
 			checkNoMoreLogs(t, lines)
 		})
