@@ -24,8 +24,8 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Set `FUSE_RUN_MOUNT_TESTS=1` only on a host that can mount. On Linux that
   needs `fuse3`. On darwin the tests mount through the macFUSE kernel
   extension, which needs macFUSE installed with that extension enabled.
-- Only the `linux-mount` CI job sets `FUSE_RUN_MOUNT_TESTS=1`. To check a
-  mounting test, push and read that job.
+- Only the `linux` and `linux-mount-root` CI jobs set
+  `FUSE_RUN_MOUNT_TESTS=1`. To check a mounting test, push and read both jobs.
 - To test `Connection` without a mount, use `testTransport` in
   `transport_test.go`. It feeds canned messages to `ReadOp` and records or
   fails the writes `Reply` makes. `newOpTestConnection` in
@@ -80,8 +80,9 @@ Run these locally, in this order. None of them mounts.
 
 1. `gofmt -l .` prints nothing.
 2. `go build ./...`
-3. `go vet -composites=false ./...` with `GOOS=linux GOARCH=amd64` and
-   `GOOS=linux GOARCH=arm64`. Add `-unsafeptr=false` with `GOOS=darwin`.
+3. `go vet -composites=false ./...` with `GOOS=linux GOARCH=amd64`. Add
+   `-unsafeptr=false` with `GOOS=darwin`. No file is specific to an
+   architecture, so a second Linux architecture adds nothing.
    composites reports unkeyed `fusekernel.Protocol` literals older than the
    fork. On darwin, unsafeptr reports the purego addresses that the FSKit fake
    and probe convert to pointers.
@@ -93,26 +94,33 @@ crash it finds. Keep the input file it writes under
 `testdata/fuzz/FuzzConvertInMessage/`: `go test` replays that corpus.
 
 CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
-`master`:
+`master`. Each push to `master` runs in full, so every merge gets a CI run. A
+new push to a pull request cancels that pull request's run in progress. Every
+job times out after 10 minutes.
 
-- `gofmt`.
-- `linux` and `macos`: build, vet and `go test -race -count=1 ./...`.
-- `linux` also runs `GOARCH=386 go test -count=1 ./...`. A 32-bit `int` catches
-  wire lengths that overflow it. Go has no darwin/386 port. On a Mac, leave
-  that step to CI.
-- `linux-mount`: installs `fuse3` and runs
-  `go test -race -count=1 -timeout 10m ./...` with `FUSE_RUN_MOUNT_TESTS=1`,
-  twice. As the runner user, `Mount` falls back to `fusermount3`. As root
-  through `sudo`, `Mount` mounts directly.
-- `linux-mount` fails when no test that `mounttest.SkipUnlessEnabled` let run
-  passed. It finds those tests by the line the gate logs.
-- `macos` installs macFUSE 5.5.0 from its GitHub release, pinned by
-  SHA-256. The tests that call `useInstalledMFMount` fail when
-  `GITHUB_ACTIONS=true` and macFUSE is missing or older than 5.5, and skip
-  elsewhere.
+- `linux`: build, vet, `GOARCH=386 go test -count=1 ./...`, the mounting
+  tests, then `gofmt`. A 32-bit `int` catches wire lengths that overflow it.
+  Go has no darwin/386 port. On a Mac, leave the 386 step to CI.
+- `linux` and `linux-mount-root` install `fuse3` and run
+  `go test -race -count=1 -timeout 5m ./...` with `FUSE_RUN_MOUNT_TESTS=1`.
+  In `linux`, as the runner user, `Mount` falls back to `fusermount3`. In
+  `linux-mount-root`, as root through `sudo`, `Mount` mounts directly.
+- Each of those two jobs fails when no test that
+  `mounttest.SkipUnlessEnabled` let run passed. It finds those tests by the
+  line the gate logs.
+- Only `linux` saves the Go build cache, and `linux-mount-root` only restores
+  it. Pass `cache: false` to `setup-go` in any other Linux job that would key
+  its cache on this repo's `go.sum`. The first job to finish saves the entry
+  for a key, and every later run restores that entry.
+- `macos`: build, vet and `go test -race -count=1 ./...`. It installs macFUSE
+  5.5.0 from its GitHub release, pinned by SHA-256. The tests that call
+  `useInstalledMFMount` fail when `GITHUB_ACTIONS=true` and macFUSE is missing
+  or older than 5.5, and skip elsewhere.
 - `artifact-fs`: builds and vets `dsfaccini/artifact-fs` `main` against this
   checkout, for Linux and darwin. An API change that breaks the consumer fails
-  here.
+  here. When that build fails, the job builds `main` again against the fuse it
+  pins. When that build fails too, artifact-fs is broken on its own, and the
+  job passes with a warning.
 
 ## On Linux, Mount answers the poll hack's requests itself
 
