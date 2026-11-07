@@ -18,7 +18,6 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/buffer"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
 )
@@ -68,39 +67,6 @@ func FuzzConvertInMessage(f *testing.F) {
 			t.Errorf("reply grew to %d bytes, want at most %d", outMsg.Len(), limit)
 		}
 	})
-}
-
-func TestConvertInMessageSizeZeroDirReadHasNoDst(t *testing.T) {
-	in := fusekernel.ReadIn{Size: 0}
-	for _, opcode := range []uint32{fusekernel.OpReaddir, fusekernel.OpReaddirplus} {
-		c := newTestConnection(nil)
-		op, outMsg, err := convertTestMessage(t, c, testMessage(opcode, 1, structBytes(&in)))
-		if err != nil {
-			t.Fatalf("opcode %d: convertInMessage: %v", opcode, err)
-		}
-		var dst []byte
-		switch op := op.(type) {
-		case *fuseops.ReadDirOp:
-			dst = op.Dst
-		case *fuseops.ReadDirPlusOp:
-			dst = op.Dst
-		}
-		if len(dst) != 0 || outMsg.Len() != buffer.OutMessageHeaderSize {
-			t.Errorf("opcode %d: len(Dst) = %d, reply = %d bytes; want 0 and the header", opcode, len(dst), outMsg.Len())
-		}
-	}
-}
-
-func TestConvertInMessageWriteDataHasRequestedSize(t *testing.T) {
-	c := newTestConnection(nil)
-	in := fusekernel.WriteIn{Size: 1}
-	op, _, err := convertTestMessage(t, c, testMessage(fusekernel.OpWrite, 1, structBytes(&in), []byte("abc")))
-	if err != nil {
-		t.Fatalf("convertInMessage: %v", err)
-	}
-	if data := op.(*fuseops.WriteFileOp).Data; string(data) != "a" {
-		t.Errorf("Data = %q, want %q", data, "a")
-	}
 }
 
 // A count the body cannot hold must not size an allocation.

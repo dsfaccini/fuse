@@ -41,12 +41,6 @@ func TestFSKitMountErrorTellsUserWhatToDo(t *testing.T) {
 	}
 }
 
-func TestErrFSKitUnavailableNamesTheMinimumMacFUSE(t *testing.T) {
-	if got := ErrFSKitUnavailable.Error(); !strings.Contains(got, "macFUSE 5.5 or later") {
-		t.Errorf("ErrFSKitUnavailable = %q, want it to name macFUSE 5.5", got)
-	}
-}
-
 // Results 1 through 4 hold for every mount until the user acts, so a caller
 // can stop retrying.
 func TestFSKitMountErrorMatchesErrFSKitUnavailable(t *testing.T) {

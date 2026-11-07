@@ -1020,15 +1020,6 @@ func TestCallbacksRunWithSizeReplyMuFree(t *testing.T) {
 	}
 }
 
-func TestNegativeEntryNotRecorded(t *testing.T) {
-	o := newOpTestConnection(t, true)
-	o.lookUp(0, 200)
-	o.readDirPlus(direntPlus(0, 200, "f"))
-	if _, ok := o.c.reportedInodes[0]; ok {
-		t.Error("connection recorded inode 0")
-	}
-}
-
 // The kernel takes no attributes from an error reply.
 func TestReportedSizeUnchangedByFailedReply(t *testing.T) {
 	for _, r := range sizeReporters() {

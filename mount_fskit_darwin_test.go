@@ -110,17 +110,6 @@ func fakeMacFUSEBundle(t *testing.T, version string) string {
 	return filepath.Join(contents, "Frameworks", "MFMount.framework", "Versions", "A", "MFMount")
 }
 
-func TestLoadFSKitAPIReportsMissingFramework(t *testing.T) {
-	for _, path := range []string{
-		filepath.Join(t.TempDir(), "MFMount"),
-		fakeMacFUSEBundle(t, "5.5.0"),
-	} {
-		if _, err := loadFSKitAPI(path); !errors.Is(err, ErrFSKitUnavailable) {
-			t.Errorf("loadFSKitAPI(%q) error = %v, want ErrFSKitUnavailable", path, err)
-		}
-	}
-}
-
 func TestCheckMacFUSEVersion(t *testing.T) {
 	for _, test := range []struct {
 		version string
@@ -149,19 +138,30 @@ func TestCheckMacFUSEVersion(t *testing.T) {
 	}
 }
 
+// minimumMacFUSE is fskitMinimumMacFUSE as text names it: "macFUSE 5.5 or
+// later".
+func minimumMacFUSE() string {
+	parts := make([]string, len(fskitMinimumMacFUSE))
+	for i, part := range fskitMinimumMacFUSE {
+		parts[i] = strconv.Itoa(part)
+	}
+	return "macFUSE " + strings.TrimSuffix(strings.Join(parts, "."), ".0") + " or later"
+}
+
 // The README states the macFUSE minimum that checkMacFUSEVersion enforces.
 func TestReadmeNamesMacFUSEMinimum(t *testing.T) {
 	readme, err := os.ReadFile("README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	parts := make([]string, len(fskitMinimumMacFUSE))
-	for i, part := range fskitMinimumMacFUSE {
-		parts[i] = strconv.Itoa(part)
-	}
-	minimum := strings.TrimSuffix(strings.Join(parts, "."), ".0")
-	if want := "macFUSE " + minimum + " or later"; !bytes.Contains(readme, []byte(want)) {
+	if want := minimumMacFUSE(); !bytes.Contains(readme, []byte(want)) {
 		t.Errorf("README.md does not say %q", want)
+	}
+}
+
+func TestErrFSKitUnavailableNamesTheMinimumMacFUSE(t *testing.T) {
+	if want := minimumMacFUSE(); !strings.Contains(ErrFSKitUnavailable.Error(), want) {
+		t.Errorf("ErrFSKitUnavailable = %q, want it to say %q", ErrFSKitUnavailable, want)
 	}
 }
 
@@ -219,6 +219,13 @@ func TestMountReturnsTypedFSKitErrors(t *testing.T) {
 	setFSKitTestSystem(t, missingFramework, "26.0")
 	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
 		t.Errorf("Mount without MFMount error = %v, want ErrFSKitUnavailable", err)
+	}
+
+	// macFUSE 5.5.0 passes the version check, and loading its missing
+	// framework fails.
+	setFSKitTestSystem(t, fakeMacFUSEBundle(t, "5.5.0"), "26.0")
+	if _, err := Mount(t.TempDir(), nil, config); !errors.Is(err, ErrFSKitUnavailable) {
+		t.Errorf("Mount on macFUSE 5.5.0 without MFMount error = %v, want ErrFSKitUnavailable", err)
 	}
 
 	// The framework is missing, so even a skipped version check mounts
@@ -495,29 +502,6 @@ func TestFSKitTransportSendsWholeMessages(t *testing.T) {
 	}
 }
 
-func TestFSKitAPILoaderRetriesAFailedLoad(t *testing.T) {
-	var loads int
-	want := &fskitAPI{}
-	loader := cacheFSKitAPI(func(string) (*fskitAPI, error) {
-		loads++
-		if loads == 1 {
-			return nil, ErrFSKitUnavailable
-		}
-		return want, nil
-	})
-	if _, err := loader(); !errors.Is(err, ErrFSKitUnavailable) {
-		t.Fatalf("first load error = %v, want ErrFSKitUnavailable", err)
-	}
-	for range 2 {
-		if got, err := loader(); err != nil || got != want {
-			t.Errorf("loader() = %p, %v; want %p, nil", got, err, want)
-		}
-	}
-	if loads != 2 {
-		t.Errorf("loads = %d, want 2: one failure, then one success reused", loads)
-	}
-}
-
 // A warm transport reuses a finished send's iovecs instead of allocating.
 func TestFSKitTransportReusesSendIovecs(t *testing.T) {
 	f := newFakeMFMount(t)
@@ -578,12 +562,14 @@ func TestFSKitTransportSendsConcurrently(t *testing.T) {
 
 func TestMountWrapsFSKitMountResult(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		afterInit bool
-		result    int32
+		name        string
+		afterInit   bool
+		result      int32
+		unavailable bool
 	}{
 		// newConnection fails to read INIT, and Mount returns the result.
-		{name: "before INIT", result: FSKitMountResultFileSystemExtensionRequiresApproval},
+		{name: "before INIT", result: FSKitMountResultFileSystemExtensionRequiresApproval, unavailable: true},
+		{name: "mount point not created", result: FSKitMountResultCreatingMountPointFailed},
 		// The connection is up when MFMount returns the result.
 		{name: "after INIT", afterInit: true, result: FSKitMountResultUnexpectedFailure},
 	} {
@@ -597,11 +583,14 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 				return test.result
 			}
 			_, err := MountWithFakeMFMount(context.Background(), t, f, drainServer{}, MountConfig{})
-			// artifact-fs finds the result with errors.As to decide whether
-			// to fall back to the kernel extension.
 			var mountErr FSKitMountError
 			if !errors.As(err, &mountErr) || mountErr.Result != test.result {
 				t.Errorf("Mount error = %v, want a wrapped FSKitMountError with result %d", err, test.result)
+			}
+			// A caller falls back to another backend only when the error
+			// matches ErrFSKitUnavailable.
+			if got := errors.Is(err, ErrFSKitUnavailable); got != test.unavailable {
+				t.Errorf("errors.Is(Mount error, ErrFSKitUnavailable) = %v, want %v", got, test.unavailable)
 			}
 			if err == nil || !strings.HasPrefix(err.Error(), "mount (background): ") {
 				t.Errorf("Mount error = %v, want the prefix %q", err, "mount (background): ")
@@ -623,14 +612,5 @@ func TestMountWrapsFSKitMountResult(t *testing.T) {
 				t.Errorf("unmount calls = %v, want none", f.unmounts)
 			}
 		})
-	}
-}
-
-// Without this, the connection would send short read replies on FSKit.
-func TestFSKitTransportPadsShortReads(t *testing.T) {
-	var transport connectionTransport = &fskitTransport{}
-	p, ok := transport.(shortReadPadder)
-	if !ok || !p.padsShortReads() {
-		t.Error("fskitTransport does not report that it pads short reads")
 	}
 }

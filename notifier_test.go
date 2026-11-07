@@ -20,6 +20,7 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -142,50 +143,60 @@ func (k *notifyBlockingKernel) SendMessage(parts [][]byte) error {
 // ServeOps returns only after the notification in progress is sent, so that
 // the connection is still open for it.
 func TestNotifierServerWaitsForTheNotificationInProgress(t *testing.T) {
-	cfg, err := (&MountConfig{}).normalize()
-	if err != nil {
-		t.Fatalf("normalize: %v", err)
-	}
-	k := &notifyBlockingKernel{fakeKernel: newFakeKernel(), sending: make(chan struct{}), release: make(chan struct{})}
-	k.Send(fakeInit()...)
-	c, err := newConnection(cfg, nil, nil, nil, k)
-	if err != nil {
-		t.Fatalf("newConnection: %v", err)
-	}
-	defer c.close()
-	checkInitReply(t, k.NextReply(t))
+	synctest.Test(t, func(t *testing.T) {
+		cfg, err := (&MountConfig{}).normalize()
+		if err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		k := &notifyBlockingKernel{fakeKernel: newFakeKernel(), sending: make(chan struct{}), release: make(chan struct{})}
+		k.Send(fakeInit()...)
+		c, err := newConnection(cfg, nil, nil, nil, k)
+		if err != nil {
+			t.Fatalf("newConnection: %v", err)
+		}
+		defer c.close()
+		checkInitReply(t, k.NextReply(t))
 
-	n := NewNotifier()
-	server := newStartedServer()
-	served := make(chan struct{})
-	go func() {
-		NewServerWithNotifier(n, server).ServeOps(c)
-		close(served)
-	}()
-	server.wait(t)
-	notified := make(chan error, 1)
-	go func() { notified <- n.InvalidateInode(7, 0, 0) }()
-	select {
-	case <-k.sending:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the notification was not sent within 5s")
-	}
+		n := NewNotifier()
+		served := make(chan struct{})
+		go func() {
+			NewServerWithNotifier(n, drainServer{}).ServeOps(c)
+			close(served)
+		}()
+		synctest.Wait()
+		notified := make(chan error, 1)
+		go func() { notified <- n.InvalidateInode(7, 0, 0) }()
+		synctest.Wait()
+		select {
+		case <-k.sending:
+		default:
+			t.Error("the notification was not sent")
+		}
 
-	// The server stops while the notification write is blocked.
-	k.HangUp()
-	select {
-	case <-served:
-		t.Fatal("ServeOps returned while a notification was being sent")
-	case <-time.After(100 * time.Millisecond):
-	}
+		// The server stops while the notification write is blocked. The
+		// checks below report and go on, so that every goroutine ends.
+		k.HangUp()
+		synctest.Wait()
+		select {
+		case <-served:
+			t.Error("ServeOps returned while a notification was being sent")
+		default:
+		}
 
-	close(k.release)
-	select {
-	case <-served:
-	case <-time.After(5 * time.Second):
-		t.Fatal("ServeOps did not return within 5s of the notification")
-	}
-	if err := <-notified; err != nil {
-		t.Errorf("InvalidateInode = %v, want nil", err)
-	}
+		close(k.release)
+		synctest.Wait()
+		select {
+		case <-served:
+		default:
+			t.Error("ServeOps did not return after the notification was sent")
+		}
+		select {
+		case err := <-notified:
+			if err != nil {
+				t.Errorf("InvalidateInode = %v, want nil", err)
+			}
+		default:
+			t.Error("InvalidateInode did not return after the notification was sent")
+		}
+	})
 }

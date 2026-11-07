@@ -49,6 +49,15 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   as `Mount` gives it.
 - To test what a `Notifier` caller gets when the kernel refuses a
   notification, call `FailNotifications` on the fake kernel.
+- To check that something has not happened yet, run the test in
+  `synctest.Test` and check after `synctest.Wait`, as
+  `TestNotifierServerWaitsForTheNotificationInProgress` does. Never wait out a
+  timer for it. `synctest.Wait` returns once every other goroutine blocks on a
+  channel or a `sync.Cond`, which is where the fake kernel blocks. A goroutine
+  blocked on a `sync.Mutex` holds it up.
+- Inside `synctest.Test`, report a failed check with `t.Error` while
+  goroutines are still blocked. A `t.Fatal` there ends the test with a
+  deadlock panic that hides the failure.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
