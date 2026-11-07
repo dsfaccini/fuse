@@ -81,6 +81,11 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   one always. `TestMountsAreDeniedByDefault` checks it.
 - To load the installed MFMount in a test, call `useInstalledMFMount`. It
   restores the denied path and the loader cache when the test ends.
+- A test that calls a function of the installed MFMount without mounting
+  calls `mounttest.SkipUnlessMFChannelEnabled` first. The gate scanner cannot
+  see such calls. `TestMFChannelContract` is the example: it checks the fake
+  MFMount against MFMount's channel functions, on a channel that MFMount never
+  mounts. Only CI's `macos` job sets `FUSE_RUN_MFCHANNEL_TESTS=1`.
 - Before you run a mutant of mount, backend or loader code, check that every
   test it runs reaches only the fake MFMount, a fake mount helper or a missing
   path. If you cannot tell, do not run it. Packages other than the root have
@@ -100,6 +105,7 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `useFakeMacFUSEMountHelper`. It points `macfuseMountHelper` at the test
   binary running `TestFakeMacFUSEMountHelper`, which `fakeMountHelper`
   scripts: the device it passes back, its mount result and its exit status.
+  It returns a function that returns the helper's arguments from its last run.
 
 ## Validate a change
 
@@ -139,7 +145,9 @@ job times out after 10 minutes.
   it. Pass `cache: false` to `setup-go` in any other Linux job that would key
   its cache on this repo's `go.sum`. The first job to finish saves the entry
   for a key, and every later run restores that entry.
-- `macos`: build, vet and `go test -race -count=1 ./...`. It installs macFUSE
+- `macos`: build, vet, `go test -race -count=1 ./...`, then
+  `TestMFChannelContract` with `FUSE_RUN_MFCHANNEL_TESTS=1`. That step fails
+  unless the run against the installed MFMount passed. The job installs macFUSE
   5.5.0 from its GitHub release, pinned by SHA-256. The tests that call
   `useInstalledMFMount` fail when `GITHUB_ACTIONS=true` and macFUSE is missing
   or older than 5.5, and skip elsewhere.
@@ -222,6 +230,15 @@ covers the change.
   `fakeMFMount.unmounts` instead of running it. Its cleanup fails the test
   unless every message is released once, and the channel once per reference:
   `MFChannelCreate`'s, plus one per `MFRetain`.
+- The fake records the mount point and options of the last MFMount call in
+  `fakeMFMount.mountPoint` and `fakeMFMount.options`.
+- After `fakeMFMount.kernel.HangUp`, the fake drops what the connection sends
+  and reports it sent, as MFMount does once an extension has connected. The
+  fake counts an extension as connected once a read has returned a message,
+  and on the transport that `fakeMFMount.transport` returns.
+- Before an extension connects, a send after the hang-up fails with ENODEV.
+  On a channel that MFMount never opened, an interrupt after the hang-up fails
+  with ENODEV too.
 - Test transport methods on the transport that `fakeMFMount.transport` returns.
 - For behavior that only `Mount` reaches, call `MountWithFakeMFMount`, which
   calls `MountContext` with the context you pass. Set `fakeMFMount.mount` to
@@ -239,6 +256,9 @@ covers the change.
   protocol. One run makes at most 5 FSKit mounts. Its doc comment lists the
   mounts and what each measures.
 - Its gate is `FUSE_RUN_FSKIT_PROBE=1`. `FUSE_RUN_MOUNT_TESTS` does not run it.
+- `FUSE_FSKIT_PROBE_PLAN=replay` makes the probe run one mount instead:
+  base's config and steps, without the two macfuse#1231 cases, the READ
+  padding timing and `open_mode_0`.
 - Run an FSKit test without asking first. These rules hold for every run that
   mounts through FSKit, the probe included:
   - Make at most 8 FSKit mounts per run.

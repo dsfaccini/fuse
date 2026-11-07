@@ -36,9 +36,11 @@ func TestGatesSkipByDefault(t *testing.T) {
 	}{
 		{Env, SkipUnlessEnabled},
 		{FSKitProbeEnv, SkipUnlessFSKitProbeEnabled},
+		{MFChannelEnv, SkipUnlessMFChannelEnabled},
 	} {
 		t.Setenv(Env, "")
 		t.Setenv(FSKitProbeEnv, "")
+		t.Setenv(MFChannelEnv, "")
 		reached := false
 		t.Run(gate.env, func(t *testing.T) {
 			gate.skip(t)
@@ -362,6 +364,7 @@ var mountFailureTests = map[string]string{
 	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation or checkMountPoint fails",
 	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
 	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
+	"TestKernelExtensionMountPassesNoAppleDoubleUnlessEnabled":           "the fake mount helper passes back /dev/null",
 }
 
 // fakeMounts call Mount through the fake MFMount, which mounts nothing. Each

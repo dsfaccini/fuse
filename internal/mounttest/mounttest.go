@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mounttest gates tests that mount a real file system, so that plain
-// `go test ./...` never mounts.
+// Package mounttest gates tests that mount a real file system or call into
+// macFUSE's MFMount framework, so that plain `go test ./...` does neither.
 package mounttest
 
 import (
@@ -59,5 +59,20 @@ func SkipUnlessFSKitProbeEnabled(t testing.TB) {
 	t.Helper()
 	if os.Getenv(FSKitProbeEnv) != "1" {
 		t.Skipf("mounts through FSKit; set %s=1 to run", FSKitProbeEnv)
+	}
+}
+
+// MFChannelEnv enables the run of TestMFChannelContract against the installed
+// MFMount framework when set to "1". It calls MFMount's channel functions on a
+// channel that MFMount never mounts.
+const MFChannelEnv = "FUSE_RUN_MFCHANNEL_TESTS"
+
+// SkipUnlessMFChannelEnabled skips t unless FUSE_RUN_MFCHANNEL_TESTS=1. A test
+// that calls the installed MFMount framework's channel functions calls it
+// first.
+func SkipUnlessMFChannelEnabled(t testing.TB) {
+	t.Helper()
+	if os.Getenv(MFChannelEnv) != "1" {
+		t.Skipf("calls the installed MFMount framework; set %s=1 to run", MFChannelEnv)
 	}
 }

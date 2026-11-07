@@ -81,6 +81,13 @@ func (k *fakeKernel) HangUp() {
 	k.mu.Unlock()
 }
 
+// isHungUp reports whether HangUp has run.
+func (k *fakeKernel) isHungUp() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.hungUp
+}
+
 // Interrupt makes the reads waiting now fail with EINTR, as
 // MFChannelInterrupt does. A later read waits as usual.
 func (k *fakeKernel) Interrupt() {

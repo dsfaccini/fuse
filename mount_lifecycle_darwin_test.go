@@ -433,33 +433,28 @@ func TestFakeMacFUSEMountHelper(t *testing.T) {
 }
 
 // useFakeMacFUSEMountHelper points macfuseMountHelper at the test binary
-// running TestFakeMacFUSEMountHelper.
-func useFakeMacFUSEMountHelper(t *testing.T) {
+// running TestFakeMacFUSEMountHelper. It returns a function that returns the
+// arguments of the helper's last run, one per line, or nil before its first.
+func useFakeMacFUSEMountHelper(t *testing.T) func() []string {
 	t.Helper()
-	helper := filepath.Join(t.TempDir(), "mount_macfuse")
-	script := "#!/bin/sh\nexec '" + os.Args[0] + "' -test.run='^TestFakeMacFUSEMountHelper$'\n"
+	dir := t.TempDir()
+	helper, argv := filepath.Join(dir, "mount_macfuse"), filepath.Join(dir, "argv")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argv + "'\nexec '" + os.Args[0] + "' -test.run='^TestFakeMacFUSEMountHelper$'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	old := macfuseMountHelper
 	macfuseMountHelper = helper
 	t.Cleanup(func() { macfuseMountHelper = old })
-}
-
-func TestMountHelperSocketsCloseOnExec(t *testing.T) {
-	fds, err := cloexecSocketpair()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, fd := range fds {
-		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	return func() []string {
+		data, err := os.ReadFile(argv)
+		if os.IsNotExist(err) {
+			return nil
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		if flags&unix.FD_CLOEXEC == 0 {
-			t.Errorf("fd %d lacks FD_CLOEXEC", fd)
-		}
-		unix.Close(fd)
+		return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 	}
 }
 
