@@ -48,18 +48,18 @@ func TestMFChannelContract(t *testing.T) {
 }
 
 // checkMFChannelContract runs the channel calls in order on one new channel.
+// The channel keeps its MFChannelCreate reference: MFMount traps on the
+// release of the last reference to a channel it never opened, with SIGTRAP
+// (https://github.com/dsfaccini/fuse/pull/32).
 func checkMFChannelContract(t *testing.T, api *fskitAPI) {
 	channel, _, _ := purego.SyscallN(api.channelCreate)
 	if channel == 0 {
 		t.Fatal("MFChannelCreate returned NULL")
 	}
-	closed, released := false, false
+	closed := false
 	t.Cleanup(func() {
 		if !closed {
 			purego.SyscallN(api.channelClose, channel)
-		}
-		if !released {
-			purego.SyscallN(api.release, channel)
 		}
 	})
 
@@ -109,9 +109,6 @@ func checkMFChannelContract(t *testing.T, api *fskitAPI) {
 	if ok, _, errno := purego.SyscallN(api.channelInterrupt, channel); byte(ok) != 0 || callErrno(errno) != syscall.ENODEV {
 		t.Errorf("MFChannelInterrupt after MFChannelClose = %v, %v; want false, ENODEV", byte(ok) != 0, callErrno(errno))
 	}
-
-	purego.SyscallN(api.release, channel)
-	released = true
 }
 
 // channelRead is what one MFChannelCopyNextMessage returned.

@@ -89,8 +89,10 @@ const fakeChannel uintptr = 1
 var activeFakeMFMount atomic.Pointer[fakeMFMount]
 
 // newFakeMFMount makes a fake MFMount active until the test ends. Then it
-// checks that the channel, if created, was released once, and that every
-// message was released once.
+// checks that the channel, if created, was released once per reference, and
+// that every message was released once. MFMount traps on the release of the
+// last reference to a channel it never opened, so such a channel must keep
+// its MFChannelCreate reference.
 func newFakeMFMount(t *testing.T) *fakeMFMount {
 	t.Helper()
 	f := &fakeMFMount{
@@ -122,9 +124,9 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 	t.Cleanup(func() { unmountSyscall = oldUnmount })
 	t.Cleanup(func() {
 		f.mu.Lock()
-		created := f.channelCreated
+		created, opened := f.channelCreated, f.channelOpened
 		f.mu.Unlock()
-		if created {
+		if created && opened {
 			select {
 			case <-f.released:
 			case <-time.After(5 * time.Second):
@@ -135,8 +137,11 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if created && f.channelReleases != 1+f.channelRetains {
+		switch {
+		case created && opened && f.channelReleases != 1+f.channelRetains:
 			t.Errorf("channel MFRelease calls = %d, want 1 plus %d MFRetain calls", f.channelReleases, f.channelRetains)
+		case created && !opened && f.channelReleases != f.channelRetains:
+			t.Errorf("MFRelease calls on a channel MFMount never opened = %d, want one per MFRetain call, %d: MFMount traps on the release of its last reference", f.channelReleases, f.channelRetains)
 		}
 		if len(f.messages) != 0 {
 			t.Errorf("%d messages never released", len(f.messages))
