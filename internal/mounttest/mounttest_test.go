@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -217,6 +218,26 @@ func TestMount(t *testing.T) {
 			wantErrs: 1,
 		},
 		{
+			name: "unexported mount functions",
+			src: `package p
+func TestMountTransport(t *testing.T) { mountTransport("", nil) }
+func TestMountDevice(t *testing.T) { mount("", nil) }
+func TestDirectmount(t *testing.T) { directmount("", nil) }
+func TestFusermount(t *testing.T) { fusermount("", nil, nil, true, nil) }`,
+			wantErrs: 4,
+		},
+		{
+			name: "field, method and local named mount",
+			src: `package p
+func newFake(mount func() int32) *fake { return &fake{mount: mount} }
+func init() { newFake(nil).mount() }
+func TestFake(t *testing.T) {
+	f := newFake(nil)
+	f.mount = func() int32 { return 0 }
+	f.mount()
+}`,
+		},
+		{
 			name: "direct SetUp",
 			src: `package p
 func TestHelloSetUpDirect(t *testing.T) { (&samples.SampleTest{}).SetUp(nil) }`,
@@ -371,10 +392,19 @@ var fakeMounts = map[string]string{
 	"MountWithFakeMFMount": ".",
 }
 
-// mountCallees mount when called: Mount and MountContext directly, mountFSKitTransport under
-// the FSKit probe, ogletest's RunTests through suites that mount in SetUp, and
-// SetUp on samples.SampleTest.
-var mountCallees = []string{"Mount", "MountContext", "mountFSKitTransport", "RunTests", "SetUp"}
+// mountCallees mount when called: Mount and MountContext directly, the
+// mountTransport, mount, directmount and fusermount they reach,
+// mountFSKitTransport under the FSKit probe, ogletest's RunTests through
+// suites that mount in SetUp, and SetUp on samples.SampleTest.
+var mountCallees = []string{"Mount", "MountContext", "mountTransport", "mount", "directmount", "fusermount", "mountFSKitTransport", "RunTests", "SetUp"}
+
+// bareCallee reports whether name is an unexported mount callee. Only package
+// fuse declares those, so only a call by the bare name reaches one. A selector
+// or a value with the name is a field, a method or a local, such as the fake
+// MFMount's mount field.
+func bareCallee(name string) bool {
+	return !ast.IsExported(name) && slices.Contains(mountCallees, name)
+}
 
 // fskitMountCallees mount through FSKit. Only the FSKit probe's gate may guard
 // them, so that FUSE_RUN_MOUNT_TESTS never starts an FSKit mount.
@@ -537,12 +567,20 @@ func isEntry(name, prefix string) bool {
 }
 
 // references reports whether node names one of names, as a call or as a
-// value such as a subtest function passed to t.Run.
+// value such as a subtest function passed to t.Run. A bare callee counts only
+// as a call by its bare name.
 func references(node ast.Node, names map[string]bool) bool {
 	found := false
 	ast.Inspect(node, func(n ast.Node) bool {
-		if ident, ok := n.(*ast.Ident); ok && names[ident.Name] {
-			found = true
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			if ident, ok := n.Fun.(*ast.Ident); ok && names[ident.Name] {
+				found = true
+			}
+		case *ast.Ident:
+			if names[n.Name] && !bareCallee(n.Name) {
+				found = true
+			}
 		}
 		return !found
 	})
@@ -593,7 +631,9 @@ func calleeName(call *ast.CallExpr) string {
 	case *ast.Ident:
 		return fun.Name
 	case *ast.SelectorExpr:
-		return fun.Sel.Name
+		if !bareCallee(fun.Sel.Name) {
+			return fun.Sel.Name
+		}
 	}
 	return ""
 }

@@ -11,27 +11,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func Test_umountExpectCustomError(t *testing.T) {
-	t.Setenv("PATH", "") // Clear PATH to fail unmount with fusermount is not found
-
-	err := unmount("/dev/fd/42")
-	if err == nil || !errors.Is(err, ErrExternallyManagedMountPoint) {
-		t.Errorf("Expected: %v, but got: %v", ErrExternallyManagedMountPoint, err)
-	}
-}
-
-func Test_umountNoCustomError(t *testing.T) {
-	t.Setenv("PATH", "") // Clear PATH to fail unmount with fusermount is not found
-
-	err := unmount("/dev")
-	if err == nil {
-		t.Fatal("Expected error but got none.")
-	}
-	if errors.Is(err, ErrExternallyManagedMountPoint) {
-		t.Error("Custom error was not expected.")
-	}
-}
-
 // testBackend is the backend that tests of backend-independent unmounting use.
 const testBackend = BackendLinux
 
@@ -63,6 +42,53 @@ func TestUnmountFallsBackToFusermountWithoutPrivilege(t *testing.T) {
 			}
 			if string(got) != test.wantArgs {
 				t.Errorf("fusermount args = %q, want %q", got, test.wantArgs)
+			}
+		})
+	}
+}
+
+// On Linux, Unmount(dir) unmounts through fusermount -u alone.
+func TestUnmountByPathRunsFusermount(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		dir  string
+		// body runs in the fake fusermount3.
+		body string
+		// want is an error that Unmount's error wraps. nil means success.
+		want error
+	}{
+		{name: "unmounts", dir: "/mnt/x"},
+		{
+			name: "busy",
+			dir:  "/mnt/x",
+			body: "echo 'fusermount3: failed to unmount /mnt/x: Device or resource busy' >&2; exit 1",
+			want: syscall.EBUSY,
+		},
+		{
+			name: "/dev/fd/N",
+			dir:  "/dev/fd/42",
+			body: "echo 'fusermount3: entry for /dev/fd/42 not found in /etc/mtab' >&2; exit 1",
+			want: ErrExternallyManagedMountPoint,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			argsFile := fakeFusermount(t, test.body)
+			err := Unmount(test.dir)
+			if test.want == nil && err != nil {
+				t.Errorf("Unmount: %v", err)
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Errorf("Unmount error = %v, want one that wraps %v", err, test.want)
+			}
+			if test.want != ErrExternallyManagedMountPoint && errors.Is(err, ErrExternallyManagedMountPoint) {
+				t.Errorf("Unmount error = %v, want one that does not wrap ErrExternallyManagedMountPoint", err)
+			}
+			got, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "-u\n--\n" + test.dir + "\n"; string(got) != want {
+				t.Errorf("fusermount args = %q, want %q", got, want)
 			}
 		})
 	}

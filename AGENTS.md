@@ -21,6 +21,9 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - That test matches names without type checking, so it can miss a mount
   reached through a shape it does not model, such as non-test code or another
   package. Read new mounting code by hand.
+- The scanner counts package fuse's unexported mount functions, such as
+  `mount`, only where a test calls them by their bare name. Fields and locals
+  share those names.
 - Set `FUSE_RUN_MOUNT_TESTS=1` only on a Linux host with `fuse3`.
   `SkipUnlessEnabled` skips every mounting test on other OSes, so no test
   mounts through the macFUSE kernel extension.
@@ -85,14 +88,16 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   test it runs reaches only the fake MFMount, a fake mount helper or a missing
   path. If you cannot tell, do not run it. Packages other than the root have
   no default-deny.
-- `Mount` force-unmounts a native mount it will not return, and
-  `MountedFileSystem.Unmount` and `Unmount(dir)` unmount through
-  `unmountBackend`. All three call `unmountSyscall`. On EPERM, FSKit falls
-  back to `diskutilPath`, and Linux to the `fusermount3` or `fusermount` on
-  `PATH`. A test that reaches them replaces those first: `recordUnmounts` in
-  `unmount_test.go` records the unmount(2) calls and answers them, and
-  `fakeFusermount` in `unmount_linux_test.go` puts a recording `fusermount3`
-  on `PATH`.
+- `Mount` force-unmounts a native mount it will not return. It,
+  `MountedFileSystem.Unmount`, and `Unmount(dir)` on darwin unmount through
+  `unmountBackend`, which calls `unmountSyscall`. On EPERM, FSKit falls back
+  to `diskutilPath`, and Linux to the `fusermount3` or `fusermount` on `PATH`.
+  On Linux, `Unmount(dir)` runs only that fusermount. A test that reaches
+  them replaces those first: `recordUnmounts` in `unmount_test.go` records
+  the unmount(2) calls and answers them, and `fakeFusermount` in
+  `unmount_linux_test.go` puts a recording `fusermount3` on `PATH`.
+- To read a Linux mount's mount table entry in a test, call `mountInfo` in
+  `mount_linux_test.go`.
 - On darwin, `Unmount(dir)` finds an FSKit volume by the `MNT_EXT_FSKIT` bit
   of its mount table entry, read through `getfsstat`. To test it, fake the
   mount table with `fakeMountTable` in `mount_lifecycle_darwin_test.go`.
@@ -161,7 +166,8 @@ job times out after 10 minutes.
   `MountConfig.ErrorLogger`, and to nowhere when that is nil.
 - Unless `MountConfig.DisableDefaultPermissions` is set, `Mount` returns only
   after the server answers a GETATTR for the root. A test server that blocks
-  that answer hangs `Mount`.
+  that answer hangs `Mount`. `rootServer` in `mount_linux_test.go` holds it to
+  test `MountContext`'s abandon path.
 
 ## Find an op error's errno with `operror.Errno`
 
