@@ -68,6 +68,10 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Inside `synctest.Test`, report a failed check with `t.Error` while
   goroutines are still blocked. A `t.Fatal` there ends the test with a
   deadlock panic that hides the failure.
+- To wait until a `Reply` blocks on `sizeReplyMu`, call `waitParkedInReply`
+  or `waitReply` in `short_reads_test.go`. A goroutine blocked on a mutex
+  closes no channel, so they match goroutine stacks by frame name. They fail
+  after `parkTimeout` when no stack matches.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
@@ -134,7 +138,9 @@ crash it finds. Keep the input file it writes under
 CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 `master`. Each push to `master` runs in full, so every merge gets a CI run. A
 new push to a pull request cancels that pull request's run in progress. Every
-job times out after 10 minutes.
+job times out after 10 minutes. The `-race` test steps of `linux`,
+`linux-mount-root` and `macos` pass `-timeout 5m`, so a hang there ends with
+every goroutine's stack before the job is cancelled.
 
 - `linux`: build, vet, `GOARCH=386 go test -count=1 ./...`, the mounting
   tests, then `gofmt`. A 32-bit `int` catches wire lengths that overflow it.
@@ -150,7 +156,7 @@ job times out after 10 minutes.
   it. Pass `cache: false` to `setup-go` in any other Linux job that would key
   its cache on this repo's `go.sum`. The first job to finish saves the entry
   for a key, and every later run restores that entry.
-- `macos`: build, vet, `go test -race -count=1 ./...`, then
+- `macos`: build, vet, `go test -race -count=1 -timeout 5m ./...`, then
   `TestMFChannelContract` with `FUSE_RUN_MFCHANNEL_TESTS=1`. That step fails
   unless the run against the installed MFMount passed. The job installs macFUSE
   5.5.0 from its GitHub release, pinned by SHA-256. The tests that call

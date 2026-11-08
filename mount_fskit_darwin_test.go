@@ -430,13 +430,8 @@ func TestFSKitTransportCloseWaitsForMountPublication(t *testing.T) {
 				wantErr, wantCloses = closeErr, 1
 			}
 			for range 2 {
-				select {
-				case err := <-results:
-					if !errors.Is(err, wantErr) {
-						t.Errorf("Close error = %v, want %v", err, wantErr)
-					}
-				case <-time.After(time.Second):
-					t.Fatal("Close did not finish after mount publication")
+				if err := <-results; !errors.Is(err, wantErr) {
+					t.Errorf("Close error = %v, want %v", err, wantErr)
 				}
 			}
 			if closes.Load() != wantCloses || releases.Load() != 1 {
@@ -459,24 +454,15 @@ func TestFSKitTransportCloseDrainsOperationsBeforeRelease(t *testing.T) {
 	transport.operations.Add(1)
 	result := make(chan error, 1)
 	go func() { result <- transport.Close() }()
-	select {
-	case <-closed:
-	case <-time.After(time.Second):
-		t.Fatal("Close did not close the successful mount's channel")
-	}
+	<-closed
 	select {
 	case <-released:
 		t.Error("native channel released while an operation was active")
 	default:
 	}
 	transport.operations.Done()
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Close did not finish after its operation drained")
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 	select {
 	case <-released:

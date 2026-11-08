@@ -159,8 +159,10 @@ jobs:
     # probe convert to pointers.
     - name: Vet
       run: go vet -composites=false -unsafeptr=false ./...
+    # -timeout ends a hang before the job's timeout does, so the log keeps
+    # every goroutine's stack.
     - name: Test
-      run: go test -race -count=1 ./...
+      run: go test -race -count=1 -timeout 5m ./...
     # Checks the fake MFMount against the installed framework's channel
     # functions, on a channel that MFMount never mounts. A broken gate would
     # skip the run, so the step checks that it passed.
