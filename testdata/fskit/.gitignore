@@ -1,0 +1,4 @@
+# The FSKit probe's recorder writes <mount>.frames here. Only a reviewed
+# recording is committed, under a name the recorder never writes.
+/*.frames
+!/replay-macfuse-*.frames

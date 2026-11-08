@@ -37,9 +37,11 @@ func TestGatesSkipByDefault(t *testing.T) {
 	}{
 		{Env, SkipUnlessEnabled},
 		{FSKitProbeEnv, SkipUnlessFSKitProbeEnabled},
+		{MFChannelEnv, SkipUnlessMFChannelEnabled},
 	} {
 		t.Setenv(Env, "")
 		t.Setenv(FSKitProbeEnv, "")
+		t.Setenv(MFChannelEnv, "")
 		reached := false
 		t.Run(gate.env, func(t *testing.T) {
 			gate.skip(t)
@@ -373,8 +375,9 @@ func TestFakeMount(t *testing.T) { MountWithFakeMFMount(t) }`,
 	}
 }
 
-// mountFailureTests call Mount but fail before anything is mounted. Listing a
-// test does not exempt an FSKit test from its gate: it must still start with
+// mountFailureTests reach a mount callee but mount nothing: they fail before
+// anything is mounted, or run a fake mount helper. Listing a test does not
+// exempt an FSKit test from its gate: it must still start with
 // SkipUnlessFSKitProbeEnabled.
 var mountFailureTests = map[string]string{
 	"TestNonexistentMountPoint":                                          "checkMountPoint rejects the directory",
@@ -383,6 +386,8 @@ var mountFailureTests = map[string]string{
 	"TestMountRejectsInvalidConfigBeforeMounting":                        "config validation or checkMountPoint fails",
 	"TestKernelExtensionMountReportsTheHelperResult":                     "the fake mount helper passes back /dev/null",
 	"TestKernelExtensionMountUnmountsNothingAfterTheHelperFailsPastINIT": "the fake mount helper passes back a socket",
+	"TestKernelExtensionMountPassesNoAppleDoubleUnlessEnabled":           "the fake mount helper passes back /dev/null",
+	"TestMountHelperSocketsCloseOnExec":                                  "fusermount runs the test binary as a helper that mounts nothing",
 }
 
 // fakeMounts call Mount through the fake MFMount, which mounts nothing. Each

@@ -161,6 +161,19 @@ jobs:
       run: go vet -composites=false -unsafeptr=false ./...
     - name: Test
       run: go test -race -count=1 ./...
+    # Checks the fake MFMount against the installed framework's channel
+    # functions, on a channel that MFMount never mounts. A broken gate would
+    # skip the run, so the step checks that it passed.
+    - name: MFMount channel contract
+      env:
+        FUSE_RUN_MFCHANNEL_TESTS: "1"
+      run: |
+        set -o pipefail
+        go test -race -count=1 -run '^TestMFChannelContract$' -v . | tee "$RUNNER_TEMP/mfchannel.txt"
+        grep -q -- '--- PASS: TestMFChannelContract/MFMount' "$RUNNER_TEMP/mfchannel.txt" || {
+          echo "::error::the MFMount run of TestMFChannelContract did not pass; check the FUSE_RUN_MFCHANNEL_TESTS gate"
+          exit 1
+        }
 
   # Builds and vets the consumer against this checkout, for Linux and darwin.
   artifact-fs:

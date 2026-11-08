@@ -14,9 +14,19 @@
 
 package fuse
 
-import "testing"
+import (
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
 
-func TestEnableAppleDoubleOmitsNoAppleDouble(t *testing.T) {
+// The kernel extension's helper gets noappledouble unless EnableAppleDouble
+// is set.
+func TestKernelExtensionMountPassesNoAppleDoubleUnlessEnabled(t *testing.T) {
+	argv := useFakeMacFUSEMountHelper(t)
+	// The helper mounts nothing and passes back /dev/null, so INIT fails.
+	t.Setenv(fakeMountHelper, "0,0")
 	for _, test := range []struct {
 		cfg  MountConfig
 		want bool
@@ -24,8 +34,33 @@ func TestEnableAppleDoubleOmitsNoAppleDouble(t *testing.T) {
 		{cfg: MountConfig{}, want: true},
 		{cfg: MountConfig{EnableAppleDouble: true}, want: false},
 	} {
-		if _, got := test.cfg.toMap()["noappledouble"]; got != test.want {
-			t.Errorf("EnableAppleDouble=%v: noappledouble set = %v, want %v", test.cfg.EnableAppleDouble, got, test.want)
+		recordUnmounts(t, nil)
+		dir := t.TempDir()
+		returned := make(chan error, 1)
+		go func() {
+			_, err := Mount(dir, drainServer{}, &test.cfg)
+			returned <- err
+		}()
+		select {
+		case err := <-returned:
+			if err == nil || !strings.HasPrefix(err.Error(), "newConnection: ") {
+				t.Errorf("EnableAppleDouble=%v: Mount error = %v, want a newConnection error", test.cfg.EnableAppleDouble, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Mount did not return within 10s")
+		}
+		args := argv()
+		if len(args) == 0 || args[len(args)-1] != dir {
+			t.Errorf("EnableAppleDouble=%v: helper arguments %q do not end with the mount point %s", test.cfg.EnableAppleDouble, args, dir)
+		}
+		var options []string
+		for i, arg := range args {
+			if arg == "-o" && i+1 < len(args) {
+				options = append(options, strings.Split(args[i+1], ",")...)
+			}
+		}
+		if got := slices.Contains(options, "noappledouble"); got != test.want {
+			t.Errorf("EnableAppleDouble=%v: helper options %q include noappledouble = %v, want %v", test.cfg.EnableAppleDouble, options, got, test.want)
 		}
 	}
 }

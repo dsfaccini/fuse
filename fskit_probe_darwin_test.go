@@ -88,10 +88,10 @@ var fskitProbeStarted atomic.Bool
 
 // probeResult is one machine-readable result line.
 type probeResult struct {
-	Item    string            `json:"item"`
-	Mount   string            `json:"mount"`
-	Result  string            `json:"result"`
-	Details map[string]string `json:"details,omitempty"`
+	Item      string            `json:"item"`
+	MountName string            `json:"mount"`
+	Result    string            `json:"result"`
+	Details   map[string]string `json:"details,omitempty"`
 }
 
 func reportProbe(t *testing.T, r probeResult) {
@@ -127,23 +127,9 @@ func runFSKitProbe(t *testing.T) {
 	if fskitProbeStarted.Swap(true) {
 		t.Fatal("TestFSKitProbe already ran in this process; run it with -count=1")
 	}
-	plan := []struct {
-		name      string
-		configure func(*MountConfig)
-		measure   func(*probeMount)
-	}{
-		{"base", nil, (*probeMount).measureBase},
-		{"local", func(c *MountConfig) { c.Options["local"] = "" }, (*probeMount).measureLocal},
-		{"options", func(c *MountConfig) {
-			c.DisableDefaultPermissions = true
-			c.MaxWrite = 128 << 10
-			c.Options["max_write"] = "262144"
-		}, (*probeMount).measureOptions},
-		{"close", nil, (*probeMount).measureChannelClose},
-		{"timeout", func(c *MountConfig) { c.Options["daemon_timeout"] = "3" }, (*probeMount).measureDaemonTimeout},
-	}
-	if len(plan) != fskitProbeMounts {
-		t.Fatalf("the probe plans %d mounts, but fskitProbeMounts and the docs say %d", len(plan), fskitProbeMounts)
+	plan, err := fskitProbePlan(os.Getenv(fskitProbePlanEnv))
+	if err != nil {
+		t.Fatal(err)
 	}
 	if volumes, err := probeConflicts(); err != nil || len(volumes) > 0 {
 		t.Fatalf("macFUSE or probe volumes are mounted: %q (mount table error: %v); the probe mounts nothing while one is", volumes, err)
@@ -182,12 +168,12 @@ func runFSKitProbe(t *testing.T) {
 		last = step.name
 		t.Run(step.name, func(t *testing.T) {
 			if m := p.mountProbe(t, step.name, step.configure); m != nil {
-				step.measure(m)
+				m.run(step.steps)
 			}
 		})
 	}
 	if reasons := p.blockers(); len(reasons) > 0 {
-		reportProbe(t, probeResult{Item: "run_stopped", Mount: last, Result: strings.Join(reasons, "; ")})
+		reportProbe(t, probeResult{Item: "run_stopped", MountName: last, Result: strings.Join(reasons, "; ")})
 	}
 	p.reportAcrossMounts()
 }
@@ -200,7 +186,7 @@ func reportEnvironment(t *testing.T) {
 	defer cancel()
 	macFUSE, macFUSEErr := exec.CommandContext(ctx, "/usr/bin/plutil", "-extract", "CFBundleShortVersionString", "raw",
 		filepath.Join(bundle, "Contents", "Info.plist")).Output()
-	reportProbe(t, probeResult{Item: "environment", Mount: "all", Result: osVersion, Details: map[string]string{
+	reportProbe(t, probeResult{Item: "environment", MountName: "all", Result: osVersion, Details: map[string]string{
 		"macos":         osVersion,
 		"macos_error":   errName(osErr),
 		"macfuse":       strings.TrimSpace(string(macFUSE)),
@@ -274,7 +260,7 @@ func (p *fskitProbe) checkNoMountLeft() {
 		result = "mounted"
 		p.t.Errorf("after the FSKit probe, macFUSE or probe volumes are mounted: %q (mount table error: %v); unmount each probe mount point with diskutil unmount force", volumes, err)
 	}
-	reportProbe(p.t, probeResult{Item: "mounts_left", Mount: "all", Result: result, Details: map[string]string{
+	reportProbe(p.t, probeResult{Item: "mounts_left", MountName: "all", Result: result, Details: map[string]string{
 		"probe_mount_points": strings.Join(left, ","),
 		"macfuse_or_probe":   strings.Join(volumes, ","),
 		"mount_table_error":  errName(err),
@@ -283,7 +269,7 @@ func (p *fskitProbe) checkNoMountLeft() {
 
 func (p *fskitProbe) reportAcrossMounts() {
 	report := func(item, mounts, result string, details map[string]string) {
-		reportProbe(p.t, probeResult{Item: item, Mount: mounts, Result: result, Details: details})
+		reportProbe(p.t, probeResult{Item: item, MountName: mounts, Result: result, Details: details})
 	}
 
 	denied := func(err error) bool { return errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) }
@@ -444,9 +430,13 @@ func (p *fskitProbe) mountProbe(t *testing.T, name string, configure func(*Mount
 	if st, mounted, err := mountedVolume(dir); mounted {
 		p.volumes[name] = st
 		m.report("volume", yesNo(st.Flags&unix.MNT_LOCAL != 0), map[string]string{
-			"type":  unix.ByteSliceToString(st.Fstypename[:]),
-			"from":  unix.ByteSliceToString(st.Mntfromname[:]),
-			"flags": fmt.Sprintf("%#x", st.Flags),
+			"type":      unix.ByteSliceToString(st.Fstypename[:]),
+			"from":      unix.ByteSliceToString(st.Mntfromname[:]),
+			"flags":     fmt.Sprintf("%#x", st.Flags),
+			"flags_ext": fmt.Sprintf("%#x", st.Flags_ext),
+			// Unmount(dir) unmounts a volume with this bit through diskutil
+			// when unmount(2) fails with EPERM.
+			"fskit": yesNo(st.Flags_ext&mntExtFSKit != 0),
 		})
 	} else {
 		m.report("volume", "unknown", map[string]string{"error": errName(err)})
@@ -639,55 +629,97 @@ func (m *probeMount) within(what string, d time.Duration, f func() error) error 
 
 func (m *probeMount) report(item, result string, details map[string]string) {
 	m.t.Helper()
-	reportProbe(m.t, probeResult{Item: item, Mount: m.name, Result: result, Details: details})
+	reportProbe(m.t, probeResult{Item: item, MountName: m.name, Result: result, Details: details})
 }
 
 // run runs steps in order until the mount's context ends.
-func (m *probeMount) run(steps ...func()) {
+func (m *probeMount) run(steps []probeStep) {
 	for _, step := range steps {
 		if err := m.ctx.Err(); err != nil {
 			m.t.Errorf("measurements stopped early: %v", err)
 			return
 		}
-		step()
+		step.measure(m)
 	}
 }
 
-func (m *probeMount) measureBase() {
-	m.run(
-		m.measureRootAccess,
-		func() { m.measureTTL("entry_ttl", "LOOKUP") },
+// probeStep is one measurement, named after the items it reports.
+type probeStep struct {
+	item    string
+	measure func(*probeMount)
+}
+
+// probeMountPlan is one mount of a probe run and the steps it measures.
+type probeMountPlan struct {
+	name      string
+	configure func(*MountConfig)
+	steps     []probeStep
+}
+
+// fskitProbePlan returns the mounts that a run of the named plan makes, in
+// order. TestFSKitProbe documents both plans.
+func fskitProbePlan(name string) ([]probeMountPlan, error) {
+	rootAccess := probeStep{"root_access", (*probeMount).measureRootAccess}
+	permissions := probeStep{"open_mode_0", (*probeMount).measurePermissions}
+	writeSizes := probeStep{"write_sizes", (*probeMount).measureWriteSizes}
+	unmountAndJoin := probeStep{"join_after_unmount", (*probeMount).unmountAndJoin}
+	base := []probeStep{
+		rootAccess,
+		{"entry_ttl", func(m *probeMount) { m.measureTTL("entry_ttl", "LOOKUP") }},
 		// A LOOKUP reply carries attributes too.
-		func() { m.measureTTL("attr_ttl", "GETATTR", "LOOKUP") },
-		m.measureNegativeEntry,
-		m.measureLookupAttributes,
-		m.measureInterrupt,
-		m.measure1231FirstRead,
-		m.measure1231Reread,
-		m.measurePaddingTimings,
-		m.measurePermissions,
-		m.measureWriteSizes,
-		m.unmountAndJoin,
-	)
+		{"attr_ttl", func(m *probeMount) { m.measureTTL("attr_ttl", "GETATTR", "LOOKUP") }},
+		{"negative_entry", (*probeMount).measureNegativeEntry},
+		{"lookup_replaces_attributes", (*probeMount).measureLookupAttributes},
+		{"interrupt_sent", (*probeMount).measureInterrupt},
+		{"macfuse_1231_first_read", (*probeMount).measure1231FirstRead},
+		{"macfuse_1231_reread", (*probeMount).measure1231Reread},
+		{"read_padding_timing", (*probeMount).measurePaddingTimings},
+		permissions,
+		writeSizes,
+		unmountAndJoin,
+	}
+	switch name {
+	case "":
+	case "replay":
+		var steps []probeStep
+		for _, step := range base {
+			if !replayLeavesOut[step.item] {
+				steps = append(steps, step)
+			}
+		}
+		return []probeMountPlan{{name: "replay", steps: steps}}, nil
+	default:
+		return nil, fmt.Errorf("%s=%q names no probe plan; leave it unset, or set it to replay", fskitProbePlanEnv, name)
+	}
+	plan := []probeMountPlan{
+		{"base", nil, base},
+		{"local", func(c *MountConfig) { c.Options["local"] = "" }, []probeStep{rootAccess, unmountAndJoin}},
+		{"options", func(c *MountConfig) {
+			c.DisableDefaultPermissions = true
+			c.MaxWrite = 128 << 10
+			c.Options["max_write"] = "262144"
+		}, []probeStep{permissions, writeSizes, {"notify_inval", (*probeMount).measureNotify}}},
+		{"close", nil, []probeStep{rootAccess, {"channel_close", (*probeMount).closeChannel}}},
+		// The signalled case runs first, because it answers its READ before
+		// the channel would close, and the unsignalled case last, because it
+		// should end the channel.
+		{"timeout", func(c *MountConfig) { c.Options["daemon_timeout"] = "3" }, []probeStep{
+			{"slow_read_signalled", (*probeMount).measureSignalledSlowRead},
+			{"slow_read", (*probeMount).measureSlowRead},
+		}},
+	}
+	if len(plan) != fskitProbeMounts {
+		return nil, fmt.Errorf("the probe plans %d mounts, but fskitProbeMounts and the docs say %d", len(plan), fskitProbeMounts)
+	}
+	return plan, nil
 }
 
-func (m *probeMount) measureLocal() {
-	m.run(m.measureRootAccess, m.unmountAndJoin)
-}
-
-func (m *probeMount) measureOptions() {
-	m.run(m.measurePermissions, m.measureWriteSizes, m.measureNotify)
-}
-
-func (m *probeMount) measureChannelClose() {
-	m.run(m.measureRootAccess, m.closeChannel)
-}
-
-// measureDaemonTimeout runs the signalled case first, because it answers its
-// READ before the channel would close, and the unsignalled case last, because
-// it should end the channel.
-func (m *probeMount) measureDaemonTimeout() {
-	m.run(m.measureSignalledSlowRead, m.measureSlowRead)
+// replayLeavesOut names the base steps that the replay plan does not run.
+var replayLeavesOut = map[string]bool{
+	"macfuse_1231_first_read": true,
+	"macfuse_1231_reread":     true,
+	"read_padding_timing":     true,
+	"open_mode_0":             true,
 }
 
 func (m *probeMount) path(name string) string {
@@ -2430,6 +2462,50 @@ func TestFSKitProbeConflictsMatchOnlyMacFUSEAndProbeVolumes(t *testing.T) {
 		if got := isProbeConflict(test.st); got != test.want {
 			t.Errorf("isProbeConflict(%s) = %v, want %v", test.name, got, test.want)
 		}
+	}
+}
+
+func TestFSKitProbePlans(t *testing.T) {
+	stepItems := func(plan probeMountPlan) []string {
+		var items []string
+		for _, step := range plan.steps {
+			items = append(items, step.item)
+		}
+		return items
+	}
+	full, err := fskitProbePlan("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, mount := range full {
+		names = append(names, mount.name)
+	}
+	if want := []string{"base", "local", "options", "close", "timeout"}; !slices.Equal(names, want) {
+		t.Errorf("full plan mounts %q, want %q", names, want)
+	}
+
+	replay, err := fskitProbePlan("replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 1 || replay[0].name != "replay" || replay[0].configure != nil {
+		t.Fatalf("replay plan = %d mounts, first %q; want one mount, replay, with base's config", len(replay), replay[0].name)
+	}
+	var want []string
+	for _, item := range stepItems(full[0]) {
+		switch item {
+		case "macfuse_1231_first_read", "macfuse_1231_reread", "read_padding_timing", "open_mode_0":
+		default:
+			want = append(want, item)
+		}
+	}
+	if got := stepItems(replay[0]); !slices.Equal(got, want) {
+		t.Errorf("replay plan steps = %q, want base's steps %q", got, want)
+	}
+
+	if _, err := fskitProbePlan("base"); err == nil {
+		t.Error("fskitProbePlan accepted a plan name it does not define")
 	}
 }
 

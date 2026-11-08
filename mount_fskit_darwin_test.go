@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,14 +73,51 @@ func setFSKitTestSystem(t *testing.T, frameworkPath string, osVersion string) {
 	t.Cleanup(func() { fskitFrameworkPath, fskitOSProductVersion, fskitAPILoader = oldPath, oldVersion, oldLoader })
 }
 
-func TestFSKitMountOptionsOmitOptionsFSKitDoesNotParse(t *testing.T) {
-	options := (&MountConfig{Backend: BackendFSKit}).toOptionsString()
-	for _, option := range strings.Split(options, ",") {
-		name, _, _ := strings.Cut(option, "=")
-		switch name {
-		case "novncache", "noappledouble", "iosize":
-			t.Errorf("FSKit mount options %q include %s", options, name)
-		}
+// The kernel extension's options novncache, noappledouble and iosize do not
+// reach MFMount, whose FSKit module does not parse them.
+func TestMountPassesFSKitOptionsToMFMount(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  MountConfig
+		want []string
+	}{
+		// The kernel extension would get novncache and noappledouble too.
+		{name: "defaults", want: []string{"default_permissions"}},
+		{
+			name: "artifact-fs",
+			cfg: MountConfig{
+				FSName:                  "artifact-fs:repo",
+				Subtype:                 "artifact-fs",
+				DisableWritebackCaching: true,
+				EnableAppleDouble:       true,
+			},
+			want: []string{"default_permissions", "fsname=artifact-fs:repo", "subtype=artifact-fs"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFakeMFMount(t)
+			mfs, err := MountWithFakeMFMount(context.Background(), t, f, drainServer{}, test.cfg)
+			if err != nil {
+				t.Fatalf("Mount: %v", err)
+			}
+			t.Cleanup(func() {
+				f.kernel.HangUp()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				mfs.Join(ctx)
+			})
+			f.mu.Lock()
+			mountPoint, options := f.mountPoint, f.options
+			f.mu.Unlock()
+			if mountPoint != mfs.Dir() {
+				t.Errorf("MFMount mount point = %q, want %q", mountPoint, mfs.Dir())
+			}
+			got := strings.Split(options, ",")
+			slices.Sort(got)
+			if !slices.Equal(got, test.want) {
+				t.Errorf("MFMount options = %q, want %q in any order", options, strings.Join(test.want, ","))
+			}
+		})
 	}
 }
 

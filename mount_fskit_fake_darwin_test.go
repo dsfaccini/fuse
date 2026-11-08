@@ -26,6 +26,7 @@ import (
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+	"golang.org/x/sys/unix"
 )
 
 // fakeMFMount stands in for macFUSE's MFMount framework. Its functions are
@@ -50,12 +51,21 @@ type fakeMFMount struct {
 	beforeRead func()
 
 	// sendResult turns a send of n bytes into MFChannelSendMessage's result
-	// and errno. Nil reports all n bytes sent.
+	// and errno. Nil reports all n bytes sent, as MFMount does, or ENODEV when
+	// the channel closed before an extension connected.
 	sendResult func(n int) (int, syscall.Errno)
 
-	mu                sync.Mutex
-	initReply         []byte
-	channelCreated    bool
+	mu        sync.Mutex
+	initReply []byte
+	// mountPoint and options are the arguments of the last MFMount call.
+	mountPoint     string
+	options        string
+	channelCreated bool
+	// channelOpened is set once MFMount opens the channel, which it does
+	// before it mounts. peerConnected is set once a message from the file
+	// system extension has arrived, so the extension has connected.
+	channelOpened     bool
+	peerConnected     bool
 	channelCloses     int
 	channelInterrupts int
 	channelRetains    int
@@ -79,8 +89,10 @@ const fakeChannel uintptr = 1
 var activeFakeMFMount atomic.Pointer[fakeMFMount]
 
 // newFakeMFMount makes a fake MFMount active until the test ends. Then it
-// checks that the channel, if created, was released once, and that every
-// message was released once.
+// checks that the channel, if created, was released once per reference, and
+// that every message was released once. MFMount traps on the release of the
+// last reference to a channel it never opened, so such a channel must keep
+// its MFChannelCreate reference.
 func newFakeMFMount(t *testing.T) *fakeMFMount {
 	t.Helper()
 	f := &fakeMFMount{
@@ -112,9 +124,9 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 	t.Cleanup(func() { unmountSyscall = oldUnmount })
 	t.Cleanup(func() {
 		f.mu.Lock()
-		created := f.channelCreated
+		created, opened := f.channelCreated, f.channelOpened
 		f.mu.Unlock()
-		if created {
+		if created && opened {
 			select {
 			case <-f.released:
 			case <-time.After(5 * time.Second):
@@ -125,8 +137,11 @@ func newFakeMFMount(t *testing.T) *fakeMFMount {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if created && f.channelReleases != 1+f.channelRetains {
+		switch {
+		case created && opened && f.channelReleases != 1+f.channelRetains:
 			t.Errorf("channel MFRelease calls = %d, want 1 plus %d MFRetain calls", f.channelReleases, f.channelRetains)
+		case created && !opened && f.channelReleases != f.channelRetains:
+			t.Errorf("MFRelease calls on a channel MFMount never opened = %d, want one per MFRetain call, %d: MFMount traps on the release of its last reference", f.channelReleases, f.channelRetains)
 		}
 		if len(f.messages) != 0 {
 			t.Errorf("%d messages never released", len(f.messages))
@@ -157,6 +172,9 @@ func (f *fakeMFMount) transport(t *testing.T) *fskitTransport {
 	t.Helper()
 	api := fakeMFMountAPI()
 	channel, _, _ := purego.SyscallN(api.channelCreate)
+	f.mu.Lock()
+	f.channelOpened, f.peerConnected = true, true
+	f.mu.Unlock()
 	tr := newFSKitTransport(api, channel)
 	tr.setMountResult(nil)
 	t.Cleanup(func() { tr.Close() })
@@ -233,6 +251,10 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 		}),
 		mount: purego.NewCallback(func(channel, mountPoint, options, quiet uintptr) uintptr {
 			f := activeFakeMFMount.Load()
+			f.mu.Lock()
+			f.mountPoint, f.options = cStringAt(mountPoint), cStringAt(options)
+			f.channelOpened = true
+			f.mu.Unlock()
 			result := int32(0)
 			switch {
 			case f.mount != nil:
@@ -256,6 +278,7 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			f.peerConnected = true
 			f.lastMessage++
 			f.messages[f.lastMessage] = &fakeMessage{buffers: r.buffers}
 			return f.lastMessage
@@ -285,15 +308,26 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 					message = append(message, unsafe.Slice(v.Base, v.Len)...)
 				}
 			}
+			f.mu.Lock()
+			peer := f.peerConnected
+			f.mu.Unlock()
+			hungUp := f.kernel.isHungUp()
 			sent, errno := len(message), syscall.Errno(0)
-			if f.sendResult != nil {
+			switch {
+			case f.sendResult != nil:
 				sent, errno = f.sendResult(len(message))
+			case hungUp && !peer:
+				// The channel closed before an extension connected, so
+				// none will take the message.
+				errno = syscall.ENODEV
 			}
 			if errno != 0 {
 				setErrno(errno)
 				return ^uintptr(0)
 			}
-			if sent == len(message) {
+			// Once the extension is gone, MFMount drops what is sent and
+			// reports it sent.
+			if sent == len(message) && !hungUp {
 				f.kernel.replies <- message
 			}
 			return uintptr(sent)
@@ -302,7 +336,14 @@ var fakeMFMountAPI = sync.OnceValue(func() *fskitAPI {
 			f := activeFakeMFMount.Load()
 			f.mu.Lock()
 			f.channelInterrupts++
+			opened := f.channelOpened
 			f.mu.Unlock()
+			if !opened && f.kernel.isHungUp() {
+				// MFChannelClose left a channel that MFMount never opened
+				// with no transport to interrupt.
+				setErrno(syscall.ENODEV)
+				return 0
+			}
 			f.kernel.Interrupt()
 			return 1
 		}),
@@ -351,6 +392,9 @@ func storeInt32(p uintptr, v int32) { *(*int32)(unsafe.Pointer(p)) = v }
 
 //go:nocheckptr
 func storeUintptr(p uintptr, v uintptr) { *(*uintptr)(unsafe.Pointer(p)) = v }
+
+//go:nocheckptr
+func cStringAt(p uintptr) string { return unix.BytePtrToString((*byte)(unsafe.Pointer(p))) }
 
 //go:nocheckptr
 func iovecsAt(p uintptr, n uintptr) []syscall.Iovec {

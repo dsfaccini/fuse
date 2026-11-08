@@ -24,6 +24,10 @@ import (
 // The probe checks its plan against it before the first mount.
 const fskitProbeMounts = 5
 
+// fskitProbePlanEnv chooses TestFSKitProbe's plan: unset for every mount, or
+// "replay" for the one mount whose recording the fake MFMount replays.
+const fskitProbePlanEnv = "FUSE_FSKIT_PROBE_PLAN"
+
 // TestFSKitProbe measures how macFUSE's FSKit backend treats the FUSE
 // protocol. It serves an in-memory file system through this package's
 // Connection and makes at most 5 FSKit mounts, one after another. Its
@@ -55,9 +59,15 @@ const fskitProbeMounts = 5
 //     would close, then without a signal and held until the channel should
 //     close.
 //
+// With FUSE_FSKIT_PROBE_PLAN=replay, the probe makes one mount, replay: base's
+// config and steps, without the two macfuse#1231 cases, the READ padding
+// timing and opening a mode 0 file. Built with -tags fuse_record, it writes
+// the recording that TestReplayFSKitRecording replays, once the owner has
+// reviewed it and committed it under the name replayRecording gives.
+//
 // Every mount also reports whether the volume is attached when MFMount
-// returns, its mount flags, the INIT request, and the reply buffers FSKit
-// attaches to READ requests. After the last mount, the probe compares mounts
+// returns, its mount flags and extended flags, the INIT request, and the
+// reply buffers FSKit attaches to READ requests. After the last mount, the probe compares mounts
 // for default_permissions, max_write and the local option. It needs separate
 // mounts because each option is fixed at mount time, and because notify,
 // MFChannelClose and daemon_timeout can each end a mount.
