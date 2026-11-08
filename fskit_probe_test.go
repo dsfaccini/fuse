@@ -61,7 +61,9 @@ const fskitProbePlanEnv = "FUSE_FSKIT_PROBE_PLAN"
 //
 // With FUSE_FSKIT_PROBE_PLAN=replay, the probe makes one mount, replay: base's
 // config and steps, without the two macfuse#1231 cases, the READ padding
-// timing and opening a mode 0 file.
+// timing and opening a mode 0 file. Built with -tags fuse_record, it writes
+// the recording that TestReplayFSKitRecording replays, once the owner has
+// reviewed it and committed it under the name replayRecording gives.
 //
 // Every mount also reports whether the volume is attached when MFMount
 // returns, its mount flags and extended flags, the INIT request, and the

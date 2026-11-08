@@ -288,8 +288,13 @@ covers the change.
 - Each result is a log line that contains `FSKIT_PROBE ` and then JSON.
   `grep -o 'FSKIT_PROBE .*'` extracts them.
 - `-tags fuse_record` writes each mount's message stream to
-  `testdata/fskit/<mount>.frames`. `fskit_probe_record_darwin_test.go` defines
-  the format.
+  `testdata/fskit/<mount>.frames`. `fskit_recording_darwin_test.go` defines
+  the format. Git ignores these files.
+- `TestReplayFSKitRecording` replays
+  `testdata/fskit/replay-macfuse-5.5.0.frames`, one mount of the replay plan,
+  through `Mount` and the fake MFMount. It runs in CI's `macos` job.
+- Replace that recording only after the repo owner has reviewed the new one.
+  The recorder never writes its name.
 - While the probe holds a READ, stat that file only through `startStat`.
   FSKit can hold the stat until the READ is answered, and `probeMount.stat`
   would then stop the run as wedged.

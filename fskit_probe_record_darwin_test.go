@@ -26,34 +26,9 @@ import (
 	"time"
 )
 
-// probeRecordingMagic opens every recording and names its format version.
-const probeRecordingMagic = "FSKREC01"
-
-// probeRecordingDir holds the recordings, relative to the package directory.
-var probeRecordingDir = filepath.Join("testdata", "fskit")
-
 // probeRecorder writes the message stream of one FSKit probe mount to
-// testdata/fskit/<mount>.frames, for replay through a fake MFMount. It exists
-// only under the fuse_record build tag.
-//
-// A recording is probeRecordingMagic followed by frames. Each frame is:
-//
-//	direction  1 byte         'K' for a message FSKit sent, 'S' for one the server sent
-//	elapsed    8 bytes        little-endian int64, nanoseconds from the recording's start
-//	length     4 bytes        little-endian uint32, the message's byte count
-//	message    length bytes   the whole FUSE message
-//
-// A 'K' message is the body MFChannelCopyNextMessage returned, its body
-// buffers concatenated, starting with fuse_in_header. Its elapsed time is when
-// the copy returned. An 'S' message is the iovecs one successful
-// MFChannelSendMessage call sent, concatenated, starting with
-// fuse_out_header. Its elapsed time is just before the send. Notify messages
-// are 'S' frames too.
-//
-// Frames are in the order the recorder appended them. An 'S' frame is
-// appended after its send returns, so a later 'K' frame can come first. Sort
-// by elapsed time to replay in send order. The FUSE structs inside a message
-// keep the host's byte order.
+// testdata/fskit/<mount>.frames, in the format fskit_recording_darwin_test.go
+// describes. It exists only under the fuse_record build tag.
 type probeRecorder struct {
 	mu     sync.Mutex
 	file   *os.File
