@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/dsfaccini/fuse/fuseops"
@@ -682,28 +683,57 @@ func TestRepliesHoldSizeReplyMuWhileWritten(t *testing.T) {
 	}
 }
 
-// parkedInReply reports whether a goroutine is blocked in frame, called from
-// Connection.Reply.
-func parkedInReply(frame string) bool {
+// parkTimeout bounds waitReply. A Reply blocks or returns at once, so one that
+// has done neither by then is blocked in a frame parkedInReply does not match.
+const parkTimeout = 10 * time.Second
+
+// parkedInReply returns the first of frames that a goroutine is blocked in,
+// called from Connection.Reply, or "" when there is none. It also returns
+// every goroutine's stack.
+func parkedInReply(frames ...string) (string, string) {
 	buf := make([]byte, 1<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-	for _, g := range strings.Split(string(buf), "\n\n") {
-		if strings.Contains(g, frame) && strings.Contains(g, "(*Connection).Reply") {
-			return true
+	stacks := string(buf[:runtime.Stack(buf, true)])
+	for _, g := range strings.Split(stacks, "\n\n") {
+		if !strings.Contains(g, "(*Connection).Reply") {
+			continue
+		}
+		for _, frame := range frames {
+			if strings.Contains(g, frame) {
+				return frame, stacks
+			}
 		}
 	}
-	return false
+	return "", stacks
+}
+
+// waitReply waits until the Reply that closes done blocks in one of frames,
+// and returns that frame, or until it returns, and returns "". It fails the
+// test when neither happens within parkTimeout.
+func waitReply(t *testing.T, done <-chan struct{}, frames ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(parkTimeout)
+	for {
+		frame, stacks := parkedInReply(frames...)
+		if frame != "" {
+			return frame
+		}
+		select {
+		case <-done:
+			return ""
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Reply neither returned nor blocked in %s within %v. If a stack below shows it blocked there, parkedInReply no longer matches the runtime's frame names:\n%s",
+				strings.Join(frames, " or "), parkTimeout, stacks)
+		}
+		runtime.Gosched()
+	}
 }
 
 func waitParkedInReply(t *testing.T, frame string, done <-chan struct{}) {
 	t.Helper()
-	for !parkedInReply(frame) {
-		select {
-		case <-done:
-			t.Fatalf("Reply returned without blocking in %s", frame)
-		default:
-		}
-		runtime.Gosched()
+	if waitReply(t, done, frame) == "" {
+		t.Fatalf("Reply returned without blocking in %s", frame)
 	}
 }
 
@@ -825,16 +855,8 @@ func TestForgetTakesNoSideOfSizeReplyMu(t *testing.T) {
 			o.c.sizeReplyMu.Lock()
 			defer o.c.sizeReplyMu.Unlock()
 			done := replyInBackground(t, o, ctx)
-			for {
-				select {
-				case <-done:
-					return
-				default:
-				}
-				if parkedInReply("sync.(*RWMutex).Lock") || parkedInReply("sync.(*RWMutex).RLock") {
-					t.Fatal("forget waits on sizeReplyMu")
-				}
-				runtime.Gosched()
+			if waitReply(t, done, "sync.(*RWMutex).Lock", "sync.(*RWMutex).RLock") != "" {
+				t.Fatal("forget waits on sizeReplyMu")
 			}
 		})
 	}

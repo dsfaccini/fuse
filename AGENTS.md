@@ -68,6 +68,10 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
 - Inside `synctest.Test`, report a failed check with `t.Error` while
   goroutines are still blocked. A `t.Fatal` there ends the test with a
   deadlock panic that hides the failure.
+- To wait until a `Reply` blocks on `sizeReplyMu`, call `waitParkedInReply`
+  or `waitReply` in `short_reads_test.go`. A goroutine blocked on a mutex
+  closes no channel, so they match goroutine stacks by frame name. They fail
+  after `parkTimeout` when no stack matches.
 - To test a `Server` without a mount, use `ServeCanned` in `export_test.go`.
   It serves the way `Mount` does and returns what `Join` returns.
 - To test how an op is decoded and answered, add a case to `protocolCases` in
