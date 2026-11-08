@@ -16,7 +16,9 @@ package fuse
 
 import (
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -24,17 +26,17 @@ import (
 
 // checkInheritedSockets makes the test binary act as a mount helper that
 // passes back /dev/null, and exits with status 1 when it inherited a socket
-// other than fd 3, its end of the socket pair.
+// other than fd 3, its end of the socket pair. The variable's value lists the
+// sockets the parent held before it ran the helper, which the helper ignores.
 const checkInheritedSockets = "FUSE_TEST_CHECK_INHERITED_SOCKETS"
 
-func TestFakeMountHelperInheritsOneSocket(t *testing.T) {
-	if os.Getenv(checkInheritedSockets) != "1" {
-		t.Skip("runs only as the fake mount helper")
-	}
+// openSockets returns the open file descriptors above 3 that are sockets.
+func openSockets() ([]string, error) {
 	fds, err := os.ReadDir("/dev/fd")
 	if err != nil {
-		os.Exit(100)
+		return nil, err
 	}
+	var sockets []string
 	for _, entry := range fds {
 		fd, err := strconv.Atoi(entry.Name())
 		if err != nil || fd <= 3 {
@@ -42,6 +44,23 @@ func TestFakeMountHelperInheritsOneSocket(t *testing.T) {
 		}
 		var st unix.Stat_t
 		if unix.Fstat(fd, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFSOCK {
+			sockets = append(sockets, entry.Name())
+		}
+	}
+	return sockets, nil
+}
+
+func TestFakeMountHelperInheritsOneSocket(t *testing.T) {
+	held, ok := os.LookupEnv(checkInheritedSockets)
+	if !ok {
+		t.Skip("runs only as the fake mount helper")
+	}
+	sockets, err := openSockets()
+	if err != nil {
+		os.Exit(100)
+	}
+	for _, fd := range sockets {
+		if !slices.Contains(strings.Split(held, ","), fd) {
 			os.Exit(1)
 		}
 	}
@@ -58,10 +77,16 @@ func TestFakeMountHelperInheritsOneSocket(t *testing.T) {
 // fusermount runs the Linux fusermount fallback and the macFUSE kernel
 // extension's mount helper. A helper that inherits the parent's end of the
 // socket pair, or a second copy of its own, keeps the parent's read of the
-// pair from ending when the helper exits.
+// pair from ending when the helper exits. The test process can hold sockets
+// it inherited itself, as on CI's macOS runners, and the helper inherits those
+// too, so it ignores them.
 func TestMountHelperSocketsCloseOnExec(t *testing.T) {
+	held, err := openSockets()
+	if err != nil {
+		t.Fatal(err)
+	}
 	dev, _, err := fusermount(os.Args[0], []string{"-test.run=^TestFakeMountHelperInheritsOneSocket$"},
-		[]string{checkInheritedSockets + "=1"}, true, nil)
+		[]string{checkInheritedSockets + "=" + strings.Join(held, ",")}, true, nil)
 	if err != nil {
 		t.Fatalf("fusermount with a helper that fails on an inherited socket: %v", err)
 	}
