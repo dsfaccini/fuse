@@ -38,16 +38,27 @@ func runPollHack(dir string, c *Connection) error {
 	c.pollHackRunning.Store(true)
 	defer c.pollHackRunning.Store(false)
 
-	// No fork may start while the file is open. Since Linux 7.3, and Ubuntu's
-	// 7.0.0-41.41, a vfork child's exec closes its copy of each close-on-exec
-	// fd before it releases the parent ("exec: do_close_on_exec() before
-	// taking exec_update_lock"). Closing a copy of this fd sends FLUSH, which
-	// only c answers, while the forking thread holds its P with signals
-	// blocked. Under GOMAXPROCS 1, a stop-the-world in the fork window, or
-	// every P forking, nothing answers, and the process hangs. Every Go fork
-	// takes syscall.ForkLock for writing, so holding it for reading keeps them
-	// out. Answering the open forks nothing: c answers the entry's requests
-	// in ReadOp, and the server answers only a GETATTR of the root.
+	// Under default permissions, the open checks permissions on the root,
+	// which needs the root's attributes. Stating the root first caches them,
+	// so the locked window below waits only on requests c answers itself in
+	// ReadOp. A server that answers with a zero attribute timeout still gets
+	// a GETATTR of the root inside the window.
+	if !c.cfg.DisableDefaultPermissions {
+		var st unix.Stat_t
+		if err := unix.Stat(dir, &st); err != nil {
+			return err
+		}
+	}
+
+	// No fork may start while the file is open. A vfork child's exec closes
+	// its copy of each close-on-exec fd before it releases the parent: "exec:
+	// do_close_on_exec() before taking exec_update_lock" is in Linux v7.3 and
+	// in stable backports such as Ubuntu's 7.0.0-41.41. Closing a copy of this
+	// fd sends FLUSH, which only c answers, while the forking thread holds its
+	// P with signals blocked. Under GOMAXPROCS 1, a stop-the-world in the fork
+	// window, or every P forking, nothing answers, and the process hangs.
+	// Every Go fork takes syscall.ForkLock for writing, so holding it for
+	// reading keeps them out.
 	syscall.ForkLock.RLock()
 	defer syscall.ForkLock.RUnlock()
 

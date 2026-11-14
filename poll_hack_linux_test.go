@@ -18,9 +18,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/fusekernel"
@@ -136,5 +138,70 @@ func TestPollHackHoldsForksOffWhileItsFileIsOpen(t *testing.T) {
 	}
 	if forkable {
 		t.Error("a fork could start while the poll hack held its file open")
+	}
+}
+
+// rootAttrServer serves an empty root directory whose attributes the kernel
+// may cache for a minute. For each GETATTR of the root, it records whether a
+// fork could start then.
+type rootAttrServer struct {
+	mu       sync.Mutex
+	getattrs int
+	locked   int
+}
+
+func (s *rootAttrServer) ServeOps(c *Connection) {
+	for {
+		ctx, op, err := c.ReadOp()
+		if err != nil {
+			return
+		}
+		o, ok := op.(*fuseops.GetInodeAttributesOp)
+		if !ok || o.Inode != fuseops.RootInodeID {
+			c.Reply(ctx, syscall.ENOSYS)
+			continue
+		}
+		s.mu.Lock()
+		s.getattrs++
+		if syscall.ForkLock.TryLock() {
+			syscall.ForkLock.Unlock()
+		} else {
+			s.locked++
+		}
+		s.mu.Unlock()
+		o.Attributes = fuseops.InodeAttributes{Nlink: 1, Mode: os.ModeDir | 0o555}
+		o.AttributesExpiration = time.Now().Add(time.Minute)
+		c.Reply(ctx, nil)
+	}
+}
+
+// Under default permissions, the poll hack's open checks permissions on the
+// root, and a GETATTR of the root waits on the server. The hack asks for the
+// root's attributes before it holds forks off, so a server that makes that
+// answer wait on a fork does not hang Mount, and an unmount through
+// fusermount does not wait on the server.
+func TestPollHackAsksForTheRootsAttributesBeforeItHoldsForksOff(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+
+	dir := t.TempDir()
+	server := &rootAttrServer{}
+	mfs, err := Mount(dir, server, &MountConfig{})
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	server.mu.Lock()
+	getattrs, locked := server.getattrs, server.locked
+	server.mu.Unlock()
+	if err := Unmount(dir); err != nil {
+		t.Errorf("Unmount: %v", err)
+	}
+	if err := mfs.Join(context.Background()); err != nil {
+		t.Errorf("Join: %v", err)
+	}
+	if getattrs == 0 {
+		t.Fatal("the server read no GETATTR of the root before Mount returned")
+	}
+	if locked != 0 {
+		t.Errorf("%d of %d GETATTRs of the root came while forks were held off", locked, getattrs)
 	}
 }
