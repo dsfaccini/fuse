@@ -178,6 +178,14 @@ every goroutine's stack before the job is cancelled.
 - A `/dev/fd/N` mount point skips the hack, so the deadlock and inode
   `math.MaxUint64` stay the file system's. A failed hack is only logged to
   `MountConfig.ErrorLogger`, and to nowhere when that is nil.
+- While the hack holds its file open, it holds `syscall.ForkLock` for
+  reading, so no fork in the process starts. Since Linux 7.3, and Ubuntu's
+  7.0.0-41.41, a vfork child's exec closes its copy of the file before it
+  releases the parent, and that close sends FLUSH, which only the connection
+  answers. A fork waits until the hack closes the file, so a server must
+  answer the hack's root GETATTR without forking, and must keep reading ops
+  while one of its handlers forks. `TestPollHackHoldsForksOffWhileItsFileIsOpen`
+  checks the lock.
 - Unless `MountConfig.DisableDefaultPermissions` is set, `Mount` returns only
   after the server answers a GETATTR for the root. A test server that blocks
   that answer hangs `Mount`. `rootServer` in `mount_linux_test.go` holds it to
