@@ -83,10 +83,14 @@ func Mount(
 //     the mount through package os can then deadlock.
 //
 // The hack checks permissions on the root. Unless
-// MountConfig.DisableDefaultPermissions is set, that sends the server a
-// GetInodeAttributes for the root, and MountContext succeeds only after the
-// server answers it. The server must not make that answer wait on anything
-// that happens after MountContext returns.
+// MountConfig.DisableDefaultPermissions is set, it first stats the root, which
+// sends the server a GetInodeAttributes for the root, and MountContext
+// succeeds only after the server answers it. The server must not make that
+// answer wait on anything that happens after MountContext returns.
+//
+// While the hack holds its file open, every fork in the process waits,
+// os/exec included, because the hack holds syscall.ForkLock for reading. See
+// poll_hack_linux.go.
 func MountContext(
 	ctx context.Context,
 	dir string,
