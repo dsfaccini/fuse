@@ -101,3 +101,40 @@ func TestMountAnswersFirstPoll(t *testing.T) {
 		t.Errorf("the file system read %d FUSE_POLL requests, want 0", n)
 	}
 }
+
+// A fork while Mount holds the poll hack's file open copies the fd, and since
+// Linux 7.3 the child's exec closes that copy, which sends FLUSH, before it
+// releases the forking thread. Every Go fork takes syscall.ForkLock for
+// writing (acquireForkLock in syscall/forkpipe2.go), so the hack holds it for
+// reading while the file is open, and no fork can start.
+func TestPollHackHoldsForksOffWhileItsFileIsOpen(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+
+	var ran, forkable bool
+	testHookPollHackFileOpen = func() {
+		ran = true
+		if syscall.ForkLock.TryLock() {
+			syscall.ForkLock.Unlock()
+			forkable = true
+		}
+	}
+	defer func() { testHookPollHackFileOpen = nil }()
+
+	dir := t.TempDir()
+	mfs, err := Mount(dir, &pollCountingServer{}, &MountConfig{})
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	if err := Unmount(dir); err != nil {
+		t.Errorf("Unmount: %v", err)
+	}
+	if err := mfs.Join(context.Background()); err != nil {
+		t.Errorf("Join: %v", err)
+	}
+	if !ran {
+		t.Fatal("Mount did not run the poll hack")
+	}
+	if forkable {
+		t.Error("a fork could start while the poll hack held its file open")
+	}
+}
