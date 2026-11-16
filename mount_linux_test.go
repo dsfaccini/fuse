@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/mounttest"
+	"golang.org/x/sys/unix"
 )
 
 func Test_parseFuseFd(t *testing.T) {
@@ -143,6 +145,66 @@ func TestMountTableListsTheConfig(t *testing.T) {
 	}
 	if !slices.Contains(strings.Split(entry.superOptions, ","), "default_permissions") {
 		t.Errorf("mountinfo super options = %q, want default_permissions", entry.superOptions)
+	}
+}
+
+// fuseDevices returns the descriptors through which the process holds
+// /dev/fuse.
+func fuseDevices(t *testing.T) []int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fds []int
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name())); err == nil && target == "/dev/fuse" {
+			fds = append(fds, fd)
+		}
+	}
+	return fds
+}
+
+// A child inherits each descriptor that lacks FD_CLOEXEC, and os/exec relies
+// on the flag to keep the parent's descriptors out of the processes it
+// starts. Each /dev/fuse descriptor that serves a mount carries it, whether
+// Mount opened the device, as it does with CAP_SYS_ADMIN, or fusermount3
+// passed it back.
+func TestMountedDeviceClosesOnExec(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+
+	dir := mountPoint(t)
+	mfs, err := Mount(dir, &rootServer{}, &MountConfig{})
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := mfs.Unmount(ctx); err != nil {
+			t.Errorf("Unmount: %v", err)
+		}
+		if err := mfs.Join(ctx); err != nil {
+			t.Errorf("Join: %v", err)
+		}
+	}()
+
+	fds := fuseDevices(t)
+	if len(fds) == 0 {
+		t.Fatal("the process holds no /dev/fuse descriptor while it serves a mount")
+	}
+	for _, fd := range fds {
+		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if err != nil {
+			t.Fatalf("F_GETFD on /dev/fuse descriptor %d: %v", fd, err)
+		}
+		if flags&unix.FD_CLOEXEC == 0 {
+			t.Errorf("/dev/fuse descriptor %d has flags %#x, want FD_CLOEXEC", fd, flags)
+		}
 	}
 }
 
