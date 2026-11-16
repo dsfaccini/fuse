@@ -61,7 +61,9 @@ func directmount(dir string, cfg *MountConfig) (*os.File, error) {
 	// We use syscall.Open + os.NewFile instead of os.OpenFile so that the file
 	// is opened in blocking mode. When opened in non-blocking mode, the Go
 	// runtime tries to use poll(2), which does not work with /dev/fuse.
-	fd, err := syscall.Open("/dev/fuse", syscall.O_RDWR, 0644)
+	// syscall.Open adds no O_CLOEXEC, and without it every child the process
+	// starts inherits the device.
+	fd, err := syscall.Open("/dev/fuse", syscall.O_RDWR|syscall.O_CLOEXEC, 0644)
 	if err != nil {
 		return nil, errFallback
 	}
@@ -103,9 +105,9 @@ func directmount(dir string, cfg *MountConfig) (*os.File, error) {
 		mountflag, // mountflag
 		data,      // data
 	); err != nil {
+		dev.Close()
 		if err == syscall.EPERM {
 			return nil, errFallback
-
 		}
 		return nil, err
 	}
