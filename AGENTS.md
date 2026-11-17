@@ -107,6 +107,12 @@ module path is `github.com/dsfaccini/fuse`. Its consumer is
   `unmount_linux_test.go` puts a recording `fusermount3` on `PATH`.
 - To read a Linux mount's mount table entry in a test, call `mountInfo` in
   `mount_linux_test.go`.
+- To list the `/dev/fuse` descriptors the process holds, call `fuseDevices` in
+  `mount_linux_test.go`. Turn the garbage collector off with
+  `debug.SetGCPercent(-1)` before the baseline `fuseDevices` call, and keep it
+  off through the code under test and the check. A finalizer closes the
+  descriptor of an `os.File` that code dropped, so a leak can vanish before
+  the check.
 - On darwin, `Unmount(dir)` finds an FSKit volume by the `MNT_EXT_FSKIT` bit
   of its mount table entry, read through `getfsstat`. To test it, fake the
   mount table with `fakeMountTable` in `mount_lifecycle_darwin_test.go`.

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/dsfaccini/fuse/fuseops"
 	"github.com/dsfaccini/fuse/internal/mounttest"
+	"golang.org/x/sys/unix"
 )
 
 func Test_parseFuseFd(t *testing.T) {
@@ -143,6 +146,78 @@ func TestMountTableListsTheConfig(t *testing.T) {
 	}
 	if !slices.Contains(strings.Split(entry.superOptions, ","), "default_permissions") {
 		t.Errorf("mountinfo super options = %q, want default_permissions", entry.superOptions)
+	}
+}
+
+// fuseDevices returns the descriptors through which the process holds
+// /dev/fuse.
+func fuseDevices(t *testing.T) []int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fds []int
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name())); err == nil && target == "/dev/fuse" {
+			fds = append(fds, fd)
+		}
+	}
+	return fds
+}
+
+// Mount holds one /dev/fuse descriptor for a mount, the one it serves. A child
+// inherits each descriptor that lacks FD_CLOEXEC, and os/exec relies on the
+// flag to keep the parent's descriptors out of the processes it starts, so
+// the served descriptor carries it, whether Mount opened the device, as it
+// does with CAP_SYS_ADMIN, or fusermount3 passed it back. Without
+// CAP_SYS_ADMIN, Mount opens the device before mount(2) fails with EPERM, and
+// closes it before it falls back to fusermount3.
+func TestMountHoldsOneDeviceThatClosesOnExec(t *testing.T) {
+	mounttest.SkipUnlessEnabled(t)
+
+	// A descriptor whose os.File Mount drops stays open until the garbage
+	// collector finalizes the file.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	held := fuseDevices(t)
+	dir := mountPoint(t)
+	mfs, err := Mount(dir, &rootServer{}, &MountConfig{})
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := mfs.Unmount(ctx); err != nil {
+			t.Errorf("Unmount: %v", err)
+		}
+		if err := mfs.Join(ctx); err != nil {
+			t.Errorf("Join: %v", err)
+		}
+	}()
+
+	var added []int
+	for _, fd := range fuseDevices(t) {
+		if !slices.Contains(held, fd) {
+			added = append(added, fd)
+		}
+	}
+	for _, fd := range added {
+		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if err != nil {
+			t.Fatalf("F_GETFD on /dev/fuse descriptor %d: %v", fd, err)
+		}
+		if flags&unix.FD_CLOEXEC == 0 {
+			t.Errorf("/dev/fuse descriptor %d has flags %#x, want FD_CLOEXEC", fd, flags)
+		}
+	}
+	if len(added) != 1 {
+		t.Errorf("Mount added /dev/fuse descriptors %v, want one", added)
 	}
 }
 
